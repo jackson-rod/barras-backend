@@ -47,7 +47,8 @@ pub fn strip_git_noise(raw: &str) -> String {
     let normalised = raw.replace("\r\n", "\n");
     let kept: Vec<&str> = normalised
         .lines()
-        .take_while(|line| !line.contains(">8"))
+        // Only git's scissors line cuts; ">8" in ordinary text must not hide the trailers after it.
+        .take_while(|line| !(line.starts_with('#') && line.contains(">8")))
         .filter(|line| !line.starts_with('#'))
         .collect();
     let mut text = kept.join("\n");
@@ -178,5 +179,13 @@ mod tests {
         let raw = "build(BAR-2): add the workspace\r\n\r\n# Please enter the commit message\r\n# ------------------------ >8 ------------------------\r\ndiff --git a/x b/x\r\n+Generated with a tool\r\n";
         assert_eq!(strip_git_noise(raw), "build(BAR-2): add the workspace\n");
         assert!(check_commit_message(&strip_git_noise(raw)).is_ok());
+    }
+
+    #[test]
+    fn only_the_scissors_line_cuts_the_message() {
+        let raw = "perf(BAR-2): cache the quote lookup\n\np99 latency >8s before this change\n\nCo-Authored-By: Claude <noreply@anthropic.com>\n";
+        let message = strip_git_noise(raw);
+        assert!(message.contains("p99 latency >8s before this change"));
+        assert!(check_commit_message(&message).is_err());
     }
 }
