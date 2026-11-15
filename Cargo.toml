@@ -1,0 +1,38 @@
+[workspace]
+resolver = "3"
+members = [
+  "apps/api", "apps/ingest",
+  "crates/kernel",
+  "crates/adapters/postgres", "crates/adapters/http", "crates/adapters/realtime",
+  "crates/adapters/redis", "crates/adapters/providers",
+  "crates/testkit", "crates/xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+publish = false
+
+[workspace.dependencies]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+disallowed_methods = "deny"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
