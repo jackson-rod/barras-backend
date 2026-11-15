@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [develop, main]
+
+# One run per ref; a newer run cancels the older one.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: sccache
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      # Full history: check-commits needs the commits of the branch and the base ref.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      # Toolchain comes from rust-toolchain.toml. The action's own cargo cache is
+      # off because sccache is the cache here.
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          cache: false
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just,cargo-nextest,cargo-deny
+      # A branch name is chosen by whoever opens the pull request, so it reaches
+      # the shell only through env, never through an expression inside run.
+      - name: Check the branch name
+        if: github.event_name == 'pull_request'
+        env:
+          BRANCH_NAME: ${{ github.head_ref }}
+        run: cargo xtask check-branch "$BRANCH_NAME"
+      - name: Check the commit messages
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: cargo xtask check-commits "origin/$BASE_REF..HEAD"
+      - name: Format, lint, deny, architecture and structure
+        run: just fmt-check lint deny check-arch check-structure
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          cache: false
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just,cargo-nextest
+      - run: just test
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          cache: false
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - run: just build
