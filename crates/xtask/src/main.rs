@@ -2,9 +2,9 @@
 
 use std::process::{Command, ExitCode};
 
-use xtask::{arch, git_rules};
+use xtask::{arch, git_rules, structure};
 
-const USAGE: &str = "subcommands:\n  check-branch [name]\n  check-commit-msg <file>\n  check-commits <range>\n  check-arch";
+const USAGE: &str = "subcommands:\n  check-branch [name]\n  check-commit-msg <file>\n  check-commits <range>\n  check-arch\n  check-structure";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -15,6 +15,7 @@ fn main() -> ExitCode {
         ["check-commit-msg", file] => check_commit_file(file),
         ["check-commits", range] => check_commit_range(range),
         ["check-arch"] => check_architecture(),
+        ["check-structure"] => check_repository_structure(),
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);
@@ -93,4 +94,14 @@ fn check_architecture() -> Problems {
         .iter()
         .map(|v| format!("{}: {} ({})", v.krate, v.dependency, v.rule))
         .collect())
+}
+
+fn check_repository_structure() -> Problems {
+    let problems =
+        structure::check_structure(&arch::workspace_root()).map_err(|e| vec![e.to_string()])?;
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems)
+    }
 }

@@ -3,3 +3,4 @@
 pub mod arch;
 pub mod error;
 pub mod git_rules;
+pub mod structure;
