@@ -15,6 +15,7 @@ rust-version = "1.100"
 publish = false
 
 [workspace.dependencies]
+regex = "1.13.1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
