@@ -1,11 +1,10 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)] // a CLI: its output is the product
 
-mod git_rules;
-
 use std::process::{Command, ExitCode};
 
-const USAGE: &str =
-    "subcommands:\n  check-branch [name]\n  check-commit-msg <file>\n  check-commits <range>";
+use xtask::{arch, git_rules};
+
+const USAGE: &str = "subcommands:\n  check-branch [name]\n  check-commit-msg <file>\n  check-commits <range>\n  check-arch";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -15,6 +14,7 @@ fn main() -> ExitCode {
         ["check-branch", name] => git_rules::check_branch_name(name).map_err(|e| vec![e]),
         ["check-commit-msg", file] => check_commit_file(file),
         ["check-commits", range] => check_commit_range(range),
+        ["check-arch"] => check_architecture(),
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);
@@ -81,4 +81,16 @@ fn check_commit_range(range: &str) -> Problems {
     } else {
         Err(problems)
     }
+}
+
+fn check_architecture() -> Problems {
+    let crates = arch::load_workspace(&arch::workspace_root()).map_err(|e| vec![e.to_string()])?;
+    let violations = arch::check_arch(&crates);
+    if violations.is_empty() {
+        return Ok(());
+    }
+    Err(violations
+        .iter()
+        .map(|v| format!("{}: {} ({})", v.krate, v.dependency, v.rule))
+        .collect())
 }

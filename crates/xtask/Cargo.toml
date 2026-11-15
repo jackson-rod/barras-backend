@@ -10,3 +10,8 @@ workspace = true
 
 [dependencies]
 regex.workspace = true
+cargo_metadata.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
