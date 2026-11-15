@@ -1,6 +1,12 @@
 # Syntax of cargo-deny 0.19+ (licenses/bans/sources schema, version 2).
 # https://embarkstudios.github.io/cargo-deny/
 
+# Explicit so the policy does not change with the tool's defaults.
+[advisories]
+yanked = "deny"
+unmaintained = "all"
+unsound = "all"
+
 [licenses]
 version = 2
 allow = [

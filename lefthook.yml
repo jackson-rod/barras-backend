@@ -11,7 +11,7 @@ pre-commit:
 commit-msg:
   commands:
     message:
-      run: cargo xtask check-commit-msg {1}
+      run: cargo xtask check-commit-msg "{1}"
 pre-push:
   commands:
     branch:

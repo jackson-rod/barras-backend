@@ -5,7 +5,7 @@ default:
 
 setup:
     rustup show active-toolchain
-    cargo install --locked cargo-nextest cargo-deny
+    cargo install --locked cargo-nextest@0.9.152 cargo-deny@0.20.2
     lefthook install
 
 dev:
@@ -24,10 +24,10 @@ fmt-check:
     cargo fmt --all --check
 
 deny:
-    cargo deny check
+    cargo deny --locked check
 
 check-arch:
-    cargo deny check bans
+    cargo deny --locked check bans
     cargo xtask check-arch
 
 check-structure:

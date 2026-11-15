@@ -8,7 +8,8 @@ on:
 # One run per ref; a newer run cancels the older one.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Only pull requests are cancelled; a run on develop or main always finishes.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -21,20 +22,24 @@ env:
 jobs:
   checks:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       # Full history: check-commits needs the commits of the branch and the base ref.
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          persist-credentials: false
       # Toolchain comes from rust-toolchain.toml. The action's own cargo cache is
       # off because sccache is the cache here.
-      - uses: actions-rust-lang/setup-rust-toolchain@v2
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           cache: false
-      - uses: mozilla-actions/sccache-action@v0.0.11
-      - uses: taiki-e/install-action@v2
+          # Its default sets CARGO_BUILD_WARNINGS=deny, which local runs do not; CI must compile exactly like `just verify`.
+          build-warnings: ""
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
-          tool: just,cargo-nextest,cargo-deny
+          tool: just@1.59.0,cargo-deny@0.20.2
       # A branch name is chosen by whoever opens the pull request, so it reaches
       # the shell only through env, never through an expression inside run.
       - name: Check the branch name
@@ -52,26 +57,36 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
-      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           cache: false
-      - uses: mozilla-actions/sccache-action@v0.0.11
-      - uses: taiki-e/install-action@v2
+          # Its default sets CARGO_BUILD_WARNINGS=deny, which local runs do not; CI must compile exactly like `just verify`.
+          build-warnings: ""
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
-          tool: just,cargo-nextest
+          tool: just@1.59.0,cargo-nextest@0.9.152
       - run: just test
 
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
-      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           cache: false
-      - uses: mozilla-actions/sccache-action@v0.0.11
-      - uses: taiki-e/install-action@v2
+          # Its default sets CARGO_BUILD_WARNINGS=deny, which local runs do not; CI must compile exactly like `just verify`.
+          build-warnings: ""
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
-          tool: just
+          tool: just@1.59.0
       - run: just build
