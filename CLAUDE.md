@@ -1,6 +1,6 @@
 # Working rules
 
-These rules bind every contributor, human or agent. They restate the accepted ADRs in [`docs/adr/`](docs/adr/README.md), the foundation design ([the spec](docs/specs/2026-11-15-barras-foundation-design.md)) and the checks this repository runs. Each rule cites its source in parentheses. When a rule here and an ADR disagree, the ADR wins, and this file is fixed in the same pull request. Everything in this repository is in English: code, comments, commits, pull requests and docs (ADR-0018).
+These rules bind every contributor, human or agent. They restate the accepted ADRs in [`docs/adr/`](docs/adr/README.md), the foundation design ([the spec](docs/specs/2026-11-15-barras-foundation-design.md)) and the checks this repository runs. Most rules cite their source in parentheses: the ADR they restate, a section of the spec or a standard, or the check that enforces them. When a rule here and an ADR disagree, the ADR wins, and this file is fixed in the same pull request. Everything in this repository is in English: code, comments, commits, pull requests and docs (ADR-0018).
 
 ## What this repository is
 
@@ -101,7 +101,6 @@ docs/                   the plan: specs, plans, ADRs, standards, schema, analysi
 
 - Modules: `identity`, `settings`, `billing`, `capital`, `budgets`, `goals`, `markets`, `news`, `indicators`, `assistant` (spec §6.2).
 - `crates/modules/`, `migrations/` and `.sqlx/` do not exist yet; the first ticket that needs one creates it.
-- Pin each dependency version once, in `[workspace.dependencies]`; a crate takes it with `<name>.workspace = true`. Enable only the features you use (spec §6.12).
 
 ## Module anatomy
 
@@ -128,21 +127,43 @@ crates/modules/<module>/        snake_case; plural for collections
 
 ### Dependency rule
 
-- `just check-arch` enforces this table: `cargo xtask check-arch` reads `cargo metadata` and fails on any dependency outside a crate's list. For the kernel and the modules, normal and build dependencies use the first list, dev dependencies the second (ADR-0003).
-- An allowed name counts only from its expected source: `barras-kernel` only as the workspace crate, every other allowed name only from the registry (`check-arch`).
-- A technology crate is a direct dependency only of its own crates: `sqlx` of `barras-adapter-postgres` and `barras-testkit`; `axum` of `barras-adapter-http` and `barras-adapter-realtime`; `reqwest` of `barras-adapter-providers`; `redis` of `barras-adapter-redis` and `barras-testkit` (`deny.toml`, `cargo deny check bans`).
-- A crate outside the folders of the table fails (`unknown-location`).
+- The "May depend on" column is the design rule (ADR-0003). The "Enforced by" column names what a check enforces; review enforces the rest.
+- `just check-arch` runs two checks. `cargo xtask check-arch` reads `cargo metadata` and fails: any kernel or module dependency outside its list, any adapter dependency on another adapter, `barras-testkit` taken as anything but a dev dependency, a workspace crate in `xtask`'s dependencies, and a crate outside the folders of the table (`unknown-location`).
+- In those lists, an allowed name counts only from its expected source: `barras-kernel` only as the workspace crate, every other allowed name only from the registry (`check-arch`).
+- `cargo deny check bans` lets only these crates depend directly on a technology crate: `sqlx` only `barras-adapter-postgres` and `barras-testkit`; `axum` only `barras-adapter-http` and `barras-adapter-realtime`; `reqwest` only `barras-adapter-providers`; `redis` only `barras-adapter-redis` and `barras-testkit`. Every other crate, apps included, fails (`deny.toml`).
 
-| Crate | May depend on |
-| --- | --- |
-| `crates/kernel` | `thiserror`, `uuid`, `time`, `rust_decimal`. Dev: the same plus `tokio`, `mockall`, `insta` (`kernel-allowlist`, `kernel-dev-allowlist`) |
-| `crates/modules/<m>` | `barras-kernel`, `thiserror`, `uuid`, `time`, `rust_decimal`, `async-trait`. Dev: the same plus `tokio`, `mockall`, `insta`. Never another module, an adapter, axum, sqlx, reqwest, redis, tokio's runtime or serde_json (`module-allowlist`, `module-dev-allowlist`) |
-| `crates/adapters/*` | `barras-kernel`, the module crates and its own technology. Never another adapter (`adapter-isolation`) |
-| `apps/*` | everything, except a direct dependency on `sqlx`, `axum`, `reqwest` or `redis`. The only place where a concrete adapter meets a port |
-| `crates/testkit` | anything `deny.toml` allows (`check-arch` sets no list for it); every other crate takes it only as a dev dependency (`testkit-dev-only`) |
-| `crates/xtask` | no workspace crate (`tool-isolation`) |
+| Crate | May depend on | Enforced by |
+| --- | --- | --- |
+| `crates/kernel` | `std` and the small pure crates `thiserror`, `uuid`, `time`, `rust_decimal` | `check-arch`: normal and build dependencies only from that list; dev dependencies from it plus `tokio`, `mockall`, `insta` (`kernel-allowlist`, `kernel-dev-allowlist`) |
+| `crates/modules/<m>` | `barras-kernel`, the same pure crates and `async-trait`. Never another module, an adapter, axum, sqlx, reqwest, redis, tokio's runtime or serde_json | `check-arch`: normal and build dependencies only from that list; dev dependencies from it plus `tokio`, `mockall`, `insta` (`module-allowlist`, `module-dev-allowlist`) |
+| `crates/adapters/*` | `barras-kernel`, the module crates and its own technology. Never another adapter | `check-arch`: no other adapter (`adapter-isolation`). cargo-deny bans: a technology crate only in its own adapter. Any other library is left to review |
+| `apps/*` | everything. The only place where a concrete adapter meets a port | cargo-deny bans: no direct `sqlx`, `axum`, `reqwest` or `redis`. `check-arch`: `barras-testkit` only as a dev dependency (`testkit-dev-only`) |
+| `crates/testkit` | test-only helpers: containers, fixtures, fakes | cargo-deny bans: `sqlx` and `redis` allowed directly, `axum` and `reqwest` not. `check-arch` sets no list; every crate that uses it takes it only as a dev dependency (`testkit-dev-only`) |
+| `crates/xtask` | no workspace crate | `check-arch` (`tool-isolation`) |
 
 Reject on sight: a framework type in a module crate; a database row type in a use case signature; a handler calling a repository; a module depending on another module; `unwrap`, `expect` or `panic!` outside tests (ADR-0003, ADR-0006).
+
+### Adding a crate or a dependency
+
+- List the crate in `members` of the root `Cargo.toml`. The list is explicit, with no globs (`Cargo.toml`).
+- Its folder decides its layer: `crates/kernel`, `crates/modules/<module>`, `crates/adapters/<name>`, `apps/<name>`, `crates/testkit` or `crates/xtask`. A crate anywhere else fails (`unknown-location`, `check-arch`).
+- Give its `Cargo.toml` the fields every member has, under its own `name` (a module is `barras-<module>`):
+
+```toml
+[package]
+name = "barras-<module>"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+```
+
+- A module crate has the files and folders `check-structure` requires (see Module anatomy).
+- Declare each dependency once, with its version, in `[workspace.dependencies]` of the root `Cargo.toml`, and take it in the crate with `<name>.workspace = true`. Enable only the features you use (spec §6.2, spec §6.12).
+- Refresh `Cargo.lock` with a plain `cargo build` before committing. The checks run with `--locked`, so the hooks fail on a stale lock file (`justfile`, `.cargo/config.toml`).
 
 ### Ports and wiring
 
@@ -197,7 +218,7 @@ Reject on sight: a framework type in a module crate; a database row type in a us
 - Two pools: primary for writes and for reads that follow a write; a read pool for read models (a replica when one exists) (ADR-0007).
 - Read models aggregate in SQL. Lists use cursor pagination, never `OFFSET`, with at most 50 items per page (ADR-0007).
 - Each repository has an explicit mapper in both directions (ADR-0007).
-- The schema changes only through migrations in `migrations/`, named `YYYYMMDDHHMMSS_snake_case.sql` (ADR-0007; `check-structure`).
+- The schema changes only through migrations in `migrations/` (ADR-0007). Every non-hidden entry in `migrations/` must be named `YYYYMMDDHHMMSS_snake_case.sql` (`check-structure`).
 - SQL that looks odd (a partial index, a CHECK) carries a comment that says why (ADR-0007).
 - Money is `rust_decimal::Decimal` in Rust and `numeric` in Postgres, always with its currency. Fiat uses `numeric(20,2)`; quantities use `numeric(38,18)` (ADR-0008).
 - Timestamps are `timestamptz` in UTC. The user's time zone applies only when presenting or grouping, such as a budget's month (ADR-0008).
@@ -229,7 +250,7 @@ Reject on sight: a framework type in a module crate; a database row type in a us
 - `GET /api/v1/health` (ready: `ok`, `degraded`, or 503) and `GET /api/v1/health/live` are public. Per-dependency detail and Prometheus metrics are only on an internal port (ADR-0015).
 - Each binary loads one typed configuration from the environment at start and refuses to boot when a variable is missing (ADR-0016).
 - Every variable is listed in `.env.example` (ADR-0016).
-- Only the configuration module reads the environment. clippy denies `std::env::var` (`clippy.toml`); the configuration module allows it with the reason on the same line (ADR-0016).
+- Only the configuration module reads the environment (ADR-0016). clippy denies `std::env::var` (`clippy.toml`); review enforces the rest of the rule, including `std::env::var_os` and `std::env::vars`.
 
 ## Definition of done
 
@@ -258,7 +279,7 @@ A change is done only when the same pull request contains (ADR-0017):
 - Every change belongs to a ticket on the Trello board BARRAS. The card number is the ticket id `BAR-<n>`. One ticket per branch (ADR-0018).
 - **Branch:** from `develop`, named `type/BAR-<n>-short-slug`, at most 50 characters. The slug is lower-case letters and digits in words joined by single hyphens. Types: `feat`, `fix`, `refactor`, `perf`, `test`, `docs`, `chore`, `ci`, `build`. `main`, `develop` and a detached `HEAD` pass the check (ADR-0018; `cargo xtask check-branch` in `pre-push` and CI).
 - **Commit subject:** `type(BAR-<n>): short description starting in lower case`, at most 100 characters, with the same types. Subjects that start with `Merge ` or `Revert "` are exempt (ADR-0018; `cargo xtask check-commit-msg` in `commit-msg`, `cargo xtask check-commits` on every commit of a pull request in CI).
-- **No AI attribution** in commits or pull requests: no AI co-author trailer, no "Generated with" line, no link to an AI tool's site or session (ADR-0018). The `commit-msg` hook rejects any line that contains "generated with", whatever follows; the exact patterns are in `crates/xtask/src/git_rules.rs`.
+- **No AI attribution** in commits or pull requests: no AI co-author trailer, no "Generated with" line, no link to an AI tool's site or session (ADR-0018). The `commit-msg` hook and CI catch the patterns listed in `crates/xtask/src/git_rules.rs`, among them any line that contains "generated with", whatever follows; review catches the rest.
 - Pull requests target `develop`. `main` and `develop` are protected: no direct push, no force push, merge only when the checks pass. The owner merges (ADR-0018).
 - Agents never push, open pull requests or touch production unless the owner asks in that conversation (ADR-0018).
 - **Move the ticket's card as its state changes** (set by the owner; not yet in an ADR):

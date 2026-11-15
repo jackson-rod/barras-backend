@@ -9,8 +9,8 @@ Barras is a mobile app for people in Colombia who invest: their money and the ma
 | Tool | Version | Why |
 | --- | --- | --- |
 | Rust, through rustup | 1.100.0 with rustfmt and clippy, pinned by `rust-toolchain.toml` | Compiles, formats and lints the workspace |
-| just | 1.59.0 | Runs every command in the `justfile` |
-| lefthook | 2.2.2 | Runs the git hooks in `lefthook.yml` |
+| just | Set up with 1.59.0; a newer one is expected to work | Runs every command in the `justfile` |
+| lefthook | Set up with 2.2.2; a newer one is expected to work | Runs the git hooks in `lefthook.yml` |
 | cargo-nextest | 0.9.152, installed by `just setup` | Runs the tests (`just test`) |
 | cargo-deny | 0.20.2, installed by `just setup` | Checks advisories, licences, sources and the layer bans (`just deny`, `just check-arch`) |
 | Postgres | 18, from BAR-4 | The database |
