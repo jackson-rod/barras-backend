@@ -6,25 +6,15 @@ Date: 2026-11-15
 ## Context
 
 - Expo is the one sensible way to build the app: the faster-bundler alternative, Re.Pack with Rspack, does not properly support Expo today and would cost Expo Router and EAS builds (section 5).
-- The stack below is a set of **Calls** of the designer, not confirmed by the owner. Compile speed and a 2.0 s cold start to Home are goals.
+- The stack is a set of **Calls** of the designer, not confirmed by the owner. Compile speed and the 2.0 s cold start to Home, a budget (section 7.3), shape it.
+- The frontend has its own standards, ADRs and UI specs (section 10). Copying them here would let the two copies drift, because a pull request touches one repository.
 
 ## Decision
 
-- Expo SDK 58 with Expo Router, development builds, EAS and React Compiler on. TypeScript strict with `noUncheckedIndexedAccess`; TypeScript 7 runs the typecheck.
-- oxlint and oxfmt, bun, TanStack Query persisted to MMKV, Zustand, tokens in expo-secure-store, Unistyles 3, FlashList, Reanimated, i18next, react-hook-form with zod, RevenueCat, Jest and Maestro.
-- The chart library is chosen in the spike F-11; writing our own on Skia is the fallback.
-- `app/` holds routes only. `src/core` holds the contract, `src/features/<feature>` (kebab-case) holds `domain`, `application`, `infrastructure`, `ui` and `index.ts`, and `src/generated` holds the generated types.
-- Import rules per layer:
-  - `domain`: itself and pure libraries.
-  - `application`: its feature's `domain`, and `src/core`.
-  - `infrastructure`: its feature's `domain`, `src/core` and `src/generated`.
-  - `ui`: its feature's `application` and `domain`, `src/shared/ui` and `src/core`.
-  - `app/` routes: a feature's `index.ts` only.
-  - Another feature: only its `index.ts`.
-  - `src/core`: nothing in `features`.
+- The app is built with Expo SDK 58 on React Native with TypeScript. Re.Pack was set aside.
+- The full stack, the feature anatomy and the import rules are decided and maintained in the frontend repository: [frontend ADR-0002](https://github.com/jackson-rod/barras-frontend/blob/develop/docs/adr/0002-frontend-stack-and-feature-anatomy.md) and [module anatomy](https://github.com/jackson-rod/barras-frontend/blob/develop/docs/standards/module-anatomy.md).
 
 ## Consequences
 
-- Cost: Expo pins TypeScript 6, so two TypeScript versions are installed.
-- dependency-cruiser enforces the layers (`bun run check:arch`), running on TypeScript 6.
-- The app never decides entitlements (ADR-0002).
+- A change to the frontend stack or anatomy is made in the frontend ADR, not here.
+- This ADR changes only if the headline choice changes.

@@ -13,6 +13,8 @@ Two plans, Lite and Pro, are offered; Lite is free. The backend is Rust with a h
 4. The code is written test first, and `verify` passes.
 5. The pull request updates the module README, the schema doc and any ADR it touches.
 
+Product-wide documents live in this repository (spec section 10). The frontend's own docs are at [barras-frontend docs](https://github.com/jackson-rod/barras-frontend/tree/develop/docs).
+
 ## Where things are
 
 | Folder | What it holds | Entry file |

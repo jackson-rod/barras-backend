@@ -204,7 +204,7 @@ The messages of each conversation. Columns are defined in this module's spec.
 
 ### ingest_runs
 
-A record of each ingestion job run. Columns are defined in this module's spec.
+A record of each ingestion job run. Columns are defined by the ingest foundation ticket (F-06, BAR-6).
 
 ## Seeds
 

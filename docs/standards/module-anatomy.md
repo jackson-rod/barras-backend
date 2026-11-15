@@ -1,5 +1,7 @@
 # Module anatomy
 
+Source: [ADR-0003](../adr/0003-hexagonal-layers-enforced-by-crates.md) and [ADR-0006](../adr/0006-errors-as-typed-results.md). Change the ADR and this file in the same pull request; if they disagree, the ADR wins.
+
 This restates the foundation design, sections 6.3 to 6.6. Where this file and `code-standard.md` disagree on structure or naming, this file wins.
 
 ## Naming
@@ -59,6 +61,8 @@ A module that needs something from another module declares its own port. The com
 - `unwrap`, `expect` or `panic!` outside tests.
 
 ## Ports and wiring
+
+**Call** (section 6.5).
 
 - Ports are traits. Use cases hold `Arc<dyn Port>`; `main.rs` builds every adapter and use case by hand. Dynamic dispatch costs nothing measurable next to a database call and compiles faster than generics.
 - Async port traits use `async-trait`. If native async traits are usable behind `dyn` on the pinned toolchain, the builder may use them instead.

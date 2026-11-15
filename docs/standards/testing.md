@@ -1,5 +1,7 @@
 # Testing
 
+Source: [ADR-0017](../adr/0017-definition-of-done.md). Change the ADR and this file in the same pull request; if they disagree, the ADR wins.
+
 This restates the foundation design, sections 9 and 6.14.
 
 ## Tests per layer
@@ -14,6 +16,8 @@ A change is done only when the same pull request contains tests for every layer 
 - Errors are asserted by `code`, never by message.
 
 ## Coverage
+
+**Call** (section 9).
 
 - 95% of lines in module crates.
 - 85% overall.

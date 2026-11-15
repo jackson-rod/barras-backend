@@ -1,5 +1,7 @@
 # Performance
 
+Source: [ADR-0014](../adr/0014-performance-budgets.md). Change the ADR and this file in the same pull request; if they disagree, the ADR wins.
+
 ## Budgets
 
 Starting budgets. **Call**; the first load test tunes them through an ADR.
@@ -26,7 +28,7 @@ Starting budgets. **Call**; the first load test tunes them through an ADR.
 
 ## Sizing for launch
 
-Sizing for launch (**Call**; orders of magnitude, refined in the markets spec):
+**Call**: orders of magnitude, refined in the markets spec.
 
 - **Users:** 10,000 registered and 1,000 concurrent websocket connections. The load test checks the budgets at 200 requests per second on the dashboard. One API node must hold 10,000 connections.
 - **Instruments:** a curated catalog, not everything an exchange lists. About 50 crypto instruments (the largest Binance USDT pairs plus Buda's COP pairs) and the Colombian listings (about 57).

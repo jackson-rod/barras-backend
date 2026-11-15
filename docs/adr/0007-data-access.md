@@ -15,7 +15,7 @@ Date: 2026-11-15
 - Keep two pools: primary for writes and for reads that follow a write, and a read pool for read models (a replica when one exists).
 - Read models aggregate in SQL. Lists use cursor pagination, never `OFFSET`, with at most 50 items per page.
 - The schema changes only through migrations. SQL that looks odd, such as a partial index or a CHECK, carries a comment that says why.
-- Each repository has an explicit mapper in both directions (ADR-0003 layout).
+- Each repository has an explicit mapper in both directions (see [module anatomy](../standards/module-anatomy.md)).
 
 ## Consequences
 

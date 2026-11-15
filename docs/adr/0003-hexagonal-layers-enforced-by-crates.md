@@ -12,7 +12,7 @@ Date: 2026-11-15
 ## Decision
 
 - One crate per bounded context under `crates/modules/<module>`, holding domain, ports and use cases.
-- A module crate depends only on `kernel`, small pure crates and `async-trait`. Never on another module, an adapter, axum, sqlx, reqwest, redis, tokio's runtime or serde_json.
+- A module crate depends only on `kernel`, `thiserror`, `uuid`, `time`, `rust_decimal` and `async-trait`. Never on another module, an adapter, axum, sqlx, reqwest, redis, tokio's runtime or serde_json.
 - An adapter depends on `kernel`, the module crates and its own technology, never on another adapter. Only `apps/*` meet a concrete adapter and a port.
 - A module that needs another module declares its own port. The composition root supplies a bridge that calls the other module's use case.
 - Use cases hold `Arc<dyn Port>`, and `main.rs` builds every adapter and use case by hand. The builder may use native async traits if they work behind `dyn` on the pinned toolchain.

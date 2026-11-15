@@ -7,7 +7,7 @@ Date: 2026-11-15
 
 - Prices and the user's own data must reach the phone fast: a tick from source to phone has a p95 budget of 1 s (ADR-0014).
 - One API node must hold 10,000 connections, and a slow connection must not hurt the others.
-- The spec makes these a set of **Calls** of the designer, not confirmed by the owner.
+- Websockets are the owner's decision (section 1, Decided). The gateway details of section 6.10 below are a set of **Calls** of the designer, not confirmed by the owner.
 
 ## Decision
 
