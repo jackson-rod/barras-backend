@@ -1,6 +1,6 @@
 # Architecture decision records
 
-An architecture decision record (ADR) records one decision: the forces behind it, the rule it sets and what it costs. An ADR outranks `CLAUDE.md`: if they disagree, the ADR wins. To add one, take the next free number, create `NNNN-title.md` in this folder with the sections Context, Decision and Consequences and the line `Status: Accepted`, and add a row to the table below in the same pull request. Do not edit an accepted ADR to reverse it; write a new one.
+An architecture decision record (ADR) records one decision: the forces behind it, the rule it sets and what it costs. An ADR outranks `CLAUDE.md`: if they disagree, the ADR wins. To add one, take the next free number, create `NNNN-title.md` in this folder with the sections Context, Decision and Consequences and the line `Status: Accepted`, and add a row to the table below in the same pull request.
 
 | ADR | Title | Status |
 | --- | --- | --- |

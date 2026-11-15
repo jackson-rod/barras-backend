@@ -15,7 +15,7 @@ Date: 2026-11-15
 - Each ADR has the sections Context, Decision and Consequences, and a Status line.
 - List every ADR in the index `docs/adr/README.md`.
 - A pull request that adds or changes a decision includes its ADR.
-- An ADR outranks `CLAUDE.md`. Do not edit an accepted ADR to reverse it: write a new one.
+- An ADR outranks `CLAUDE.md`.
 
 ## Consequences
 

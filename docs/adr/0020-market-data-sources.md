@@ -8,6 +8,7 @@ Date: 2026-11-15
 - The owner named the sources: exchanges and the stock market, DANE, and banks (Decided, section 1).
 - The exchange (BVC, now nuam) licenses real-time data by contract only. The vendor found with display rights lists about USD 1,099 per month, and Yahoo has no redistribution right.
 - The terms of Binance and Buda for showing data in a commercial app are unverified (risk 3).
+- The fallback if F-10 ends without a licence (last Decision bullet) is a **Call** of the designer, not confirmed by the owner.
 
 ## Decision
 

@@ -5,7 +5,7 @@ Date: 2026-11-15
 
 ## Context
 
-- The owner decided on a hexagonal backend, and the spec sets a goal that architecture rules are enforced by the compiler and by checks, not by convention (Decided, sections 1 and 2).
+- The owner decided on a hexagonal backend, and the spec sets a goal that architecture rules are enforced by the compiler and by checks, not by convention (hexagonal: Decided, section 1; goal 8: section 2).
 - Splitting the code into many small crates also lets Cargo compile in parallel, which serves the fast feedback loop.
 - The two wiring rules below are **Calls** of the designer, not confirmed by the owner: ports are `Arc<dyn Port>`, and async ports use `async-trait`.
 

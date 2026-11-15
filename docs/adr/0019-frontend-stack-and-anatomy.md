@@ -14,7 +14,14 @@ Date: 2026-11-15
 - oxlint and oxfmt, bun, TanStack Query persisted to MMKV, Zustand, tokens in expo-secure-store, Unistyles 3, FlashList, Reanimated, i18next, react-hook-form with zod, RevenueCat, Jest and Maestro.
 - The chart library is chosen in the spike F-11; writing our own on Skia is the fallback.
 - `app/` holds routes only. `src/core` holds the contract, `src/features/<feature>` (kebab-case) holds `domain`, `application`, `infrastructure`, `ui` and `index.ts`, and `src/generated` holds the generated types.
-- Layers import only what the spec's table allows. A route or another feature imports only a feature's `index.ts`, and `src/core` imports nothing in `features`.
+- Import rules per layer:
+  - `domain`: itself and pure libraries.
+  - `application`: its feature's `domain`, and `src/core`.
+  - `infrastructure`: its feature's `domain`, `src/core` and `src/generated`.
+  - `ui`: its feature's `application` and `domain`, `src/shared/ui` and `src/core`.
+  - `app/` routes: a feature's `index.ts` only.
+  - Another feature: only its `index.ts`.
+  - `src/core`: nothing in `features`.
 
 ## Consequences
 

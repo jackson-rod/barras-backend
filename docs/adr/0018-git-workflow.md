@@ -6,6 +6,7 @@ Date: 2026-11-15
 ## Context
 
 - The working rules come from the owner's earlier project, adapted to Rust (Decided, section 1). The Trello card number is the ticket id.
+- That everything in the repositories is in English is a **Call** of the designer, not confirmed by the owner.
 - `main` and `develop` carry released and integrated work, so nothing may reach them unchecked.
 
 ## Decision
