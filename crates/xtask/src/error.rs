@@ -8,6 +8,8 @@ pub enum XtaskError {
     Io(#[from] std::io::Error),
     #[error("cargo metadata failed: {0}")]
     Metadata(String),
+    #[error("invalid pattern {pattern:?}: {message}")]
+    Pattern { pattern: String, message: String },
     #[error("git failed: {0}")]
     Git(String),
 }

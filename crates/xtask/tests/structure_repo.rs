@@ -12,3 +12,13 @@ fn the_real_repository_is_clean_from_any_directory() {
         Vec::<String>::new()
     );
 }
+
+#[test]
+fn the_command_works_from_a_subdirectory() {
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_xtask"))
+        .arg("check-structure")
+        .current_dir(workspace_root().join("crates/kernel"))
+        .status()
+        .unwrap();
+    assert!(status.success());
+}

@@ -10,17 +10,23 @@ use crate::error::XtaskError;
 
 const README: &str = "README.md";
 
-fn pattern(source: &str) -> Regex {
-    // The patterns are literals in this file; a bad one fails every test at once.
-    Regex::new(source).unwrap_or_else(|e| unreachable!("invalid pattern {source}: {e}"))
+fn pattern(source: &str) -> Result<Regex, XtaskError> {
+    Regex::new(source).map_err(|e| XtaskError::Pattern {
+        pattern: source.to_owned(),
+        message: e.to_string(),
+    })
 }
 
-/// Sorted (name, is_directory) pairs directly inside `dir`, so messages come out in a stable order.
+/// Sorted (name, is_directory) pairs, hidden entries left out, directly inside `dir`, so messages come out in a stable order.
 fn entries(dir: &Path) -> Result<Vec<(String, bool)>, XtaskError> {
     let mut found = Vec::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
+        // Finder and editors drop hidden files (.DS_Store) into any folder on their own.
+        if name.starts_with('.') {
+            continue;
+        }
         found.push((name, entry.file_type()?.is_dir()));
     }
     found.sort();
@@ -28,13 +34,14 @@ fn entries(dir: &Path) -> Result<Vec<(String, bool)>, XtaskError> {
 }
 
 pub fn check_adrs(adr_dir: &Path) -> Result<Vec<String>, XtaskError> {
-    let name_rule = pattern(r"^(\d{4})-[a-z0-9]+(-[a-z0-9]+)*\.md$");
-    let status_rule = pattern(r"^Status: (Proposed|Accepted|Superseded by ADR-\d{4})$");
-    let link_rule = pattern(r"\((\d{4}-[^()\s]+\.md)\)");
+    let name_rule = pattern(r"^(\d{4})-[a-z0-9]+(-[a-z0-9]+)*\.md$")?;
+    let status_rule = pattern(r"^Status: (Proposed|Accepted|Superseded by ADR-\d{4})$")?;
+    let link_rule = pattern(r"\((\d{4}-[^()\s]+\.md)\)")?;
     let index = fs::read_to_string(adr_dir.join(README))?;
     let mut problems = Vec::new();
     let mut files = Vec::new();
     let mut numbers = BTreeSet::new();
+    let mut duplicates = BTreeSet::new();
 
     for (file, is_dir) in entries(adr_dir)? {
         if is_dir || file == README {
@@ -64,7 +71,15 @@ pub fn check_adrs(adr_dir: &Path) -> Result<Vec<String>, XtaskError> {
         if !index.contains(&format!("({file})")) {
             problems.push(format!("{file} is not listed in {README}"));
         }
-        numbers.insert(number.parse::<u32>().unwrap_or(0));
+        match number.parse::<u32>() {
+            Ok(0) => problems.push(format!("{file}: number must start at 0001")),
+            Ok(n) => {
+                if !numbers.insert(n) {
+                    duplicates.insert(n);
+                }
+            }
+            Err(e) => problems.push(format!("{file}: number is not valid: {e}")),
+        }
         files.push(file);
     }
 
@@ -72,6 +87,9 @@ pub fn check_adrs(adr_dir: &Path) -> Result<Vec<String>, XtaskError> {
         for missing in (1..highest).filter(|n| !numbers.contains(n)) {
             problems.push(format!("ADR {missing:04} is missing"));
         }
+    }
+    for number in duplicates {
+        problems.push(format!("ADR {number:04} is used by more than one file"));
     }
     for linked in link_rule.captures_iter(&index) {
         if !files.contains(&linked[1].to_owned()) {
@@ -85,7 +103,7 @@ pub fn check_adrs(adr_dir: &Path) -> Result<Vec<String>, XtaskError> {
 }
 
 pub fn check_modules(modules_dir: &Path) -> Result<Vec<String>, XtaskError> {
-    let name_rule = pattern(r"^[a-z][a-z0-9]*(_[a-z0-9]+)*$");
+    let name_rule = pattern(r"^[a-z][a-z0-9]*(_[a-z0-9]+)*$")?;
     let mut problems = Vec::new();
     for (module, is_dir) in entries(modules_dir)? {
         if !is_dir {
@@ -127,7 +145,7 @@ pub fn check_modules(modules_dir: &Path) -> Result<Vec<String>, XtaskError> {
 }
 
 pub fn check_migrations(migrations_dir: &Path) -> Result<Vec<String>, XtaskError> {
-    let name_rule = pattern(r"^\d{14}_[a-z0-9_]+\.sql$");
+    let name_rule = pattern(r"^\d{14}_[a-z0-9_]+\.sql$")?;
     Ok(entries(migrations_dir)?
         .into_iter()
         .filter(|(name, _)| !name_rule.is_match(name))
@@ -273,5 +291,50 @@ mod tests {
         assert!(found.contains("docs/adr is missing"));
         assert!(!found.contains("modules"));
         assert!(!found.contains("migrations"));
+    }
+
+    #[test]
+    fn hidden_files_are_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "docs/adr/README.md", "[0001](0001-a.md)\n");
+        write(root, "docs/adr/0001-a.md", &adr(1, "A"));
+        write(root, "docs/adr/.DS_Store", "");
+        write(root, "crates/modules/identity/README.md", "");
+        write(root, "crates/modules/identity/src/lib.rs", "");
+        write(root, "crates/modules/identity/src/domain/errors.rs", "");
+        write(
+            root,
+            "crates/modules/identity/src/domain/user.rs",
+            "#[cfg(test)]\nmod tests {}\n",
+        );
+        write(root, "crates/modules/identity/src/ports/mod.rs", "");
+        write(
+            root,
+            "crates/modules/identity/src/application/register_user.rs",
+            "#[cfg(test)]\nmod tests {}\n",
+        );
+        write(root, "crates/modules/.DS_Store", "");
+        write(root, "migrations/20261115120000_create_users.sql", "");
+        write(root, "migrations/.DS_Store", "");
+        assert_eq!(check_structure(dir.path()).unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn adr_numbers_are_unique_and_start_at_one() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "README.md",
+            "[0](0000-zero.md)\n[1](0001-a.md)\n[2](0002-b.md)\n[2](0002-c.md)\n",
+        );
+        write(dir.path(), "0000-zero.md", &adr(0, "Zero"));
+        write(dir.path(), "0001-a.md", &adr(1, "A"));
+        write(dir.path(), "0002-b.md", &adr(2, "B"));
+        write(dir.path(), "0002-c.md", &adr(2, "C"));
+        let found = check_adrs(dir.path()).unwrap().join("\n");
+        for expected in ["0000-zero.md: number", "0002 is used by more than one file"] {
+            assert!(found.contains(expected), "{expected}\n{found}");
+        }
     }
 }
