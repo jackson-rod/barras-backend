@@ -15,7 +15,8 @@ const MODULE_ALLOWED: &[&str] = &[
     "rust_decimal",
     "async-trait",
 ];
-const MODULE_DEV_EXTRA: &[&str] = &["tokio", "mockall", "insta"];
+const DEV_EXTRA: &[&str] = &["tokio", "mockall", "insta"];
+const KERNEL: &str = "barras-kernel";
 const TESTKIT: &str = "barras-testkit";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,17 +84,16 @@ pub fn check_arch(crates: &[CrateInfo]) -> Vec<Violation> {
             let name = dep.name.as_str();
             let not_dev = dep.kind != DepKind::Dev;
             match layer {
-                Layer::Kernel if not_dev && !KERNEL_ALLOWED.contains(&name) => {
+                Layer::Kernel if not_dev && !allowed(&[KERNEL_ALLOWED], dep) => {
                     violations.push(violation(krate, name, "kernel-allowlist"));
                 }
-                Layer::Module if not_dev && !MODULE_ALLOWED.contains(&name) => {
+                Layer::Kernel if !not_dev && !allowed(&[KERNEL_ALLOWED, DEV_EXTRA], dep) => {
+                    violations.push(violation(krate, name, "kernel-dev-allowlist"));
+                }
+                Layer::Module if not_dev && !allowed(&[MODULE_ALLOWED], dep) => {
                     violations.push(violation(krate, name, "module-allowlist"));
                 }
-                Layer::Module
-                    if !not_dev
-                        && !MODULE_ALLOWED.contains(&name)
-                        && !MODULE_DEV_EXTRA.contains(&name) =>
-                {
+                Layer::Module if !not_dev && !allowed(&[MODULE_ALLOWED, DEV_EXTRA], dep) => {
                     violations.push(violation(krate, name, "module-dev-allowlist"));
                 }
                 Layer::Adapter if depends_on_adapter(crates, name) => {
@@ -112,6 +112,14 @@ pub fn check_arch(crates: &[CrateInfo]) -> Vec<Violation> {
     violations
 }
 
+/// An allowlisted name counts only from its expected source: `barras-kernel` is a
+/// workspace path, everything else comes from the registry. Otherwise a `path`, `git`
+/// or `[patch]` entry could pass a foreign crate off under an allowed name.
+fn allowed(lists: &[&[&str]], dep: &Dep) -> bool {
+    lists.iter().any(|list| list.contains(&dep.name.as_str()))
+        && dep.is_workspace == (dep.name == KERNEL)
+}
+
 fn violation(krate: &CrateInfo, dependency: &str, rule: &'static str) -> Violation {
     Violation {
         krate: krate.name.clone(),
@@ -128,6 +136,7 @@ fn depends_on_adapter(crates: &[CrateInfo], dependency: &str) -> bool {
 
 pub fn load_workspace(root: &Path) -> Result<Vec<CrateInfo>, XtaskError> {
     let metadata = MetadataCommand::new()
+        .current_dir(root)
         .manifest_path(root.join("Cargo.toml"))
         .no_deps()
         .exec()
@@ -175,7 +184,7 @@ pub fn workspace_root() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::DepKind::{Dev, Normal};
+    use super::DepKind::{Build, Dev, Normal};
     use super::*;
 
     fn krate(name: &str, dir: &str, deps: &[(&str, DepKind, bool)]) -> CrateInfo {
@@ -297,6 +306,61 @@ mod tests {
                 ("barras-api", "barras-testkit", "testkit-dev-only"),
                 ("xtask", "barras-kernel", "tool-isolation"),
                 ("barras-misc", "", "unknown-location"),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_allowed_name_from_the_wrong_source_is_a_violation() {
+        let crates = [
+            krate("barras-kernel", "crates/kernel", &[("uuid", Normal, true)]),
+            krate(
+                "barras-identity",
+                "crates/modules/identity",
+                &[
+                    ("barras-kernel", Normal, false),
+                    ("time", Normal, true),
+                    ("tokio", Dev, true),
+                ],
+            ),
+        ];
+        assert_eq!(
+            rules(&check_arch(&crates)),
+            [
+                ("barras-kernel", "uuid", "kernel-allowlist"),
+                ("barras-identity", "barras-kernel", "module-allowlist"),
+                ("barras-identity", "time", "module-allowlist"),
+                ("barras-identity", "tokio", "module-dev-allowlist"),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_and_dev_dependencies_follow_the_rules_too() {
+        let crates = [
+            krate(
+                "barras-kernel",
+                "crates/kernel",
+                &[
+                    ("cc", Build, false),
+                    ("sqlx", Dev, false),
+                    ("insta", Dev, false),
+                ],
+            ),
+            krate(
+                "barras-identity",
+                "crates/modules/identity",
+                &[("cc", Build, false)],
+            ),
+            krate("barras-api", "apps/api", &[("barras-testkit", Build, true)]),
+        ];
+        assert_eq!(
+            rules(&check_arch(&crates)),
+            [
+                ("barras-kernel", "cc", "kernel-allowlist"),
+                ("barras-kernel", "sqlx", "kernel-dev-allowlist"),
+                ("barras-identity", "cc", "module-allowlist"),
+                ("barras-api", "barras-testkit", "testkit-dev-only"),
             ]
         );
     }
