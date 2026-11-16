@@ -1,6 +1,9 @@
 //! The public application: the documented routes under `/api/v1`, wrapped in the middleware
 //! every answer goes through, and the OpenAPI document built from the same routes.
 
+use std::error::Error;
+use std::fmt;
+
 use axum::Router;
 #[cfg(any(test, feature = "testing"))]
 use axum::routing::MethodRouter;
@@ -83,18 +86,49 @@ impl HttpAppBuilder {
         self
     }
 
-    pub fn build(self) -> HttpApp {
+    /// The app, or every problem `ApiRouter` recorded about a route the document cannot
+    /// describe: an app that would serve such a route is not built.
+    pub fn build(self) -> Result<HttpApp, BuildError> {
+        if !self.routes.problems.is_empty() {
+            return Err(BuildError {
+                problems: self.routes.problems,
+            });
+        }
         // Merging documents drops the top-level `info` and extensions, so the routes are nested
         // into the base rather than the base merged into them.
         let (router, document) = OpenApiRouter::with_openapi(document_base())
-            .nest(API_PREFIX, self.routes.0)
+            .nest(API_PREFIX, self.routes.router)
             .split_for_parts();
         #[cfg(any(test, feature = "testing"))]
         let router = router.merge(self.undocumented);
-        HttpApp {
+        Ok(HttpApp {
             service: self.service,
             router: middleware::wrap(router),
             document,
-        }
+        })
     }
 }
+
+/// The routes of an app that the OpenAPI document cannot describe, one problem each.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildError {
+    problems: Vec<String>,
+}
+
+impl BuildError {
+    pub fn problems(&self) -> &[String] {
+        &self.problems
+    }
+}
+
+impl fmt::Display for BuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the OpenAPI document cannot describe every route:")?;
+        for problem in &self.problems {
+            write!(f, "\n{problem}")?;
+        }
+        Ok(())
+    }
+}
+
+impl Error for BuildError {}

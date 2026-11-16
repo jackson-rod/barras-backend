@@ -1,11 +1,19 @@
 //! The OpenAPI document of the public API: the metadata every operation carries (spec §7.2),
 //! its canonical JSON, and the check that nothing is missing.
 
+use std::collections::BTreeMap;
+
+use serde_json::Value;
 use utoipa::openapi::extensions::ExtensionsBuilder;
 use utoipa::openapi::path::{Operation, PathItem};
 use utoipa::openapi::{Info, OpenApi, Paths, RefOr, Response};
 
 use crate::error::ApiError;
+
+/// The title and the version of the public document: written here, never taken from a
+/// crate's metadata.
+const TITLE: &str = "Barras API";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The codes any route can return, whatever it does: listed once, at the top of the document,
 /// as `x-common-error-codes`, rather than on every operation. Sorted.
@@ -44,14 +52,21 @@ pub fn canonical_json(document: &OpenApi) -> Result<String, serde_json::Error> {
     Ok(json)
 }
 
-/// What the operations of `document` lack of the metadata of spec §7.2: one line per missing
-/// item, naming the method, the path and the item. Empty when nothing is missing.
+/// What `document` lacks of the metadata of spec §7.2, one line per missing item: first what
+/// its root lacks of what `document_base` writes; then each item an operation lacks, naming
+/// the method and the path; last, each operationId that more than one operation uses. Empty
+/// when nothing is missing.
 pub fn metadata_problems(document: &OpenApi) -> Vec<String> {
-    let mut problems = Vec::new();
+    let mut problems = root_problems(document);
+    let mut operation_ids: BTreeMap<&str, Vec<String>> = BTreeMap::new();
     for (path, method, operation) in operations(document) {
         let mut missing = |item: &str| problems.push(format!("{method} {path}: {item}"));
-        if is_blank(operation.operation_id.as_deref()) {
-            missing("no operationId");
+        match operation.operation_id.as_deref().map(str::trim) {
+            Some(id) if !id.is_empty() => {
+                let used_by = operation_ids.entry(id).or_default();
+                used_by.push(format!("{method} {path}"));
+            }
+            _ => missing("no operationId"),
         }
         if operation
             .tags
@@ -65,36 +80,107 @@ pub fn metadata_problems(document: &OpenApi) -> Vec<String> {
             missing("no summary");
         }
         let responses = &operation.responses.responses;
-        let enveloped_success = responses.iter().any(|(status, response)| {
-            status.starts_with('2')
-                && body_component(document, response)
-                    .and_then(|name| name.strip_prefix(SUCCESS_ENVELOPE_PREFIX))
-                    .is_some_and(|data| !data.is_empty())
-        });
-        if !enveloped_success {
-            missing("no 2xx response has a SuccessEnvelope body");
+        if !responses.keys().any(|status| is_success(status)) {
+            missing("no 2xx response");
         }
         for (status, response) in responses {
             if !matches!(response, RefOr::T(response) if !response.description.trim().is_empty()) {
                 missing(&format!("response {status} has no description"));
             }
-            let is_error = status.starts_with('4') || status.starts_with('5');
-            if is_error && body_component(document, response) != Some(ERROR_ENVELOPE) {
+            // A route with nothing to return answers `NoData`, so a 2xx without a body, a 204
+            // included, is refused like any other.
+            let body = body_component(document, response);
+            if is_success(status) && !is_success_envelope(body) {
+                missing(&format!("response {status} has no SuccessEnvelope body"));
+            }
+            if is_error(status) && body != Some(ERROR_ENVELOPE) {
                 missing(&format!("response {status} has no ErrorEnvelope body"));
             }
         }
         let extensions = operation.extensions.as_ref();
-        for key in [X_ERROR_CODES, X_PERMISSION, X_PLAN_FEATURE] {
-            if !extensions.is_some_and(|extensions| extensions.contains_key(key)) {
+        let value = |key: &str| extensions.and_then(|extensions| extensions.get(key));
+        match value(X_ERROR_CODES).map(error_codes) {
+            None => missing(&format!("no {X_ERROR_CODES}")),
+            Some(None) => missing(&format!(
+                "{X_ERROR_CODES} is not a sorted list of unique codes"
+            )),
+            Some(Some(codes)) => {
+                let common = codes
+                    .into_iter()
+                    .filter(|code| COMMON_ERROR_CODES.contains(code));
+                for code in common {
+                    missing(&format!(
+                        "{X_ERROR_CODES} repeats {code} of {X_COMMON_ERROR_CODES}"
+                    ));
+                }
+            }
+        }
+        for key in [X_PERMISSION, X_PLAN_FEATURE] {
+            if is_blank(value(key).and_then(Value::as_str)) {
                 missing(&format!("no {key}"));
             }
         }
+    }
+    for (id, used_by) in operation_ids {
+        if used_by.len() > 1 {
+            let used_by = used_by.join(" and ");
+            problems.push(format!("operationId {id} is used by {used_by}"));
+        }
+    }
+    problems
+}
+
+/// What the root of `document` lacks of what `document_base` writes there: a document nested
+/// on another root would pass every other check.
+fn root_problems(document: &OpenApi) -> Vec<String> {
+    let mut problems = Vec::new();
+    if document.info.title != TITLE {
+        problems.push(format!("info.title is not {TITLE}"));
+    }
+    if document.info.version != VERSION {
+        problems.push(format!("info.version is not {VERSION}"));
+    }
+    let common = document
+        .extensions
+        .as_ref()
+        .and_then(|extensions| extensions.get(X_COMMON_ERROR_CODES));
+    if common != Some(&Value::from(COMMON_ERROR_CODES)) {
+        let problem = format!("{X_COMMON_ERROR_CODES} is not the list of COMMON_ERROR_CODES");
+        problems.push(problem);
     }
     problems
 }
 
 fn is_blank(text: Option<&str>) -> bool {
     text.is_none_or(|text| text.trim().is_empty())
+}
+
+/// A 2xx status, or the range `2XX`.
+fn is_success(status: &str) -> bool {
+    status.starts_with('2')
+}
+
+/// A 4xx or 5xx status, a range of them, or `default`, which stands for every other status.
+fn is_error(status: &str) -> bool {
+    status.starts_with('4') || status.starts_with('5') || status == "default"
+}
+
+/// `SuccessEnvelope_` followed by the name of the data: the prefix alone wraps nothing.
+fn is_success_envelope(body: Option<&str>) -> bool {
+    body.and_then(|name| name.strip_prefix(SUCCESS_ENVELOPE_PREFIX))
+        .is_some_and(|data| !data.is_empty())
+}
+
+/// The codes of `value` when it is a list of codes, each once and in order; `None` otherwise.
+fn error_codes(value: &Value) -> Option<Vec<&str>> {
+    let codes: Vec<&str> = value
+        .as_array()?
+        .iter()
+        .map(|code| code.as_str().filter(|code| !code.trim().is_empty()))
+        .collect::<Option<_>>()?;
+    codes
+        .is_sorted_by(|earlier, later| earlier < later)
+        .then_some(codes)
 }
 
 /// The schema component the JSON body of `response` refers to, when the document has it. A
@@ -118,7 +204,7 @@ fn body_component<'a>(document: &'a OpenApi, response: &'a RefOr<Response>) -> O
 /// The root of the public document. Its `info` is written here, so that nothing comes from
 /// a crate's metadata (utoipa would write an empty licence for a crate that has none).
 pub(crate) fn document_base() -> OpenApi {
-    let info = Info::new("Barras API", env!("CARGO_PKG_VERSION"));
+    let info = Info::new(TITLE, VERSION);
     let mut document = OpenApi::new(info, Paths::new());
     let common = ExtensionsBuilder::new().add(X_COMMON_ERROR_CODES, COMMON_ERROR_CODES);
     document.extensions = Some(common.build());
@@ -126,36 +212,41 @@ pub(crate) fn document_base() -> OpenApi {
 }
 
 /// Every operation of `document`, with its path and its method, in the order of the paths and
-/// then of [`operations_mut`]. The method is in upper case, as a request spells it, except
-/// that of an additional operation, which is as the document writes it.
+/// then of [`operations_of`].
 pub(crate) fn operations(document: &OpenApi) -> Vec<(&str, &str, &Operation)> {
-    let mut found = Vec::new();
-    for (path, item) in &document.paths.paths {
-        let fixed = [
-            ("GET", &item.get),
-            ("PUT", &item.put),
-            ("POST", &item.post),
-            ("DELETE", &item.delete),
-            ("OPTIONS", &item.options),
-            ("HEAD", &item.head),
-            ("PATCH", &item.patch),
-            ("TRACE", &item.trace),
-            ("QUERY", &item.query),
-        ];
-        let fixed = fixed
-            .into_iter()
-            .filter_map(|(method, operation)| Some((method, operation.as_ref()?)));
-        let additional = item
-            .additional_operations
-            .iter()
-            .map(|(method, operation)| (method.as_str(), operation));
-        found.extend(
-            fixed
-                .chain(additional)
-                .map(|(method, operation)| (path.as_str(), method, operation)),
-        );
-    }
-    found
+    document
+        .paths
+        .paths
+        .iter()
+        .flat_map(|(path, item)| {
+            operations_of(item).map(move |(method, operation)| (path.as_str(), method, operation))
+        })
+        .collect()
+}
+
+/// Every operation of a path item, with its method, in the order of [`operations_mut`]. The
+/// method is in upper case, as a request spells it, except that of an additional operation,
+/// which is as the document writes it.
+pub(crate) fn operations_of(item: &PathItem) -> impl Iterator<Item = (&str, &Operation)> {
+    let fixed = [
+        ("GET", &item.get),
+        ("PUT", &item.put),
+        ("POST", &item.post),
+        ("DELETE", &item.delete),
+        ("OPTIONS", &item.options),
+        ("HEAD", &item.head),
+        ("PATCH", &item.patch),
+        ("TRACE", &item.trace),
+        ("QUERY", &item.query),
+    ];
+    let additional = item
+        .additional_operations
+        .iter()
+        .map(|(method, operation)| (method.as_str(), operation));
+    fixed
+        .into_iter()
+        .filter_map(|(method, operation)| Some((method, operation.as_ref()?)))
+        .chain(additional)
 }
 
 /// Every operation of a path item: the eight methods of OpenAPI 3.1, then the `query` and
@@ -180,10 +271,11 @@ pub(crate) fn operations_mut(item: &mut PathItem) -> impl Iterator<Item = &mut O
 #[cfg(test)]
 mod tests {
     use serde::Serialize;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use utoipa::ToSchema;
-    use utoipa::openapi::extensions::ExtensionsBuilder;
+    use utoipa::openapi::extensions::{Extensions, ExtensionsBuilder};
     use utoipa::openapi::path::{HttpMethod, Paths};
+    use utoipa::openapi::schema::{ObjectBuilder, Type};
     use utoipa::openapi::{Content, Info, Ref, RefOr, Response, ResponseBuilder};
     use utoipa_axum::router::OpenApiRouter;
     use utoipa_axum::routes;
@@ -191,6 +283,38 @@ mod tests {
     use super::*;
     use crate::envelope::{ApiResult, ApiSuccess, ErrorEnvelope, NoData, SuccessEnvelope};
     use crate::router::{Access, ApiRouter};
+
+    /// Two handlers of the same name, in two modules: utoipa names each operation after its
+    /// function, so both get the operationId `read`.
+    mod first {
+        use super::*;
+
+        /// Read the first.
+        #[utoipa::path(
+            get,
+            path = "/first",
+            tag = "fixtures",
+            responses((status = 200, description = "The first", body = SuccessEnvelope<Fixture>)),
+        )]
+        pub(super) async fn read() -> ApiResult<Fixture> {
+            Ok(ApiSuccess::ok("First read", Fixture { name: "first" }))
+        }
+    }
+
+    mod second {
+        use super::*;
+
+        /// Read the second.
+        #[utoipa::path(
+            get,
+            path = "/second",
+            tag = "fixtures",
+            responses((status = 200, description = "The second", body = SuccessEnvelope<Fixture>)),
+        )]
+        pub(super) async fn read() -> ApiResult<Fixture> {
+            Ok(ApiSuccess::ok("Second read", Fixture { name: "second" }))
+        }
+    }
 
     /// What the fixture route answers.
     #[derive(Serialize, ToSchema)]
@@ -238,9 +362,36 @@ mod tests {
     /// base.
     fn document_of(routes: ApiRouter) -> OpenApi {
         OpenApiRouter::with_openapi(document_base())
-            .nest("/api/v1", routes.0)
+            .nest("/api/v1", routes.router)
             .split_for_parts()
             .1
+    }
+
+    /// A described response whose JSON body is `content`.
+    fn content_of(content: RefOr<Content>) -> RefOr<Response> {
+        let mut response = ResponseBuilder::new()
+            .description("Changed by the test")
+            .build();
+        response
+            .content
+            .insert("application/json".to_owned(), content);
+        RefOr::T(response)
+    }
+
+    /// A described response whose JSON body is a schema written in place.
+    fn inline_body() -> RefOr<Response> {
+        let schema = ObjectBuilder::new().schema_type(Type::Object);
+        content_of(RefOr::T(Content::new(Some(schema))))
+    }
+
+    /// A described response whose JSON body is given by reference.
+    fn body_by_reference() -> RefOr<Response> {
+        content_of(RefOr::Ref(Ref::new("#/components/schemas/Fixture")))
+    }
+
+    /// The extensions of the fixture operation, to change one.
+    fn fixture_extensions(document: &mut OpenApi) -> &mut Extensions {
+        fixture_operation(document).extensions.as_mut().unwrap()
     }
 
     /// A document with every item of spec §7.2, to take one away from.
@@ -429,26 +580,225 @@ mod tests {
     }
 
     #[test]
-    fn no_success_with_a_success_envelope_is_one_line() {
-        // `Missing` names a component the document does not have.
-        for body in [
-            None,
-            Some("ErrorEnvelope"),
-            Some("Fixture"),
-            Some("SuccessEnvelope_Missing"),
-        ] {
+    fn no_2xx_response_is_one_line() {
+        // A success envelope counts only on a 2xx.
+        for other in [None, Some(("302", body_of("SuccessEnvelope_Fixture")))] {
             let mut document = complete();
             let responses = &mut fixture_operation(&mut document).responses.responses;
             responses.remove("200");
-            if let Some(name) = body {
-                responses.insert("200".to_owned(), body_of(name));
+            let label = other.as_ref().map(|(status, _)| *status);
+            if let Some((status, response)) = other {
+                responses.insert(status.to_owned(), response);
             }
 
             assert_eq!(
                 metadata_problems(&document),
-                ["GET /api/v1/fixtures: no 2xx response has a SuccessEnvelope body"],
-                "{body:?}"
+                ["GET /api/v1/fixtures: no 2xx response"],
+                "{label:?}"
             );
+        }
+    }
+
+    #[test]
+    fn a_2xx_without_a_success_envelope_is_one_line() {
+        // `Missing` names a component the document does not have.
+        let cases = [
+            ("an error envelope", body_of("ErrorEnvelope")),
+            ("bare data", body_of("Fixture")),
+            ("a component it lacks", body_of("SuccessEnvelope_Missing")),
+            ("only the prefix", body_of("SuccessEnvelope_")),
+            ("a body by reference", body_by_reference()),
+            ("a body in place", inline_body()),
+            (
+                "no body",
+                RefOr::T(ResponseBuilder::new().description("Empty").build()),
+            ),
+        ];
+        for (label, response) in cases {
+            let mut document = complete();
+            let components = document.components.as_mut().unwrap();
+            let schema = components.schemas["SuccessEnvelope_Fixture"].clone();
+            components
+                .schemas
+                .insert("SuccessEnvelope_".to_owned(), schema);
+            let responses = &mut fixture_operation(&mut document).responses.responses;
+            responses.insert("200".to_owned(), response);
+
+            assert_eq!(
+                metadata_problems(&document),
+                ["GET /api/v1/fixtures: response 200 has no SuccessEnvelope body"],
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_2xx_needs_a_success_envelope_and_default_an_error_envelope() {
+        let mut document = complete();
+        let responses = &mut fixture_operation(&mut document).responses.responses;
+        responses.insert("201".to_owned(), inline_body());
+        let bodiless = ResponseBuilder::new().description("Nothing to return");
+        responses.insert("204".to_owned(), RefOr::T(bodiless.build()));
+        responses.insert("default".to_owned(), inline_body());
+
+        assert_eq!(
+            metadata_problems(&document),
+            [
+                "GET /api/v1/fixtures: response 201 has no SuccessEnvelope body",
+                "GET /api/v1/fixtures: response 204 has no SuccessEnvelope body",
+                "GET /api/v1/fixtures: response default has no ErrorEnvelope body",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_default_response_without_the_error_envelope_is_one_line() {
+        for (label, response) in [
+            ("a success envelope", body_of("SuccessEnvelope_Fixture")),
+            ("a body by reference", body_by_reference()),
+            ("a body in place", inline_body()),
+            (
+                "no body",
+                RefOr::T(ResponseBuilder::new().description("Empty").build()),
+            ),
+        ] {
+            let mut document = complete();
+            let responses = &mut fixture_operation(&mut document).responses.responses;
+            responses.insert("default".to_owned(), response);
+
+            assert_eq!(
+                metadata_problems(&document),
+                ["GET /api/v1/fixtures: response default has no ErrorEnvelope body"],
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_operation_id_used_twice_is_one_line_naming_every_operation() {
+        let routes = ApiRouter::new()
+            .route(routes!(first::read), Access::public(), &[])
+            .route(routes!(second::read), Access::public(), &[]);
+
+        assert_eq!(
+            metadata_problems(&document_of(routes)),
+            ["operationId read is used by GET /api/v1/first and GET /api/v1/second"]
+        );
+    }
+
+    #[test]
+    fn a_permission_or_a_plan_feature_that_is_blank_or_not_text_is_missing() {
+        for (key, value) in [
+            ("x-permission", json!("")),
+            ("x-permission", json!(" ")),
+            ("x-permission", json!(5)),
+            ("x-plan-feature", json!(" ")),
+            ("x-plan-feature", Value::Null),
+        ] {
+            let mut document = complete();
+            fixture_extensions(&mut document).insert(key.to_owned(), value.clone());
+
+            assert_eq!(
+                metadata_problems(&document),
+                [format!("GET /api/v1/fixtures: no {key}")],
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_error_codes_must_be_a_sorted_list_of_unique_codes() {
+        for codes in [
+            json!({ "not": "an array" }),
+            json!("FIXTURE_GONE"),
+            json!(["FIXTURE_LOCKED", "FIXTURE_GONE"]),
+            json!(["FIXTURE_GONE", "FIXTURE_GONE"]),
+            json!(["FIXTURE_GONE", 1]),
+            json!([" "]),
+        ] {
+            let mut document = complete();
+            fixture_extensions(&mut document).insert("x-error-codes".to_owned(), codes.clone());
+
+            assert_eq!(
+                metadata_problems(&document),
+                ["GET /api/v1/fixtures: x-error-codes is not a sorted list of unique codes"],
+                "{codes}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_codes_of_a_route_do_not_repeat_a_common_code() {
+        let routes = ApiRouter::new().route(
+            routes!(read_fixture),
+            Access::public(),
+            &[
+                ApiError::INTERNAL_ERROR,
+                "FIXTURE_GONE",
+                ApiError::MALFORMED_REQUEST,
+            ],
+        );
+
+        assert_eq!(
+            metadata_problems(&document_of(routes)),
+            [
+                "GET /api/v1/fixtures: x-error-codes repeats INTERNAL_ERROR of x-common-error-codes",
+                "GET /api/v1/fixtures: x-error-codes repeats MALFORMED_REQUEST of x-common-error-codes",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_document_not_rooted_on_the_base_is_reported() {
+        let routes: ApiRouter =
+            ApiRouter::new().route(routes!(read_fixture), Access::public(), &["FIXTURE_GONE"]);
+
+        let document = OpenApiRouter::default()
+            .nest("/api/v1", routes.router)
+            .split_for_parts()
+            .1;
+
+        assert_eq!(
+            metadata_problems(&document),
+            [
+                "info.title is not Barras API".to_owned(),
+                format!("info.version is not {}", env!("CARGO_PKG_VERSION")),
+                "x-common-error-codes is not the list of COMMON_ERROR_CODES".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn each_item_of_the_root_is_one_line() {
+        let mut retitled = complete();
+        retitled.info.title = "Other API".to_owned();
+        let mut reversioned = complete();
+        reversioned.info.version = "0.0.0".to_owned();
+        let mut short = complete();
+        let common = short.extensions.as_mut().unwrap();
+        common.insert(
+            "x-common-error-codes".to_owned(),
+            json!(&COMMON_ERROR_CODES[1..]),
+        );
+        let mut bare = complete();
+        bare.extensions = None;
+
+        for (document, problem) in [
+            (retitled, "info.title is not Barras API".to_owned()),
+            (
+                reversioned,
+                format!("info.version is not {}", env!("CARGO_PKG_VERSION")),
+            ),
+            (
+                short,
+                "x-common-error-codes is not the list of COMMON_ERROR_CODES".to_owned(),
+            ),
+            (
+                bare,
+                "x-common-error-codes is not the list of COMMON_ERROR_CODES".to_owned(),
+            ),
+        ] {
+            assert_eq!(metadata_problems(&document), [problem]);
         }
     }
 
@@ -554,8 +904,8 @@ mod tests {
             [
                 "POST /api/v1/careless: no tag",
                 "POST /api/v1/careless: no summary",
-                "POST /api/v1/careless: no 2xx response has a SuccessEnvelope body",
                 "POST /api/v1/careless: response 200 has no description",
+                "POST /api/v1/careless: response 200 has no SuccessEnvelope body",
                 "POST /api/v1/careless: response 409 has no ErrorEnvelope body",
             ]
         );

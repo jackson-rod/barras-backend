@@ -1,11 +1,16 @@
 //! The door to the public API: a route is a documented handler registered together with what
 //! it needs from the caller and the error codes of its own it can return.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use barras_kernel::Feature;
+use utoipa::openapi::RefOr;
 use utoipa::openapi::extensions::ExtensionsBuilder;
+use utoipa::openapi::path::Paths;
+use utoipa::openapi::schema::Schema;
 use utoipa_axum::router::{OpenApiRouter, UtoipaMethodRouter};
 
-use crate::openapi::{X_ERROR_CODES, X_PERMISSION, X_PLAN_FEATURE, operations_mut};
+use crate::openapi::{X_ERROR_CODES, X_PERMISSION, X_PLAN_FEATURE, operations_mut, operations_of};
 
 /// What a route needs from the caller: a permission and a plan feature, each optional. The
 /// document states them from this value, and the guard that will enforce them reads the same
@@ -38,30 +43,54 @@ impl Access {
 
 /// The only way to add a route to the public API. A route is made of handlers that carry
 /// `#[utoipa::path]`, gathered by `routes!`, so the router and the OpenAPI document are built
-/// from the same values. There is no way to add a bare axum route.
-pub struct ApiRouter<S = ()>(pub(crate) OpenApiRouter<S>);
+/// from the same values.
+///
+/// A route can still be built by hand, as the tuple `routes!` makes. [`ApiRouter::route`]
+/// refuses one the document cannot describe, and `HttpAppBuilder::build` then refuses the app;
+/// a method the tuple serves and its document lacks is left to the test client's route guard.
+pub struct ApiRouter<S = ()> {
+    pub(crate) router: OpenApiRouter<S>,
+    /// One line for each route refused and each schema name given two shapes.
+    pub(crate) problems: Vec<String>,
+}
+
+/// The schema components of a document, by name.
+type Schemas = BTreeMap<String, RefOr<Schema>>;
 
 impl<S: Clone + Send + Sync + 'static> ApiRouter<S> {
     /// A router with no route, whose document holds nothing else: the title, the version and
     /// the codes common to every route are written once, at the root of the public document.
     pub fn new() -> Self {
-        // `OpenApiRouter::new()` would stamp utoipa-axum's own title, version and licence.
-        Self(OpenApiRouter::default())
+        Self {
+            // `OpenApiRouter::new()` would stamp utoipa-axum's own title, version and licence.
+            router: OpenApiRouter::default(),
+            problems: Vec::new(),
+        }
     }
 
-    /// Adds the handlers of `route`, made with `routes!` from handlers of one path: utoipa-axum
-    /// serves each handler of the call on every path the call names.
+    /// Adds the handlers of `route`, made with `routes!` from handlers of one path.
     ///
     /// Every operation of the route gets `x-permission` and `x-plan-feature` from `access`,
     /// and `x-error-codes`: `error_codes`, the codes of its own the route can return, sorted,
     /// each once. These replace any key of the same name the handler declared itself.
+    ///
+    /// A route the document cannot describe is not added; a problem is recorded instead. That
+    /// is a route that names other than exactly one path (utoipa-axum serves each handler of a
+    /// `routes!` call on every path the call names), whose path documents no operation, or
+    /// that brings a schema under a name already registered with another shape (one of the two
+    /// would document the routes of the other).
     pub fn route(
-        self,
+        mut self,
         route: UtoipaMethodRouter<S>,
         access: Access,
         error_codes: &'static [&'static str],
     ) -> Self {
         let (schemas, mut paths, method_router) = route;
+        let problems = route_problems(&paths, &schemas, registered_schemas(&self.router));
+        if !problems.is_empty() {
+            self.problems.extend(problems);
+            return self;
+        }
         let mut codes = error_codes.to_vec();
         codes.sort_unstable();
         codes.dedup();
@@ -76,18 +105,35 @@ impl<S: Clone + Send + Sync + 'static> ApiRouter<S> {
                 None => operation.extensions = Some(extensions),
             }
         }
-        Self(self.0.routes((schemas, paths, method_router)))
+        self.router = self.router.routes((schemas, paths, method_router));
+        self
     }
 
-    /// Adds every route of `other`, with its documentation. A method and path both routers
-    /// serve makes axum panic, as it does for any two routes that overlap.
-    pub fn merge(self, other: Self) -> Self {
-        Self(self.0.merge(other.0))
+    /// Adds every route of `other`, with its documentation and its problems. A schema name the
+    /// two hold with different shapes is a problem. A method and path both routers serve makes
+    /// axum panic, as it does for any two routes that overlap.
+    pub fn merge(mut self, other: Self) -> Self {
+        let ours = registered_schemas(&self.router);
+        for (name, schema) in registered_schemas(&other.router).into_iter().flatten() {
+            if ours
+                .and_then(|ours| ours.get(name))
+                .is_some_and(|ours| ours != schema)
+            {
+                let problem = format!("the merged routers hold two schemas named {name}");
+                self.problems.push(problem);
+            }
+        }
+        self.problems.extend(other.problems);
+        self.router = self.router.merge(other.router);
+        self
     }
 
     /// Gives the routes their state.
     pub fn with_state<S2>(self, state: S) -> ApiRouter<S2> {
-        ApiRouter(self.0.with_state(state))
+        ApiRouter {
+            router: self.router.with_state(state),
+            problems: self.problems,
+        }
     }
 }
 
@@ -97,12 +143,66 @@ impl<S: Clone + Send + Sync + 'static> Default for ApiRouter<S> {
     }
 }
 
+fn registered_schemas<S: Clone + Send + Sync + 'static>(
+    router: &OpenApiRouter<S>,
+) -> Option<&Schemas> {
+    let components = router.get_openapi().components.as_ref()?;
+    Some(&components.schemas)
+}
+
+/// Why the document cannot describe the route of `paths` and `schemas`, one line each, given
+/// the schemas already `registered`.
+fn route_problems(
+    paths: &Paths,
+    schemas: &[(String, RefOr<Schema>)],
+    registered: Option<&Schemas>,
+) -> Vec<String> {
+    let named: Vec<&str> = paths.paths.keys().map(String::as_str).collect();
+    let mut problems = Vec::new();
+    match named.as_slice() {
+        [] => problems.push("a route names no path".to_owned()),
+        [path]
+            if paths
+                .paths
+                .values()
+                .all(|item| operations_of(item).next().is_none()) =>
+        {
+            problems.push(format!("the route at {path} documents no operation"));
+        }
+        [_] => {}
+        many => problems.push(format!(
+            "a route names {} paths, {}: give routes! the handlers of one path",
+            many.len(),
+            many.join(" and ")
+        )),
+    }
+    let mut brought: BTreeMap<&str, &RefOr<Schema>> = BTreeMap::new();
+    let mut clashes = BTreeSet::new();
+    for (name, schema) in schemas {
+        let earlier = registered
+            .and_then(|registered| registered.get(name))
+            .or_else(|| brought.get(name.as_str()).copied());
+        if earlier.is_some_and(|earlier| earlier != schema) {
+            clashes.insert(name.as_str());
+        }
+        brought.insert(name, schema);
+    }
+    problems.extend(clashes.into_iter().map(|name| {
+        let at = named.join(" and ");
+        format!("the route at {at} brings a schema {name} unlike the one of that name")
+    }));
+    problems
+}
+
 #[cfg(test)]
 mod tests {
+    use axum::body::Body;
     use axum::extract::State;
-    use axum::routing::MethodRouter;
+    use axum::http::Request;
+    use axum::routing::{MethodRouter, get};
     use serde::Serialize;
     use serde_json::{Value, json};
+    use tower::ServiceExt;
     use utoipa::ToSchema;
     use utoipa::openapi::path::{HttpMethod, Operation, PathItem, Paths};
     use utoipa::openapi::{Info, OpenApi};
@@ -110,6 +210,71 @@ mod tests {
 
     use super::*;
     use crate::envelope::{ApiResult, ApiSuccess, ErrorEnvelope, SuccessEnvelope};
+
+    /// Another module's type of the same name as this one's, and a route that answers it.
+    mod other {
+        use super::*;
+
+        /// What another module calls a fixture.
+        #[derive(Serialize, ToSchema)]
+        pub(super) struct Fixture {
+            size: u8,
+        }
+
+        /// Read the other fixture.
+        #[utoipa::path(
+            get,
+            path = "/others",
+            tag = "fixtures",
+            responses((status = 200, description = "The other", body = SuccessEnvelope<Fixture>)),
+        )]
+        pub(super) async fn read_other() -> ApiResult<Fixture> {
+            Ok(ApiSuccess::ok("Other read", Fixture { size: 1 }))
+        }
+
+        /// Replace the fixture with the other module's.
+        #[utoipa::path(
+            put,
+            path = "/fixtures",
+            tag = "fixtures",
+            responses((status = 200, description = "The other", body = SuccessEnvelope<Fixture>)),
+        )]
+        pub(super) async fn replace_with_other() -> ApiResult<Fixture> {
+            Ok(ApiSuccess::ok("Fixture replaced", Fixture { size: 2 }))
+        }
+    }
+
+    /// Create a widget.
+    #[utoipa::path(
+        post,
+        path = "/widgets",
+        tag = "fixtures",
+        responses((status = 200, description = "The widget", body = SuccessEnvelope<Fixture>)),
+    )]
+    async fn create_widget() -> ApiResult<Fixture> {
+        Ok(ApiSuccess::ok("Widget created", Fixture { name: "widget" }))
+    }
+
+    /// The status `router` answers `method path` with, when nothing else serves it.
+    async fn status_of(router: ApiRouter, method: &str, path: &str) -> u16 {
+        let (router, _) = router.router.split_for_parts();
+        let request = Request::builder()
+            .method(method)
+            .uri(path)
+            .body(Body::empty())
+            .unwrap();
+        let Ok(response) = router.oneshot(request).await;
+        response.status().as_u16()
+    }
+
+    /// A route built by hand: `paths` documented, `GET` served.
+    fn by_hand(paths: Paths) -> UtoipaMethodRouter {
+        (Vec::new(), paths, get(read_fixture))
+    }
+
+    fn paths_of(document: &OpenApi) -> Vec<&str> {
+        document.paths.paths.keys().map(String::as_str).collect()
+    }
 
     /// What every fixture route answers.
     #[derive(Serialize, ToSchema)]
@@ -169,7 +334,7 @@ mod tests {
     }
 
     fn document_of<S: Clone + Send + Sync + 'static>(router: ApiRouter<S>) -> OpenApi {
-        router.0.into_openapi()
+        router.router.into_openapi()
     }
 
     fn operation<'a>(document: &'a OpenApi, path: &str, method: HttpMethod) -> &'a Operation {
@@ -373,5 +538,167 @@ mod tests {
             "{:?}",
             document.info.title
         );
+    }
+
+    #[test]
+    fn a_default_router_is_a_new_one() {
+        let router = ApiRouter::<()>::default();
+
+        assert!(router.problems.is_empty());
+        assert!(document_of(router).paths.paths.is_empty());
+    }
+
+    fn two_paths() -> ApiRouter {
+        ApiRouter::new().route(routes!(read_fixture, create_widget), Access::public(), &[])
+    }
+
+    #[tokio::test]
+    async fn a_route_naming_two_paths_is_a_problem_and_neither_is_served_or_documented() {
+        let router = two_paths();
+
+        assert_eq!(
+            router.problems,
+            [
+                "a route names 2 paths, /fixtures and /widgets: give routes! the handlers of one path"
+            ]
+        );
+        assert!(document_of(two_paths()).paths.paths.is_empty());
+        for (method, path) in [
+            ("GET", "/fixtures"),
+            ("POST", "/widgets"),
+            ("GET", "/widgets"),
+        ] {
+            assert_eq!(
+                status_of(two_paths(), method, path).await,
+                404,
+                "{method} {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_route_naming_no_path_is_a_problem() {
+        let router: ApiRouter =
+            ApiRouter::new().route(by_hand(Paths::new()), Access::public(), &[]);
+
+        assert_eq!(router.problems, ["a route names no path"]);
+    }
+
+    fn operationless() -> ApiRouter {
+        let mut paths = Paths::new();
+        paths
+            .paths
+            .insert("/hidden".to_owned(), PathItem::default());
+        ApiRouter::new().route(by_hand(paths), Access::public(), &[])
+    }
+
+    #[tokio::test]
+    async fn a_path_with_no_operation_is_a_problem_and_is_not_served() {
+        let router = operationless();
+
+        assert_eq!(
+            router.problems,
+            ["the route at /hidden documents no operation"]
+        );
+        assert!(document_of(operationless()).paths.paths.is_empty());
+        assert_eq!(status_of(operationless(), "GET", "/hidden").await, 404);
+    }
+
+    #[test]
+    fn a_problem_does_not_stop_the_routes_after_it() {
+        let router = two_paths().route(routes!(read_owner), Access::public(), &[]);
+
+        assert_eq!(router.problems.len(), 1);
+        assert_eq!(paths_of(&document_of(router)), ["/fixtures/owner"]);
+    }
+
+    #[test]
+    fn merge_carries_the_problems_of_both_routers() {
+        let merged = two_paths().merge(operationless());
+
+        assert_eq!(
+            merged.problems,
+            [
+                "a route names 2 paths, /fixtures and /widgets: give routes! the handlers of one path",
+                "the route at /hidden documents no operation",
+            ]
+        );
+    }
+
+    #[test]
+    fn with_state_keeps_the_problems() {
+        let pathless = (Vec::new(), Paths::new(), MethodRouter::new());
+        let router: ApiRouter = ApiRouter::<&'static str>::new()
+            .route(pathless, Access::public(), &[])
+            .with_state("hello");
+
+        assert_eq!(router.problems, ["a route names no path"]);
+    }
+
+    #[test]
+    fn a_schema_name_taken_by_another_shape_is_a_problem_and_the_route_is_not_added() {
+        let router: ApiRouter = ApiRouter::new()
+            .route(routes!(read_fixture), Access::public(), &[])
+            .route(routes!(other::read_other), Access::public(), &[]);
+
+        assert_eq!(
+            router.problems,
+            [
+                "the route at /others brings a schema Fixture unlike the one of that name",
+                "the route at /others brings a schema SuccessEnvelope_Fixture unlike the one of that name",
+            ]
+        );
+        assert_eq!(paths_of(&document_of(router)), ["/fixtures"]);
+    }
+
+    #[test]
+    fn handlers_of_one_route_that_bring_two_shapes_of_a_name_are_a_problem() {
+        let router: ApiRouter = ApiRouter::new().route(
+            routes!(read_fixture, other::replace_with_other),
+            Access::public(),
+            &[],
+        );
+
+        assert_eq!(
+            router.problems,
+            [
+                "the route at /fixtures brings a schema Fixture unlike the one of that name",
+                "the route at /fixtures brings a schema SuccessEnvelope_Fixture unlike the one of that name",
+            ]
+        );
+        assert!(document_of(router).paths.paths.is_empty());
+    }
+
+    #[test]
+    fn merge_finds_a_schema_name_with_two_shapes() {
+        let fixtures: ApiRouter =
+            ApiRouter::new().route(routes!(read_fixture), Access::public(), &[]);
+        let others: ApiRouter =
+            ApiRouter::new().route(routes!(other::read_other), Access::public(), &[]);
+
+        let merged = fixtures.merge(others);
+
+        assert_eq!(
+            merged.problems,
+            [
+                "the merged routers hold two schemas named Fixture",
+                "the merged routers hold two schemas named SuccessEnvelope_Fixture",
+            ]
+        );
+    }
+
+    #[test]
+    fn routes_that_share_a_schema_are_no_problem() {
+        let together: ApiRouter = ApiRouter::new()
+            .route(routes!(read_fixture), Access::public(), &[])
+            .route(routes!(read_owner), Access::public(), &[]);
+        let fixtures: ApiRouter =
+            ApiRouter::new().route(routes!(read_fixture), Access::public(), &[]);
+        let owners: ApiRouter = ApiRouter::new().route(routes!(read_owner), Access::public(), &[]);
+
+        let merged = fixtures.merge(owners);
+
+        assert!(together.problems.is_empty(), "{:?}", together.problems);
+        assert!(merged.problems.is_empty(), "{:?}", merged.problems);
     }
 }

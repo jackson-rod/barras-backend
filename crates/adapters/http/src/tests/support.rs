@@ -159,7 +159,10 @@ pub(super) fn fixture_routes() -> ApiRouter {
 }
 
 pub(super) fn fixture_app() -> HttpApp {
-    HttpApp::builder(SERVICE).routes(fixture_routes()).build()
+    HttpApp::builder(SERVICE)
+        .routes(fixture_routes())
+        .build()
+        .unwrap()
 }
 
 pub(super) fn client() -> TestClient {
