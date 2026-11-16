@@ -226,11 +226,11 @@ pub struct ConfigError;   // problems() -> &[ConfigProblem] (name, ProblemKind::
 
 // logging.rs
 pub fn init_logging(env: AppEnv, level: LogLevel) -> Result<(), LoggingError>;
-pub fn subscriber<W>(env: AppEnv, level: LogLevel, writer: W) -> impl tracing::Subscriber + Send + Sync;
+pub fn build_subscriber<W>(env: AppEnv, level: LogLevel, writer: W) -> impl tracing::Subscriber + Send + Sync;
 
 // shutdown.rs (Unix only: install() registers SIGTERM and SIGINT inside the tokio runtime)
 pub struct ShutdownSignal;
-impl ShutdownSignal { pub fn install() -> Result<Self, std::io::Error>; pub async fn recv(self); }
+impl ShutdownSignal { pub fn install() -> Result<Self, std::io::Error>; pub async fn recv(&mut self); }   // install() outside a runtime: an error, not a panic
 ```
 
 **Rules the tests pin**
@@ -238,9 +238,10 @@ impl ShutdownSignal { pub fn install() -> Result<Self, std::io::Error>; pub asyn
 - A problem line is `<NAME> is missing: expected <EXPECTED>` or `<NAME> is not valid: expected <EXPECTED>`. With a value such as `hunter2-secret` set for a variable, the error text does not contain it.
 - `from_process` reads only the names a configuration asks for, and a value that is not Unicode is not valid. It carries the one `#[allow(clippy::disallowed_methods)]`, with its reason.
 - `clippy.toml` disallows `std::env::var`, `std::env::var_os`, `std::env::vars` and `std::env::vars_os`. `xtask` reads `std::env::args`, which stays allowed.
-- JSON format: every line parses as JSON and has `timestamp`, `level`, `target`, `message`; an event inside a span with `request_id` carries it under `spans`. `Local` gives readable lines, not JSON. A level below `level` is not written. The format is A.5.
+- JSON format: every line is one JSON object with exactly the top-level keys `timestamp`, `level`, `target`, `fields` and, inside a span, `spans`. The event's fields, `message` included, are under `fields` and the spans' fields under `spans`, so no field can shadow a top-level key; a test parses each line into a struct that refuses unknown and duplicate keys. An event inside a span with `request_id` carries it under `spans`. `Local` gives readable lines, not JSON. A level below `level` is not written. The format is A.5.
 - `init_logging` twice returns an error, not a panic.
-- `ShutdownSignal` is exercised by the process tests of Tasks 11 and 12, not here: a test cannot signal its own process safely.
+- `finish` fails on any recorded problem, whatever `config` is: a variable that was read but left out of the configuration still stops the start-up. A value that is not valid Unicode is `Invalid`, even for a type that accepts any text.
+- `ShutdownSignal`: after `install()`, a test sends SIGTERM, and another SIGINT, to its own process with the `kill` program, and `recv` returns (nextest runs each test in its own process, and tokio's handler is in place); a signal sent before `recv` is kept. `install()` outside a tokio runtime is an error, not a panic. Tokio never removes its handlers, so a second signal during the drain is ignored until `recv` is called again; say so in the doc of `recv`.
 
 **Steps**
 - [ ] Create the crate with the member fields of `CLAUDE.md`; `cargo xtask check-arch` is clean.
@@ -571,6 +572,8 @@ pub async fn run(config: ApiConfig) -> Result<(), RunError>;  // logs, bind both
 pub fn main_with_args(args: &[String]) -> ExitCode;           // no argument: serve; `openapi`; `openapi --check <file>`
 ```
 
+`ApiConfig::from_env` reads each variable with `Environment::required`, builds the struct with `?` inside a helper closure (`(|| Some(ApiConfig { env: env?, … }))()`), and hands that to `Environment::finish`, which reports every problem at once.
+
 `main.rs` is `fn main() -> ExitCode { barras_api::cli::main_with_args(&args) }` and nothing else. The serve mode loads the configuration, and on a `ConfigError` prints its lines to standard error (one `#[allow(clippy::print_stderr)]`, with its reason: the logs are not up, the configuration they need has just failed) and returns a non-zero status before any socket is opened. It then builds the tokio runtime by hand and blocks on `run`.
 
 **Rules the tests pin**
@@ -717,14 +720,14 @@ Skill: `documentation-and-adrs`.
 | ADR | Decision |
 | --- | --- |
 | 0024 (amended, then `Accepted`) | Adds: members known by their folder, and `package-name`; `path-outside-members` and `apps-are-roots`; `barras-kernel` only at the member's path; the `workspace-hack` exception (a path dependency in the kernel's and modules' lists, a wrapper in the bans, `xtask` left out) and the two rules that make it safe, `hack-isolation` and `hack-is-a-stub`; the bans on `axum-core`, `hyper`, `hyper-util` and the deny list of alternatives. Its Context says the owner confirmed the stricter rule on 2026-11-15 |
-| 0026 | `barras-bootstrap`: what it holds, its row in the dependency table, the two rules |
+| 0026 | `barras-bootstrap`: what it holds, its row in the dependency table, the two rules; Barras builds and runs only on Unix, because the shutdown signal is SIGTERM and SIGINT |
 | 0027 | Tiers by file name (`e2e_`, `int_`); coverage over production lines, per crate; the kernel at 95%; what is not measured; doctests outside the measure; how `check-coverage` reads the sources (`syn`, `#[cfg(test)]` items) and the shapes it refuses; its accepted limits (Task 2) |
 | 0028 | `barras-api openapi` and `--check`; the canonical file; the metadata of spec §7.2; `ApiRouter` as the only door; the three-layer guard |
 | 0029 | The adapter's own codes and statuses; camelCase; no 204; `x-request-id`; the body limit and compression; the internal port without envelope; metrics from an explicit registry |
 
 ADR-0003, ADR-0015, ADR-0016 and ADR-0017 keep their Decisions. A Consequence that is no longer accurate gets a pointer: ADR-0003 and the design §6.4 (`check-arch` has lists only for the kernel and the modules: ADR-0024); ADR-0015 (the internal port: ADR-0029); ADR-0016 (clippy now denies the four ways of reading the environment); ADR-0017 (how coverage is measured: ADR-0027).
 
-**`CLAUDE.md`:** the commands table and the `cargo xtask` subcommands; the layout (`crates/bootstrap`, `crates/workspace-hack`, `.config/hakari.toml`, `openapi.json`, `.env.example`); the dependency table (the two new rows, the kernel path rule, the new bans); "Adding a crate or a dependency" (`just hakari`, the `use workspace_hack as _;` line); the API rules (the adapter's codes, handlers use `ApiRouter` and the validating extractors only, `just openapi` after a route change); logging and configuration (the four disallowed methods, no default in code); the definition of done (how coverage is measured, the tier names).
+**`CLAUDE.md`:** the commands table and the `cargo xtask` subcommands; the layout (`crates/bootstrap`, `crates/workspace-hack`, `.config/hakari.toml`, `openapi.json`, `.env.example`); the dependency table (the two new rows, the kernel path rule, the new bans); "Adding a crate or a dependency" (`just hakari`, the `use workspace_hack as _;` line); the API rules (the adapter's codes, handlers use `ApiRouter` and the validating extractors only, `just openapi` after a route change); logging and configuration (the four disallowed methods, no default in code, the shape of a JSON log line and that every event has a message); members known by their folder, not by their package name (ADR-0024); the definition of done (how coverage is measured, the tier names).
 
 **`README.md`:** what you need (cargo-llvm-cov, cargo-hakari, watchexec; how to add `rust-src` for an editor; the rustup version that accepts `rustup toolchain install` without arguments, only if verified against rustup's own documentation, otherwise leave the row as it is); first run (`cp .env.example .env`, `just dev`, the two addresses and what answers on each); everyday commands; the CI table; where things are; the `just lint` row says cargo's own warnings are denied; the two present-state sentences are rewritten so they do not go stale again. The Docker row stays "from BAR-4".
 
@@ -844,15 +847,14 @@ async fn from_request(req: Request, state: &S) -> Result<Self, ApiError> {
 
 ```rust
 match env {
-    AppEnv::Local => fmt::layer().with_ansi(false).with_target(true).with_writer(writer).boxed(),
-    _ => fmt::layer().json().flatten_event(true).with_current_span(true).with_span_list(true)
-             .with_target(true).with_writer(writer).boxed(),
+    AppEnv::Local => fmt::layer().with_ansi(false).with_writer(writer).boxed(),
+    _ => fmt::layer().json().with_current_span(false).with_span_list(true).with_writer(writer).boxed(),
 }
 // tracing_subscriber::registry().with(layer).with(level_filter); try_init() for the process
 ```
 
 - The default timer already prints RFC 3339 in UTC. tracing-subscriber needs the feature `json`.
-- A span's fields are under `span` and `spans`, not at the top level; `spans[0]` is the request span.
+- The event's fields, `message` included, are under `fields`, and the spans' fields under `spans`; `spans[0]` is the request span. Nothing an event or a span writes can collide with a top-level key. `flatten_event(true)`, tried first, let a field named `level` or `timestamp` write a second key of the same name, which parsers read as the line's own.
 - Capture in a test: a `Clone` wrapper over `Arc<Mutex<Vec<u8>>>` that implements `io::Write` and `MakeWriter`; `tracing::subscriber::set_default` on a current-thread runtime. It is thread-local: a multi-thread runtime loses the events.
 
 ### A.6 Serving and stopping
