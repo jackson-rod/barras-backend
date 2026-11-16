@@ -4,7 +4,7 @@ use std::process::{Command, ExitCode};
 
 use xtask::{arch, git_rules, structure};
 
-const USAGE: &str = "subcommands:\n  check-branch [name]\n  check-commit-msg <file>\n  check-commits <range>\n  check-arch\n  check-structure";
+const USAGE: &str = "subcommands:\n  check-branch [name]\n  check-commit-msg <file>\n  check-commits <range>\n  check-pr <file>\n  check-arch\n  check-structure";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -14,6 +14,7 @@ fn main() -> ExitCode {
         ["check-branch", name] => git_rules::check_branch_name(name).map_err(|e| vec![e]),
         ["check-commit-msg", file] => check_commit_file(file),
         ["check-commits", range] => check_commit_range(range),
+        ["check-pr", file] => check_pr_file(file),
         ["check-arch"] => check_architecture(),
         ["check-structure"] => check_repository_structure(),
         _ => {
@@ -64,6 +65,15 @@ fn check_commit_file(file: &str) -> Problems {
     git_rules::check_commit_message(&git_rules::strip_git_noise(&raw)).map_err(|e| vec![e])
 }
 
+/// The title on the first line, a blank line, then the description: a squash merge turns
+/// them into the commit that lands on `develop`. Taken as it is, because the description
+/// is Markdown and a `## Heading` line is content, not a git comment.
+fn check_pr_file(file: &str) -> Problems {
+    let text =
+        std::fs::read_to_string(file).map_err(|e| vec![format!("could not read {file}: {e}")])?;
+    git_rules::check_commit_message(&text).map_err(|e| vec![e])
+}
+
 fn check_commit_range(range: &str) -> Problems {
     let hashes = git(&["log", "--format=%H", range]).map_err(|e| vec![e])?;
     let mut problems = Vec::new();
@@ -85,8 +95,8 @@ fn check_commit_range(range: &str) -> Problems {
 }
 
 fn check_architecture() -> Problems {
-    let crates = arch::load_workspace(&arch::workspace_root()).map_err(|e| vec![e.to_string()])?;
-    let violations = arch::check_arch(&crates);
+    let violations =
+        arch::check_workspace(&arch::workspace_root()).map_err(|e| vec![e.to_string()])?;
     if violations.is_empty() {
         return Ok(());
     }

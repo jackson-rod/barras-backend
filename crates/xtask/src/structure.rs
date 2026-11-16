@@ -18,26 +18,34 @@ fn pattern(source: &str) -> Result<Regex, XtaskError> {
 }
 
 /// Sorted (name, is_directory) pairs, hidden entries left out, directly inside `dir`, so messages come out in a stable order.
-fn entries(dir: &Path) -> Result<Vec<(String, bool)>, XtaskError> {
+pub(crate) fn entries(dir: &Path) -> Result<Vec<(String, bool)>, XtaskError> {
     let mut found = Vec::new();
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
+    for entry in fs::read_dir(dir).map_err(XtaskError::io(dir))? {
+        let entry = entry.map_err(XtaskError::io(dir))?;
         let name = entry.file_name().to_string_lossy().into_owned();
         // Finder and editors drop hidden files (.DS_Store) into any folder on their own.
         if name.starts_with('.') {
             continue;
         }
-        found.push((name, entry.file_type()?.is_dir()));
+        let is_dir = entry
+            .file_type()
+            .map_err(XtaskError::io(&entry.path()))?
+            .is_dir();
+        found.push((name, is_dir));
     }
     found.sort();
     Ok(found)
+}
+
+fn read(path: &Path) -> Result<String, XtaskError> {
+    fs::read_to_string(path).map_err(XtaskError::io(path))
 }
 
 pub fn check_adrs(adr_dir: &Path) -> Result<Vec<String>, XtaskError> {
     let name_rule = pattern(r"^(\d{4})-[a-z0-9]+(-[a-z0-9]+)*\.md$")?;
     let status_rule = pattern(r"^Status: (Proposed|Accepted|Superseded by ADR-\d{4})$")?;
     let link_rule = pattern(r"\((\d{4}-[^()\s]+\.md)\)")?;
-    let index = fs::read_to_string(adr_dir.join(README))?;
+    let index = read(&adr_dir.join(README))?;
     let mut problems = Vec::new();
     let mut files = Vec::new();
     let mut numbers = BTreeSet::new();
@@ -52,7 +60,7 @@ pub fn check_adrs(adr_dir: &Path) -> Result<Vec<String>, XtaskError> {
             continue;
         };
         let number = captures[1].to_owned();
-        let text = fs::read_to_string(adr_dir.join(&file))?;
+        let text = read(&adr_dir.join(&file))?;
         // A CRLF checkout must not turn every ADR into a violation.
         let lines: Vec<&str> = text.lines().map(|l| l.trim_end_matches('\r')).collect();
         if !lines
@@ -119,8 +127,15 @@ pub fn check_modules(modules_dir: &Path) -> Result<Vec<String>, XtaskError> {
             }
         }
         for required in ["src/ports", "src/application"] {
-            if !root.join(required).is_dir() {
+            let dir = root.join(required);
+            if !dir.is_dir() {
                 problems.push(format!("{module}: {required} is missing"));
+            } else if !entries(&dir)?
+                .iter()
+                .any(|(file, is_dir)| !is_dir && file.ends_with(".rs"))
+            {
+                // git does not track an empty folder: it would pass here and fail in CI.
+                problems.push(format!("{module}: {required} has no .rs file"));
             }
         }
         for (folder, exempt) in [
@@ -135,7 +150,7 @@ pub fn check_modules(modules_dir: &Path) -> Result<Vec<String>, XtaskError> {
                 if is_dir || !file.ends_with(".rs") || exempt.contains(&file.as_str()) {
                     continue;
                 }
-                if !fs::read_to_string(dir.join(&file))?.contains("#[cfg(test)]") {
+                if !read(&dir.join(&file))?.contains("#[cfg(test)]") {
                     problems.push(format!("{module}: {folder}/{file} has no tests"));
                 }
             }
@@ -275,6 +290,25 @@ mod tests {
     }
 
     #[test]
+    fn empty_ports_and_application_folders_are_reported() {
+        // git does not track an empty folder, so such a module passes here and fails in CI.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "wallets/README.md", "");
+        write(root, "wallets/src/lib.rs", "");
+        write(root, "wallets/src/domain/errors.rs", "");
+        fs::create_dir_all(root.join("wallets/src/ports")).unwrap();
+        fs::create_dir_all(root.join("wallets/src/application")).unwrap();
+        let found = check_modules(root).unwrap().join("\n");
+        for expected in [
+            "wallets: src/ports has no .rs file",
+            "wallets: src/application has no .rs file",
+        ] {
+            assert!(found.contains(expected), "{expected}\n{found}");
+        }
+    }
+
+    #[test]
     fn migration_names() {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "20261115120000_create_users.sql", "");
@@ -318,6 +352,14 @@ mod tests {
         write(root, "migrations/20261115120000_create_users.sql", "");
         write(root, "migrations/.DS_Store", "");
         assert_eq!(check_structure(dir.path()).unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn an_io_error_names_the_path_it_was_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "0001-a.md", &adr(1, "A"));
+        let error = check_adrs(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("README.md"), "{error}");
     }
 
     #[test]
