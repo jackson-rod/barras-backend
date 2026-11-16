@@ -15,6 +15,13 @@ pub enum XtaskError {
     Metadata(String),
     #[error("invalid pattern {pattern:?}: {message}")]
     Pattern { pattern: String, message: String },
+    #[error("the coverage report is malformed at line {line}: {problem}")]
+    Lcov { line: usize, problem: &'static str },
+    #[error(
+        "the coverage report is older than {}: it measures line {line}, which the file does not have",
+        path.display()
+    )]
+    StaleReport { path: PathBuf, line: usize },
 }
 
 impl XtaskError {
