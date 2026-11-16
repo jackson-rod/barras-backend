@@ -73,6 +73,16 @@ deny = [
     { crate = "curl", reason = "a second HTTP client: outbound HTTP is reqwest, in the providers adapter (ADR-0024)" },
 ]
 
+# axum's own `Json`, `Query` and `Form` extractors exist only with these features. Their
+# rejections are not envelopes, and their messages quote what the caller sent, so a handler
+# takes its body and its query through the HTTP adapter's validating extractors instead.
+# `default-features = false` in every crate keeps them off; this keeps them off whatever a
+# crate writes, `default` included, which turns on all three.
+[[bans.features]]
+crate = "axum"
+deny = ["form", "json", "query"]
+reason = "the stock extractors answer with rejections that are not envelopes and quote the caller's input; handlers use ValidatedJson and ValidatedQuery (ADR-0029)"
+
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
