@@ -8,4 +8,4 @@ mod process;
 
 pub use env_file::env_file;
 #[cfg(unix)]
-pub use process::{BinaryCommand, RunningBinary, free_local_addr};
+pub use process::{BinaryCommand, RunningBinary};

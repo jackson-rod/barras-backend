@@ -1,33 +1,35 @@
 //! The real `barras-api` binary, started as an operator starts it (spec §8, §9.2): it refuses to
 //! start without its configuration, naming each variable and never a value; it serves the public
 //! API and the internal port on the addresses it is given, logs JSON outside `local`, and stops
-//! with status 0 on SIGTERM; `openapi` prints the document with no configuration at all, and
-//! `openapi --check` fails on a stale file.
+//! with status 0 on SIGTERM; `openapi` prints the document and reads no variable, and
+//! `openapi --check` fails on a stale file. Neither a closed standard error nor a worker count
+//! for tokio in the environment turns a run into a panic.
 //!
-//! A binary that was started is always ended with `terminate` or run to its end, never dropped:
-//! a drop kills it, and a killed binary writes no coverage profile.
+//! Every address the binary binds is `127.0.0.1:0`: the system picks a free port, so no other
+//! process can take it first, and the test reads the ports from the `listening` line. A binary
+//! that was started is always ended within a deadline, by `terminate` or `run_within`, never
+//! dropped: a drop kills it, and a killed binary writes no coverage profile.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // integration test crate: every item is test code
 
 use std::fs;
-use std::net::{SocketAddr, TcpListener};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 use std::time::Duration;
 
 use barras_adapter_http::testing::{TestResponse, fetch};
 use barras_api::ApiConfig;
-use barras_testkit::{BinaryCommand, RunningBinary, env_file, free_local_addr};
+use barras_testkit::{BinaryCommand, RunningBinary, env_file};
 use serde_json::Value;
 
 const BINARY: &str = env!("CARGO_BIN_EXE_barras-api");
 
-/// How long a start or a stop may take before the test fails: far longer than either takes, for
-/// an instrumented build on a busy machine.
+/// How long a start, a run or a stop may take before the test fails: far longer than any takes,
+/// for an instrumented build on a busy machine.
 const PATIENCE: Duration = Duration::from_secs(30);
 
-/// How many times the binary is started on new addresses when another process took one of them
-/// between the moment it was found free and the moment the binary bound it.
-const ATTEMPTS: usize = 3;
+/// A free port of the loopback interface, which the system picks when the binary binds it.
+const ANY_PORT: &str = "127.0.0.1:0";
 
 fn repository_file(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -75,6 +77,37 @@ fn get(addr: SocketAddr, path: &str) -> TestResponse {
         .block_on(fetch(addr, path))
 }
 
+/// A pipe nobody reads from any more, so that every write to it fails.
+fn closed_pipe() -> Stdio {
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    Stdio::from(writer)
+}
+
+/// Whether `line`, JSON or readable, is the one the binary logs once both listeners are bound.
+fn is_listening(line: &str) -> bool {
+    match serde_json::from_str::<Value>(line) {
+        Ok(json) => json["fields"]["message"] == "listening",
+        Err(_) => line.contains(": listening "),
+    }
+}
+
+/// The address the `listening` line gives for `field`, whether the line is JSON or readable.
+fn address_in(line: &str, field: &str) -> SocketAddr {
+    let address = match serde_json::from_str::<Value>(line) {
+        Ok(json) => json["fields"][field].as_str().map(str::to_owned),
+        Err(_) => {
+            let prefix = format!("{field}=");
+            line.split_whitespace()
+                .find_map(|word| word.strip_prefix(&prefix))
+                .map(str::to_owned)
+        }
+    };
+    address
+        .and_then(|address| address.parse().ok())
+        .unwrap_or_else(|| panic!("no {field} in {line:?}"))
+}
+
 /// A binary that listens on both its addresses.
 struct Serving {
     binary: RunningBinary,
@@ -82,43 +115,34 @@ struct Serving {
     internal: SocketAddr,
 }
 
-/// Starts the binary with the values of `.env.example`, `variables` over them and two free
-/// addresses, and waits until both addresses listen. A binary that stopped because another
-/// process took one of its addresses in between is started again on new ones.
+/// Starts the binary with the values of `.env.example`, `variables` over them and any free port
+/// for both addresses, and waits until it logs where it listens.
 fn serve(variables: &[(&str, &str)]) -> Serving {
-    for _ in 0..ATTEMPTS {
-        let public = free_local_addr();
-        let internal = free_local_addr();
-        let command = variables
-            .iter()
-            .fold(with_example_values(), |command, (name, value)| {
-                command.env(name, value)
-            })
-            .env("API_BIND_ADDR", public.to_string())
-            .env("API_INTERNAL_BIND_ADDR", internal.to_string());
-        let mut binary = command.spawn();
-        if binary.wait_until_listening(public, PATIENCE)
-            && binary.wait_until_listening(internal, PATIENCE)
-        {
-            return Serving {
-                binary,
-                public,
-                internal,
-            };
-        }
+    let binary = variables
+        .iter()
+        .fold(with_example_values(), |command, (name, value)| {
+            command.env(name, value)
+        })
+        .env("API_BIND_ADDR", ANY_PORT)
+        .env("API_INTERNAL_BIND_ADDR", ANY_PORT)
+        .spawn();
+    let Some(listening) = binary.wait_for_line(is_listening, PATIENCE) else {
         let output = binary.terminate(PATIENCE);
-        assert!(
-            text(&output.stdout).contains("could not bind"),
-            "the binary did not listen: {}",
+        panic!(
+            "the binary did not log where it listens: {}",
             describe(&output)
         );
+    };
+    Serving {
+        public: address_in(&listening, "public_addr"),
+        internal: address_in(&listening, "internal_addr"),
+        binary,
     }
-    panic!("another process took the binary's addresses {ATTEMPTS} times in a row");
 }
 
 #[test]
 fn an_empty_environment_stops_the_binary_naming_every_variable() {
-    let output = BinaryCommand::new(BINARY).run();
+    let output = BinaryCommand::new(BINARY).run_within(PATIENCE);
 
     assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
     let lines: Vec<&str> = text(&output.stderr).lines().collect();
@@ -134,20 +158,13 @@ fn an_empty_environment_stops_the_binary_naming_every_variable() {
 }
 
 #[test]
-fn a_log_level_that_is_not_valid_stops_the_binary_before_either_address_listens() {
-    let public = free_local_addr();
-    let internal = free_local_addr();
-    let mut binary = with_example_values()
+fn a_log_level_that_is_not_valid_stops_the_binary_before_it_listens() {
+    let output = with_example_values()
         .env("LOG_LEVEL", "loud")
-        .env("API_BIND_ADDR", public.to_string())
-        .env("API_INTERNAL_BIND_ADDR", internal.to_string())
-        .spawn();
+        .env("API_BIND_ADDR", ANY_PORT)
+        .env("API_INTERNAL_BIND_ADDR", ANY_PORT)
+        .run_within(PATIENCE);
 
-    let listened = binary.wait_until_listening(public, PATIENCE)
-        || binary.wait_until_listening(internal, PATIENCE);
-    let output = binary.terminate(PATIENCE);
-
-    assert!(!listened, "{}", describe(&output));
     assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
     let stderr = text(&output.stderr);
     assert_eq!(
@@ -155,6 +172,8 @@ fn a_log_level_that_is_not_valid_stops_the_binary_before_either_address_listens(
         "LOG_LEVEL is not valid: expected one of trace, debug, info, warn, error\n"
     );
     assert!(!stderr.contains("loud"), "{stderr}");
+    // Nothing logged: the logs did not start, and the listeners come after them.
+    assert_eq!(text(&output.stdout), "");
 }
 
 #[test]
@@ -205,9 +224,8 @@ fn sigterm_stops_the_binary_with_status_0() {
 #[test]
 fn outside_local_every_line_of_the_log_is_json_from_listening_to_stopped() {
     let serving = serve(&[("APP_ENV", "staging")]);
-    let (public, internal) = (serving.public, serving.internal);
 
-    let ready = get(public, "/api/v1/health");
+    let ready = get(serving.public, "/api/v1/health");
     let output = serving.binary.terminate(PATIENCE);
 
     assert_eq!(ready.status, 200);
@@ -223,20 +241,30 @@ fn outside_local_every_line_of_the_log_is_json_from_listening_to_stopped() {
         "{messages:?}"
     );
     assert!(messages.len() > 3, "the request left no line: {messages:?}");
-    assert_eq!(lines[0]["fields"]["public_addr"], public.to_string());
-    assert_eq!(lines[0]["fields"]["internal_addr"], internal.to_string());
+}
+
+#[test]
+fn a_worker_count_for_tokio_in_the_environment_is_never_read() {
+    let serving = serve(&[("TOKIO_WORKER_THREADS", "abc")]);
+
+    let live = get(serving.public, "/api/v1/health/live");
+    let output = serving.binary.terminate(PATIENCE);
+
+    assert_eq!(live.status, 200);
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    assert_eq!(text(&output.stderr), "");
 }
 
 #[test]
 fn an_address_already_taken_stops_the_binary_and_the_log_says_why() {
-    let taken = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let taken = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let public = taken.local_addr().unwrap();
 
     let output = with_example_values()
         .env("APP_ENV", "staging")
         .env("API_BIND_ADDR", public.to_string())
-        .env("API_INTERNAL_BIND_ADDR", free_local_addr().to_string())
-        .run();
+        .env("API_INTERNAL_BIND_ADDR", ANY_PORT)
+        .run_within(PATIENCE);
 
     assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
     let lines = json_lines(&output.stdout);
@@ -251,8 +279,37 @@ fn an_address_already_taken_stops_the_binary_and_the_log_says_why() {
 }
 
 #[test]
+fn a_closed_standard_error_does_not_turn_a_failure_into_a_panic() {
+    // The configuration's problems, then the usage, each with nowhere to go.
+    for (args, status) in [(&[][..], 1), (&["--help"][..], 2)] {
+        let output = args
+            .iter()
+            .fold(BinaryCommand::new(BINARY), |command, arg| command.arg(arg))
+            .stderr(closed_pipe())
+            .run_within(PATIENCE);
+
+        assert_eq!(
+            output.status.code(),
+            Some(status),
+            "{args:?}: {}",
+            describe(&output)
+        );
+    }
+    // Neither the document nor the failure to write it can be written.
+    let output = BinaryCommand::new(BINARY)
+        .arg("openapi")
+        .stdout(closed_pipe())
+        .stderr(closed_pipe())
+        .run_within(PATIENCE);
+
+    assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+}
+
+#[test]
 fn openapi_prints_the_committed_document_with_an_empty_environment() {
-    let output = BinaryCommand::new(BINARY).arg("openapi").run();
+    let output = BinaryCommand::new(BINARY)
+        .arg("openapi")
+        .run_within(PATIENCE);
 
     assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
     let committed = fs::read(repository_file("openapi.json")).unwrap();
@@ -264,18 +321,32 @@ fn openapi_prints_the_committed_document_with_an_empty_environment() {
 }
 
 #[test]
-fn openapi_reports_a_document_it_cannot_write_instead_of_panicking() {
-    // A pipe nobody reads from any more: every write to it fails.
-    let (reader, writer) = std::io::pipe().unwrap();
-    drop(reader);
+fn openapi_reads_no_variable_whatever_its_value() {
+    let output = ApiConfig::VARIABLES
+        .iter()
+        .fold(
+            BinaryCommand::new(BINARY).arg("openapi"),
+            |command, name| command.env(name, "not-valid"),
+        )
+        .env("TOKIO_WORKER_THREADS", "abc")
+        .run_within(PATIENCE);
 
-    // `BinaryCommand` captures standard output, so this one is started by hand. `openapi` reads
-    // no variable, so the environment the test runs in changes nothing.
-    let output = Command::new(BINARY)
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    let committed = fs::read(repository_file("openapi.json")).unwrap();
+    assert!(
+        output.stdout == committed,
+        "the document printed is not openapi.json: {}",
+        describe(&output)
+    );
+    assert_eq!(text(&output.stderr), "");
+}
+
+#[test]
+fn openapi_reports_a_document_it_cannot_write_instead_of_panicking() {
+    let output = BinaryCommand::new(BINARY)
         .arg("openapi")
-        .stdout(Stdio::from(writer))
-        .output()
-        .unwrap();
+        .stdout(closed_pipe())
+        .run_within(PATIENCE);
 
     assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
     let stderr = text(&output.stderr);
@@ -291,7 +362,7 @@ fn openapi_check_fails_on_a_file_it_cannot_read_and_says_how_to_write_it() {
         .arg("openapi")
         .arg("--check")
         .arg("/nonexistent/openapi.json")
-        .run();
+        .run_within(PATIENCE);
 
     assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
     let stderr = text(&output.stderr);
@@ -314,7 +385,7 @@ fn openapi_check_fails_on_a_stale_file_and_says_how_to_update_it() {
         .arg("openapi")
         .arg("--check")
         .arg(&stale)
-        .run();
+        .run_within(PATIENCE);
 
     fs::remove_file(&stale).unwrap();
     assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
@@ -329,7 +400,7 @@ fn openapi_check_passes_on_the_committed_file() {
         .arg("openapi")
         .arg("--check")
         .arg(repository_file("openapi.json"))
-        .run();
+        .run_within(PATIENCE);
 
     assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
     assert_eq!(text(&output.stderr), "");
@@ -341,7 +412,7 @@ fn a_command_line_it_does_not_know_prints_the_usage_and_exits_with_status_2() {
         let output = args
             .iter()
             .fold(BinaryCommand::new(BINARY), |command, arg| command.arg(arg))
-            .run();
+            .run_within(PATIENCE);
 
         assert_eq!(
             output.status.code(),
@@ -363,7 +434,7 @@ fn an_argument_that_is_not_unicode_is_a_command_line_it_does_not_know() {
 
     let output = BinaryCommand::new(BINARY)
         .arg(std::ffi::OsStr::from_bytes(b"open\xffapi"))
-        .run();
+        .run_within(PATIENCE);
 
     assert_eq!(output.status.code(), Some(2), "{}", describe(&output));
     assert!(text(&output.stderr).starts_with("usage: barras-api"));

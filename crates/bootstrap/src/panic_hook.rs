@@ -104,4 +104,17 @@ mod tests {
         assert_eq!(events.len(), 1, "{events:?}");
         assert_eq!(events[0]["fields"]["payload"], "a payload that is not text");
     }
+
+    #[test]
+    fn a_panic_inside_a_request_carries_the_request_id() {
+        // As the HTTP adapter opens it: at `error`, so that it survives every log level.
+        let request = || tracing::error_span!("request", request_id = "r-1");
+
+        let events = logged_while_panicking(|| request().in_scope(|| panic!("the handler failed")));
+
+        assert_eq!(events.len(), 1, "{events:?}");
+        let spans = &events[0]["spans"];
+        assert_eq!(spans[0]["name"], "request", "{spans}");
+        assert_eq!(spans[0]["request_id"], "r-1", "{spans}");
+    }
 }

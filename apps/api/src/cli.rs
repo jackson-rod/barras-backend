@@ -5,7 +5,9 @@
 use std::fmt::Display;
 use std::fs;
 use std::io::{self, Write};
+use std::num::NonZeroUsize;
 use std::process::ExitCode;
+use std::thread;
 
 use barras_bootstrap::{Environment, with_sources};
 use tokio::runtime;
@@ -60,7 +62,11 @@ fn serve() -> ExitCode {
         Ok(config) => config,
         Err(error) => return fail(&error),
     };
-    let runtime = match runtime::Builder::new_multi_thread().enable_all().build() {
+    let runtime = match runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads())
+        .enable_all()
+        .build()
+    {
         Ok(runtime) => runtime,
         Err(error) => return fail(&format!("the tokio runtime could not start: {error}")),
     };
@@ -73,6 +79,13 @@ fn serve() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// One worker per processor, the count tokio picks by default. Given explicitly, so that tokio
+/// never reads `TOKIO_WORKER_THREADS`: the binary's configuration is `ApiConfig`, and tokio
+/// panics on a value it cannot read, printing it.
+fn worker_threads() -> usize {
+    thread::available_parallelism().map_or(1, NonZeroUsize::get)
 }
 
 fn print_openapi() -> ExitCode {
@@ -115,9 +128,12 @@ fn fail(message: &dyn Display) -> ExitCode {
     ExitCode::FAILURE
 }
 
-#[allow(clippy::print_stderr)] // the logs are not up yet: serving starts them once the configuration is read, and no other mode has any
+/// Writes `message` to standard error: the logs are not up, since serving starts them only once
+/// the configuration is read, and no other mode has any.
 fn report(message: &dyn Display) {
-    eprintln!("{message}");
+    // `eprintln!` panics when standard error is closed. Then nowhere is left to say anything,
+    // and the exit status still tells the failure, so the write's own failure is dropped.
+    let _ = writeln!(io::stderr().lock(), "{message}");
 }
 
 #[cfg(test)]

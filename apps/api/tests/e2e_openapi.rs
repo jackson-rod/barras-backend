@@ -67,3 +67,14 @@ fn every_variable_of_the_configuration_is_in_env_example() {
         );
     }
 }
+
+#[test]
+fn every_variable_in_env_example_is_read_by_this_binary_or_belongs_to_the_ingestor() {
+    for (name, _) in env_file(repository_file(".env.example")) {
+        assert!(
+            ApiConfig::VARIABLES.contains(&name.as_str()) || name.starts_with("INGEST_"),
+            "{name} is in .env.example, but barras-api does not read it, and it is not an \
+             INGEST_ variable of barras-ingest: a variable no binary reads any more"
+        );
+    }
+}

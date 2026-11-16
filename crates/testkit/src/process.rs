@@ -1,13 +1,13 @@
 //! Starting a workspace binary from its tests: with a clean environment, stopped with
-//! SIGTERM, with everything it printed.
+//! SIGTERM, with everything it printed, and never waited for without a deadline.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::io::Read;
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::io::{self, Read};
 use std::panic;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -15,31 +15,21 @@ use std::time::{Duration, Instant};
 /// coverage profile.
 const PROFILE_FILE: &str = "LLVM_PROFILE_FILE";
 
-/// Short, so that a wait ends soon after the binary is ready or has exited.
+/// Short, so that a wait ends soon after the binary has exited.
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
-
-/// On loopback a connect succeeds or is refused at once; only a listener whose backlog is
-/// full leaves it waiting.
-const CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
-
-/// `127.0.0.1` with a port the OS has just handed out, which nothing listens on any more.
-/// Another process may take the port before the binary binds it: a test that starts a binary
-/// on it starts over with a new address when the binary exits before it listens.
-pub fn free_local_addr() -> SocketAddr {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap_or_else(|error| panic!("cannot bind 127.0.0.1:0: {error}"));
-    listener.local_addr().unwrap()
-}
 
 /// A binary to start from a test. Its environment holds only the variables given with
 /// [`env`](Self::env), plus `LLVM_PROFILE_FILE` when the tests run under cargo-llvm-cov, so
 /// that the binary's coverage joins theirs. Its standard input is empty, and what it prints
-/// is captured. A step that fails panics, and so fails the test that took it.
+/// is captured unless sent elsewhere. A step that fails panics, and so fails the test that
+/// took it.
 #[derive(Debug)]
 pub struct BinaryCommand {
     program: PathBuf,
     args: Vec<OsString>,
     variables: BTreeMap<OsString, OsString>,
+    stdout: Option<Stdio>,
+    stderr: Option<Stdio>,
 }
 
 impl BinaryCommand {
@@ -49,6 +39,8 @@ impl BinaryCommand {
             program: program.as_ref().to_owned(),
             args: Vec::new(),
             variables: BTreeMap::new(),
+            stdout: None,
+            stderr: None,
         }
     }
 
@@ -65,14 +57,34 @@ impl BinaryCommand {
         self
     }
 
-    /// Runs the binary to its end and returns its exit status and everything it printed. Like
-    /// [`Command::output`], it waits as long as the binary runs.
-    pub fn run(self) -> Output {
+    /// Sends standard output to `destination` instead of capturing it: a pipe nobody reads, for
+    /// a test of a binary that cannot write its output, say.
+    pub fn stdout(mut self, destination: Stdio) -> Self {
+        self.stdout = Some(destination);
+        self
+    }
+
+    /// Sends standard error to `destination` instead of capturing it.
+    pub fn stderr(mut self, destination: Stdio) -> Self {
+        self.stderr = Some(destination);
+        self
+    }
+
+    /// Runs the binary to its end and returns its exit status and everything it printed. A
+    /// binary still running once `timeout` has passed is killed, and the test fails with what it
+    /// printed: a binary that should have stopped, and serves instead, fails its test rather
+    /// than hang it.
+    pub fn run_within(self, timeout: Duration) -> Output {
         let mut running = self.spawn();
-        let status = running.child.wait().unwrap_or_else(|error| {
-            panic!("cannot wait for process {}: {error}", running.child.id())
-        });
-        running.collect_output(status)
+        let exited = running.wait_for_exit(timeout);
+        let status = exited.unwrap_or_else(|| running.kill_and_reap());
+        let output = running.collect_output(status);
+        assert!(
+            exited.is_some(),
+            "the binary was still running after {timeout:?}, so it was killed: {}",
+            describe(&output)
+        );
+        output
     }
 
     /// Starts the binary and returns at once. Its output is read from that moment on, so a
@@ -83,16 +95,14 @@ impl BinaryCommand {
             .env_clear()
             .envs(child_environment(self.variables, parent_profile_file()))
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(self.stdout.unwrap_or_else(Stdio::piped))
+            .stderr(self.stderr.unwrap_or_else(Stdio::piped))
             .spawn()
             .unwrap_or_else(|error| panic!("cannot start {}: {error}", self.program.display()));
-        let stdout = child.stdout.take().expect("standard output is piped");
-        let stderr = child.stderr.take().expect("standard error is piped");
         RunningBinary {
+            stdout: Captured::start(child.stdout.take()),
+            stderr: Captured::start(child.stderr.take()),
             child,
-            stdout: Some(read_in_background(stdout)),
-            stderr: Some(read_in_background(stderr)),
         }
     }
 }
@@ -103,31 +113,40 @@ impl BinaryCommand {
 #[must_use = "dropping it kills the binary"]
 pub struct RunningBinary {
     child: Child,
-    // In an `Option` only so that `collect_output` can take them: a type with `Drop` cannot
-    // be taken apart.
-    stdout: Option<JoinHandle<Vec<u8>>>,
-    stderr: Option<JoinHandle<Vec<u8>>>,
+    stdout: Captured,
+    stderr: Captured,
 }
 
 impl RunningBinary {
-    /// Waits until `addr` accepts a connection, and returns `true`. Returns `false` as soon as
-    /// the binary has exited, or once `timeout` has passed. Each try opens a connection and
-    /// closes it without sending anything.
-    pub fn wait_until_listening(&mut self, addr: SocketAddr, timeout: Duration) -> bool {
+    /// The first whole line of standard output, one that ends with a newline, for which
+    /// `matches` holds, whether it was printed before the call or is printed during it. `None`
+    /// as soon as the binary has closed its output without printing one, or once `timeout` has
+    /// passed. The lines stay in the output that [`terminate`](Self::terminate) returns.
+    pub fn wait_for_line(
+        &self,
+        matches: impl Fn(&str) -> bool,
+        timeout: Duration,
+    ) -> Option<String> {
         let deadline = Instant::now() + timeout;
+        let mut stream = self.stdout.stream();
+        let mut looked_at = 0;
         loop {
-            // Before the connect: when another process took the port, that process is the one
-            // that answers, and the binary has exited.
-            if self.exit_status().is_some() {
-                return false;
+            while let Some(length) = stream.bytes[looked_at..]
+                .iter()
+                .position(|&byte| byte == b'\n')
+            {
+                let line = &stream.bytes[looked_at..looked_at + length];
+                let line = String::from_utf8_lossy(line).into_owned();
+                looked_at += length + 1;
+                if matches(&line) {
+                    return Some(line);
+                }
             }
-            if TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).is_ok() {
-                return true;
+            let left = deadline.saturating_duration_since(Instant::now());
+            if stream.ended || left.is_zero() {
+                return None;
             }
-            if Instant::now() >= deadline {
-                return false;
-            }
-            thread::sleep(POLL_INTERVAL);
+            stream = self.stdout.wait_for_more(stream, left);
         }
     }
 
@@ -193,8 +212,8 @@ impl RunningBinary {
     fn collect_output(&mut self, status: ExitStatus) -> Output {
         Output {
             status,
-            stdout: join_reader(self.stdout.take()),
-            stderr: join_reader(self.stderr.take()),
+            stdout: self.stdout.take_all(),
+            stderr: self.stderr.take_all(),
         }
     }
 }
@@ -213,23 +232,112 @@ impl Drop for RunningBinary {
     }
 }
 
-/// Reads `pipe` to its end on a thread of its own: a binary that fills a pipe nobody reads
-/// stops until someone does.
-fn read_in_background(mut pipe: impl Read + Send + 'static) -> JoinHandle<Vec<u8>> {
-    thread::spawn(move || {
-        let mut bytes = Vec::new();
-        pipe.read_to_end(&mut bytes)
-            .unwrap_or_else(|error| panic!("cannot read what the binary printed: {error}"));
-        bytes
-    })
+/// One stream of the binary, read to its end on a thread of its own, since a binary that fills
+/// a pipe nobody reads stops until someone does. What was read is shared, so that a test can
+/// look at it while the binary runs.
+#[derive(Debug)]
+struct Captured {
+    shared: Arc<Shared>,
+    reader: Option<JoinHandle<()>>,
 }
 
-/// What the reader read. A panic of its thread carries on in the caller's.
-fn join_reader(reader: Option<JoinHandle<Vec<u8>>>) -> Vec<u8> {
-    reader
-        .expect("the output is collected once")
-        .join()
-        .unwrap_or_else(|payload| panic::resume_unwind(payload))
+#[derive(Debug, Default)]
+struct Shared {
+    stream: Mutex<Stream>,
+    /// Signalled whenever bytes arrive, and when the stream ends.
+    grew: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct Stream {
+    bytes: Vec<u8>,
+    ended: bool,
+}
+
+impl Captured {
+    /// Reads `pipe` from now on; with no pipe, the stream went elsewhere and is empty.
+    fn start(pipe: Option<impl Read + Send + 'static>) -> Self {
+        let shared = Arc::new(Shared::default());
+        let reader = match pipe {
+            Some(pipe) => {
+                let shared = Arc::clone(&shared);
+                Some(thread::spawn(move || read_to_end(pipe, &shared)))
+            }
+            None => {
+                lock(&shared.stream).ended = true;
+                None
+            }
+        };
+        Self { shared, reader }
+    }
+
+    fn stream(&self) -> MutexGuard<'_, Stream> {
+        lock(&self.shared.stream)
+    }
+
+    /// Waits until more bytes arrive, the stream ends, or `timeout` passes.
+    fn wait_for_more<'a>(
+        &'a self,
+        stream: MutexGuard<'a, Stream>,
+        timeout: Duration,
+    ) -> MutexGuard<'a, Stream> {
+        let (stream, _) = self
+            .shared
+            .grew
+            .wait_timeout(stream, timeout)
+            .unwrap_or_else(PoisonError::into_inner);
+        stream
+    }
+
+    /// Everything read, once the stream has ended. A panic of the reader carries on in the
+    /// caller's.
+    fn take_all(&mut self) -> Vec<u8> {
+        if let Some(reader) = self.reader.take() {
+            reader
+                .join()
+                .unwrap_or_else(|payload| panic::resume_unwind(payload));
+        }
+        std::mem::take(&mut self.stream().bytes)
+    }
+}
+
+fn read_to_end(mut pipe: impl Read, shared: &Shared) {
+    let mut chunk = [0; 8192];
+    let failure = loop {
+        match pipe.read(&mut chunk) {
+            Ok(0) => break None,
+            Ok(count) => {
+                lock(&shared.stream)
+                    .bytes
+                    .extend_from_slice(&chunk[..count]);
+                shared.grew.notify_all();
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => break Some(error),
+        }
+    };
+    // Ended either way, so that nobody waits for bytes that cannot come.
+    lock(&shared.stream).ended = true;
+    shared.grew.notify_all();
+    if let Some(error) = failure {
+        panic!("cannot read what the binary printed: {error}");
+    }
+}
+
+/// A lock whose holder panicked still guards bytes that are whole: each change is one append
+/// or one flag.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The exit status and what the binary printed, for the message of a failed test.
+fn describe(output: &Output) -> String {
+    format!(
+        "{}\nstandard output:\n{}\nstandard error:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
 }
 
 /// The environment a binary starts with: the variables given, plus the parent's
@@ -255,10 +363,8 @@ fn parent_profile_file() -> Option<OsString> {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::net::IpAddr;
     use std::os::unix::process::ExitStatusExt;
     use std::sync::atomic::{AtomicU32, Ordering};
-    use std::sync::mpsc;
 
     use super::*;
 
@@ -284,16 +390,6 @@ mod tests {
             .status()
             .unwrap()
             .success()
-    }
-
-    /// Runs `work` on a thread of its own, and fails the test when it is still running after
-    /// ten seconds: a deadlock then fails the test instead of hanging the run.
-    fn within_ten_seconds<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
-        let (sender, receiver) = mpsc::channel();
-        thread::spawn(move || sender.send(work()));
-        receiver
-            .recv_timeout(Duration::from_secs(10))
-            .expect("still running after ten seconds")
     }
 
     /// A file the shell creates once its trap is set: a SIGTERM sent before that would end
@@ -372,7 +468,7 @@ mod tests {
         let output = BinaryCommand::new("/usr/bin/env")
             .env("FIRST", "1")
             .env("SECOND", "two words")
-            .run();
+            .run_within(Duration::from_secs(10));
 
         let mut expected = vec!["FIRST=1".to_owned(), "SECOND=two words".to_owned()];
         // Under cargo-llvm-cov the tests have it, so the binary has it too.
@@ -386,11 +482,11 @@ mod tests {
     }
 
     #[test]
-    fn run_returns_the_exit_status_and_what_the_binary_printed() {
+    fn run_within_returns_the_exit_status_and_what_the_binary_printed() {
         let output = BinaryCommand::new("/bin/sh")
             .arg("-c")
             .arg("echo out; echo err >&2; exit 3")
-            .run();
+            .run_within(Duration::from_secs(10));
 
         assert_eq!(output.status.code(), Some(3));
         assert_eq!(text(&output.stdout), "out\n");
@@ -398,14 +494,56 @@ mod tests {
     }
 
     #[test]
-    fn run_does_not_block_a_binary_that_prints_more_than_a_pipe_holds() {
-        let command = BinaryCommand::new("/bin/sh").arg("-c").arg(LARGE_OUTPUT);
-
-        let output = within_ten_seconds(move || command.run());
+    fn run_within_does_not_block_a_binary_that_prints_more_than_a_pipe_holds() {
+        let output = BinaryCommand::new("/bin/sh")
+            .arg("-c")
+            .arg(LARGE_OUTPUT)
+            .run_within(Duration::from_secs(10));
 
         assert!(output.status.success());
         assert_eq!(output.stdout.len(), MIB);
         assert_eq!(output.stderr.len(), MIB);
+    }
+
+    #[test]
+    fn run_within_kills_a_binary_still_running_at_the_deadline_and_fails_with_its_output() {
+        // `exec` keeps the shell's process id, so the one printed is that of the sleeper.
+        let command = BinaryCommand::new("/bin/sh")
+            .arg("-c")
+            .arg("echo $$; exec /bin/sleep 60");
+        let started = Instant::now();
+
+        let failure = panic::catch_unwind(|| command.run_within(Duration::from_millis(300)));
+
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let message = failure.unwrap_err().downcast::<String>().unwrap();
+        assert!(message.contains("still running after 300ms"), "{message}");
+        let pid = message
+            .lines()
+            .find_map(|line| line.parse::<u32>().ok())
+            .unwrap();
+        assert!(!is_alive(pid), "{message}");
+    }
+
+    #[test]
+    fn a_stream_sent_elsewhere_is_not_captured() {
+        let script = "echo out; echo err >&2";
+
+        let quiet_stdout = BinaryCommand::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .stdout(Stdio::null())
+            .run_within(Duration::from_secs(10));
+        let quiet_stderr = BinaryCommand::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .stderr(Stdio::null())
+            .run_within(Duration::from_secs(10));
+
+        assert_eq!(text(&quiet_stdout.stdout), "");
+        assert_eq!(text(&quiet_stdout.stderr), "err\n");
+        assert_eq!(text(&quiet_stderr.stdout), "out\n");
+        assert_eq!(text(&quiet_stderr.stderr), "");
     }
 
     #[test]
@@ -509,66 +647,70 @@ mod tests {
     }
 
     #[test]
-    fn wait_until_listening_is_true_once_the_address_accepts_connections() {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let mut running = BinaryCommand::new("/bin/sleep").arg("60").spawn();
+    fn wait_for_line_returns_the_first_whole_line_that_matches_while_the_binary_runs() {
+        // The line arrives in two writes; its first half alone would match too.
+        let running = BinaryCommand::new("/bin/sh")
+            .arg("-c")
+            .arg(
+                "echo starting; printf 'listen'; /bin/sleep 0.2; printf 'ing on 1\\n'; \
+                 echo listening on 2; exec /bin/sleep 60",
+            )
+            .spawn();
 
-        let listening =
-            running.wait_until_listening(listener.local_addr().unwrap(), Duration::from_secs(10));
+        let line =
+            running.wait_for_line(|line| line.starts_with("listen"), Duration::from_secs(10));
+        let output = running.terminate(Duration::from_secs(10));
 
-        assert!(listening);
+        assert_eq!(line.as_deref(), Some("listening on 1"));
+        // Looking at the lines took none of them away.
+        assert_eq!(
+            text(&output.stdout),
+            "starting\nlistening on 1\nlistening on 2\n"
+        );
     }
 
     #[test]
-    fn wait_until_listening_is_false_at_once_for_a_binary_that_has_exited() {
-        // Another process listens on the address: the binary exited because it had the port.
-        let taken = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let mut running = BinaryCommand::new("/bin/sh")
+    fn wait_for_line_finds_a_line_printed_before_it_was_called() {
+        let ready = ReadyFile::new("line-printed-before");
+        let running = BinaryCommand::new("/bin/sh")
             .arg("-c")
-            .arg("exit 1")
+            .arg(r#"echo ready; : > "$READY"; exec /bin/sleep 60"#)
+            .env("READY", ready.path())
             .spawn();
-        assert!(running.wait_for_exit(Duration::from_secs(10)).is_some());
+        ready.wait();
 
-        let started = Instant::now();
-        let listening =
-            running.wait_until_listening(taken.local_addr().unwrap(), Duration::from_secs(60));
+        let line = running.wait_for_line(|line| line == "ready", Duration::from_secs(10));
+        running.terminate(Duration::from_secs(10));
 
-        assert!(!listening);
-        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(line.as_deref(), Some("ready"));
     }
 
     #[test]
-    fn wait_until_listening_is_false_as_soon_as_the_binary_exits() {
-        let mut running = BinaryCommand::new("/bin/sh")
+    fn wait_for_line_is_none_as_soon_as_the_binary_exits_without_printing_it() {
+        let running = BinaryCommand::new("/bin/sh")
             .arg("-c")
-            .arg("/bin/sleep 0.2; exit 1")
+            .arg("echo something else; /bin/sleep 0.2; exit 1")
             .spawn();
 
         let started = Instant::now();
-        let listening = running.wait_until_listening(free_local_addr(), Duration::from_secs(60));
+        let line = running.wait_for_line(|line| line == "listening", Duration::from_secs(60));
+        let output = running.terminate(Duration::from_secs(10));
 
-        assert!(!listening);
+        assert_eq!(line, None);
         assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(output.status.code(), Some(1));
     }
 
     #[test]
-    fn wait_until_listening_is_false_when_the_timeout_ends() {
-        let mut running = BinaryCommand::new("/bin/sleep").arg("60").spawn();
+    fn wait_for_line_is_none_when_the_timeout_ends() {
+        let running = BinaryCommand::new("/bin/sleep").arg("60").spawn();
         let timeout = Duration::from_millis(200);
 
         let started = Instant::now();
-        let listening = running.wait_until_listening(free_local_addr(), timeout);
+        let line = running.wait_for_line(|_| true, timeout);
+        running.terminate(Duration::from_secs(10));
 
-        assert!(!listening);
+        assert_eq!(line, None);
         assert!(started.elapsed() >= timeout);
-    }
-
-    #[test]
-    fn free_local_addr_is_a_loopback_address_that_nothing_listens_on() {
-        let addr = free_local_addr();
-
-        assert_eq!(addr.ip(), IpAddr::from(Ipv4Addr::LOCALHOST));
-        assert_ne!(addr.port(), 0);
-        assert!(TcpListener::bind(addr).is_ok());
     }
 }

@@ -3,9 +3,10 @@
 use std::fs;
 use std::path::Path;
 
-/// What a value may not hold: a shell, or a dotenv loader, would read it otherwise than as
-/// written (a quote, an expansion, an escape, a command, a comment).
-const READ_OTHERWISE: &[char] = &['"', '\'', '$', '\\', '`', '#'];
+/// What a value may hold besides ASCII letters and digits: characters that a shell sourcing the
+/// file, and a dotenv loader, both take as written. Any other one, a space, a quote, `$`, `;`,
+/// `~` or `#` say, is read as something else by one of them.
+const TAKEN_AS_WRITTEN: &[char] = &['.', '_', ':', '/', '@', '%', '+', ',', '=', '[', ']', '-'];
 
 /// The variables of the env file at `path`, in the order written: one `NAME=value` per line,
 /// the value taken as written. Blank lines and lines that start with `#` are skipped. Any other
@@ -35,8 +36,8 @@ fn variables(text: &str, origin: &str) -> Vec<(String, String)> {
 }
 
 /// The name and the value of `line` when it is `NAME=value`: a name of upper-case letters,
-/// digits and underscores that does not start with a digit, and a value of visible ASCII
-/// characters, none of them read otherwise.
+/// digits and underscores that does not start with a digit, and a value of characters that every
+/// reader takes as written.
 fn variable(line: &str) -> Option<(String, String)> {
     let (name, value) = line.split_once('=')?;
     let name_is_valid = name
@@ -48,7 +49,7 @@ fn variable(line: &str) -> Option<(String, String)> {
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
     let value_is_plain = value
         .chars()
-        .all(|c| c.is_ascii_graphic() && !READ_OTHERWISE.contains(&c));
+        .all(|c| c.is_ascii_alphanumeric() || TAKEN_AS_WRITTEN.contains(&c));
     (name_is_valid && value_is_plain).then(|| (name.to_owned(), value.to_owned()))
 }
 
@@ -91,6 +92,25 @@ mod tests {
             variable("_PRIVATE_2=a=b"),
             Some(("_PRIVATE_2".to_owned(), "a=b".to_owned()))
         );
+        // Every character a value may hold.
+        let every = "AZaz09._:/@%+,=[]-";
+        assert_eq!(
+            variable(&format!("EVERY={every}")),
+            Some(("EVERY".to_owned(), every.to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_value_with_a_character_a_shell_reads_otherwise_is_not_a_variable() {
+        // A shell that sources the file ends the assignment, starts a command, redirects,
+        // opens a subshell, expands a home folder or a pattern, or recalls history.
+        for character in [
+            ';', '&', '|', '<', '>', '(', ')', '~', '*', '?', '!', '{', '}', '^',
+        ] {
+            let line = format!("ADDRESS=127.0.0.1{character}8080");
+
+            assert_eq!(variable(&line), None, "{line:?}");
+        }
     }
 
     #[test]
