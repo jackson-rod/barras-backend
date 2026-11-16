@@ -41,6 +41,7 @@ pub fn load_workspace(root: &Path) -> Result<Vec<CrateInfo>, XtaskError> {
             .iter()
             .map(|d| Dep {
                 name: d.name.clone(),
+                rename: d.rename.clone(),
                 kind: match d.kind {
                     DependencyKind::Development => DepKind::Dev,
                     DependencyKind::Build => DepKind::Build,
@@ -48,6 +49,7 @@ pub fn load_workspace(root: &Path) -> Result<Vec<CrateInfo>, XtaskError> {
                 },
                 origin: Origin::of(d.source.as_ref()),
                 path: d.path.as_ref().map(|path| relative(path.as_std_path())),
+                features: d.features.clone(),
             })
             .collect();
         let targets = package
@@ -63,6 +65,7 @@ pub fn load_workspace(root: &Path) -> Result<Vec<CrateInfo>, XtaskError> {
             dir,
             deps,
             targets,
+            features: package.features.clone(),
         });
     }
     Ok(crates)

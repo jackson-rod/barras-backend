@@ -5,6 +5,7 @@ mod manifests;
 mod metadata;
 mod rules;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use cargo_metadata::TargetKind;
@@ -46,11 +47,17 @@ impl Origin {
 pub struct Dep {
     /// The real package name, never the local rename.
     pub name: String,
+    /// The key the manifest gives it when that differs from `name`: the name a
+    /// `[features]` entry calls it by.
+    pub rename: Option<String>,
     pub kind: DepKind,
     pub origin: Origin,
     /// The folder of a path dependency: relative to the workspace root when it is inside
     /// it, as cargo reports it otherwise.
     pub path: Option<PathBuf>,
+    /// The features this dependency turns on, those of a `[workspace.dependencies]` entry
+    /// it inherits included.
+    pub features: Vec<String>,
 }
 
 /// What a target of a package is, as far as `hack-is-a-stub` is concerned.
@@ -87,6 +94,8 @@ pub struct CrateInfo {
     pub dir: PathBuf,
     pub deps: Vec<Dep>,
     pub targets: Vec<Target>,
+    /// The crate's own `[features]` table: each feature and what it turns on, as written.
+    pub features: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

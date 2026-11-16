@@ -16,6 +16,9 @@ const DEV_EXTRA: &[&str] = &["tokio", "mockall", "insta"];
 const KERNEL_MEMBERS: &[&str] = &[HACK_DIR];
 /// The members a module may depend on, by folder, each only as a path dependency there.
 const MODULE_MEMBERS: &[&str] = &[KERNEL_DIR, HACK_DIR];
+/// The feature that holds a member's test support, such as the kernel's `FixedClock` or
+/// the HTTP adapter's test client and `undocumented_route`.
+const TESTING: &str = "testing";
 
 /// The package name the crate in the known folder `dir` must have. The cargo-deny bans
 /// name crates, so a name that drifted from its folder would slip them.
@@ -66,8 +69,49 @@ pub fn check_arch(crates: &[CrateInfo]) -> Vec<Violation> {
                 violations.push(violation(krate, &dep.name, rule));
             }
         }
+        for (feature, value) in testing_turned_on_by_another_feature(crates, krate) {
+            violations.push(violation(
+                krate,
+                &format!("[features] {feature} = {value}"),
+                "testing-dev-only",
+            ));
+        }
     }
     violations
+}
+
+/// The entries of `krate`'s `[features]` table that turn on a `testing` feature, its own
+/// or a member's, from any feature but its own `testing`. That one is safe to forward
+/// from, because `testing-dev-only` keeps it to dev-dependencies; any other could be a
+/// default, which `cargo build --workspace` turns on, or be turned on by a normal
+/// dependency.
+fn testing_turned_on_by_another_feature<'a>(
+    crates: &[CrateInfo],
+    krate: &'a CrateInfo,
+) -> Vec<(&'a str, &'a str)> {
+    krate
+        .features
+        .iter()
+        .filter(|(feature, _)| *feature != TESTING)
+        .flat_map(|(feature, values)| values.iter().map(move |value| (feature, value)))
+        .filter(|(_, value)| turns_on_testing(crates, krate, value))
+        .map(|(feature, value)| (feature.as_str(), value.as_str()))
+        .collect()
+}
+
+/// `value`, an entry of `krate`'s `[features]` table, is `testing`, or `<key>/testing` or
+/// `<key>?/testing` where `<key>` names a dependency that resolves to a member.
+fn turns_on_testing(crates: &[CrateInfo], krate: &CrateInfo, value: &str) -> bool {
+    let Some((key, feature)) = value.split_once('/') else {
+        return value == TESTING;
+    };
+    let key = key.strip_suffix('?').unwrap_or(key);
+    feature == TESTING
+        && krate
+            .deps
+            .iter()
+            .filter(|dep| dep.rename.as_deref().unwrap_or(&dep.name) == key)
+            .any(|dep| crates.iter().any(|c| c.name == dep.name))
 }
 
 /// The rules that `dep`, a dependency of a crate in `layer`, breaks. A dependency on a
@@ -94,6 +138,13 @@ fn broken_rules(crates: &[CrateInfo], layer: Option<Layer>, dep: &Dep) -> Vec<&'
     }
     if member_layer == Some(Layer::Bootstrap) && layer != Some(Layer::App) {
         broken.push("bootstrap-apps-only");
+    }
+    // A normal or build dependency compiles the test support into a build that is not a
+    // test, and `cargo build --workspace` unifies the features of every member it builds,
+    // the testkit's included, so it would reach the binaries. A dev-dependency turns the
+    // feature on only where tests are built.
+    if member.is_some() && dep.kind != DepKind::Dev && dep.features.iter().any(|f| f == TESTING) {
+        broken.push("testing-dev-only");
     }
     broken
 }
@@ -157,6 +208,7 @@ fn is_path_at(dep: &Dep, member: &CrateInfo, folder: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
 
     use super::*;
@@ -189,6 +241,7 @@ mod tests {
                 .iter()
                 .map(|(name, kind, source)| Dep {
                     name: (*name).to_owned(),
+                    rename: None,
                     kind: *kind,
                     origin: Origin::of(
                         source
@@ -198,9 +251,11 @@ mod tests {
                             .as_ref(),
                     ),
                     path: source.is_none().then(|| PathBuf::from(MEMBER_FOLDER)),
+                    features: Vec::new(),
                 })
                 .collect(),
             targets: Vec::new(),
+            features: BTreeMap::new(),
         }
     }
 
@@ -213,13 +268,41 @@ mod tests {
                 .iter()
                 .map(|(name, kind, path)| Dep {
                     name: (*name).to_owned(),
+                    rename: None,
                     kind: *kind,
                     origin: Origin::Path,
                     path: Some(PathBuf::from(path)),
+                    features: Vec::new(),
                 })
                 .collect(),
             targets: Vec::new(),
+            features: BTreeMap::new(),
         }
+    }
+
+    /// `krate`, each dependency turning on the features given.
+    fn krate_enabling(name: &str, dir: &str, deps: &[(&str, DepKind, bool, &[&str])]) -> CrateInfo {
+        let plain: Vec<(&str, DepKind, bool)> = deps
+            .iter()
+            .map(|(name, kind, is_path, _)| (*name, *kind, *is_path))
+            .collect();
+        let mut krate = krate(name, dir, &plain);
+        for (dep, (_, _, _, features)) in krate.deps.iter_mut().zip(deps) {
+            dep.features = features.iter().map(|f| (*f).to_owned()).collect();
+        }
+        krate
+    }
+
+    /// `krate` with its own `[features]` table: each feature and what it turns on.
+    fn with_features(mut krate: CrateInfo, table: &[(&str, &[&str])]) -> CrateInfo {
+        krate.features = table
+            .iter()
+            .map(|(feature, enables)| {
+                let enables = enables.iter().map(|value| (*value).to_owned()).collect();
+                ((*feature).to_owned(), enables)
+            })
+            .collect();
+        krate
     }
 
     /// The crates as `load_workspace` reads them: a path dependency on a member's name
@@ -452,9 +535,11 @@ mod tests {
         // A path dependency whose folder cargo did not report is outside every member too.
         crates[1].deps.push(Dep {
             name: "shim".to_owned(),
+            rename: None,
             kind: Normal,
             origin: Origin::Path,
             path: None,
+            features: Vec::new(),
         });
         assert_eq!(
             rules(&check_arch(&crates)),
@@ -977,6 +1062,89 @@ mod tests {
                 ("barras-kernel", "sqlx", "kernel-dev-allowlist"),
                 ("barras-identity", "cc", "module-allowlist"),
                 ("barras-api", "barras-testkit", "testkit-dev-only"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_member_s_testing_feature_is_turned_on_only_in_a_dev_dependency() {
+        let crates = workspace([
+            krate("barras-kernel", "crates/kernel", &[]),
+            krate_enabling(
+                "barras-adapter-http",
+                "crates/adapters/http",
+                &[
+                    ("barras-kernel", Normal, true, &["testing"]),
+                    ("barras-kernel", Dev, true, &["testing"]),
+                    // A feature of that name in a crate that is not a member is not ours.
+                    ("tokio", Normal, false, &["testing"]),
+                ],
+            ),
+            krate_enabling(
+                "barras-api",
+                "apps/api",
+                &[
+                    ("barras-adapter-http", Normal, true, &[]),
+                    ("barras-adapter-http", Dev, true, &["testing"]),
+                    ("barras-adapter-http", Build, true, &["testing"]),
+                ],
+            ),
+            // The testkit too: `cargo build --workspace` builds it with the binaries.
+            krate_enabling(
+                "barras-testkit",
+                "crates/testkit",
+                &[("barras-kernel", Normal, true, &["testing"])],
+            ),
+        ]);
+        assert_eq!(
+            rules(&check_arch(&crates)),
+            [
+                ("barras-adapter-http", "barras-kernel", "testing-dev-only"),
+                ("barras-api", "barras-adapter-http", "testing-dev-only"),
+                ("barras-testkit", "barras-kernel", "testing-dev-only"),
+            ]
+        );
+    }
+
+    #[test]
+    fn only_a_crate_s_own_testing_feature_may_turn_on_a_testing_feature() {
+        let mut http = krate(
+            "barras-adapter-http",
+            "crates/adapters/http",
+            &[("barras-kernel", Normal, true), ("serde", Normal, false)],
+        );
+        // `kernel = { package = "barras-kernel", … }`: the table names a dependency by its key.
+        http.deps[0].rename = Some("kernel".to_owned());
+        let crates = workspace([
+            krate("barras-kernel", "crates/kernel", &[]),
+            with_features(
+                http,
+                &[
+                    ("testing", &["dep:hyper-util", "kernel/testing"]),
+                    ("default", &["testing"]),
+                    ("clock", &["kernel?/testing"]),
+                    ("fixtures", &["kernel/testing", "serde/testing"]),
+                ],
+            ),
+        ]);
+        assert_eq!(
+            rules(&check_arch(&crates)),
+            [
+                (
+                    "barras-adapter-http",
+                    "[features] clock = kernel?/testing",
+                    "testing-dev-only"
+                ),
+                (
+                    "barras-adapter-http",
+                    "[features] default = testing",
+                    "testing-dev-only"
+                ),
+                (
+                    "barras-adapter-http",
+                    "[features] fixtures = kernel/testing",
+                    "testing-dev-only"
+                ),
             ]
         );
     }

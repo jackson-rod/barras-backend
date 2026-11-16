@@ -670,6 +670,117 @@ fn the_kernel_and_the_modules_have_no_build_script() {
     );
 }
 
+/// The kernel and the HTTP adapter, each with a `testing` feature that the other members
+/// may turn on, as the real workspace has them.
+const KERNEL_WITH_TESTING: (&str, &str, &str) = (
+    "crates/kernel",
+    "barras-kernel",
+    "\n[features]\ntesting = []\n",
+);
+
+#[test]
+fn testing_features_turned_on_in_dev_dependencies_only_are_clean() {
+    let root = workspace(
+        &[
+            KERNEL_WITH_TESTING,
+            (
+                "crates/adapters/http",
+                "barras-adapter-http",
+                "\n[features]\ntesting = [\"barras-kernel/testing\"]\n\n[dependencies]\nbarras-kernel.workspace = true\n\n[dev-dependencies]\nbarras-kernel = { workspace = true, features = [\"testing\"] }\n",
+            ),
+            (
+                "apps/api",
+                "barras-api",
+                "\n[dependencies]\nbarras-adapter-http.workspace = true\n\n[dev-dependencies]\nbarras-adapter-http = { workspace = true, features = [\"testing\"] }\n",
+            ),
+        ],
+        "\n[workspace.dependencies]\nbarras-kernel = { path = \"crates/kernel\" }\nbarras-adapter-http = { path = \"crates/adapters/http\" }\n",
+    );
+    assert_eq!(check_workspace(root.path()).unwrap(), []);
+}
+
+#[test]
+fn a_testing_feature_turned_on_outside_a_dev_dependency_is_refused() {
+    // The workspace entry turns the kernel's on in every crate that inherits it, and cargo
+    // reports it on each of them.
+    let root = workspace(
+        &[
+            KERNEL_WITH_TESTING,
+            (
+                "crates/adapters/http",
+                "barras-adapter-http",
+                "\n[features]\ntesting = []\n\n[dependencies]\nbarras-kernel.workspace = true\n",
+            ),
+            (
+                "apps/api",
+                "barras-api",
+                "\n[dependencies]\nbarras-adapter-http = { path = \"../../crates/adapters/http\", features = [\"testing\"] }\n\n[build-dependencies]\nbarras-adapter-http = { path = \"../../crates/adapters/http\", features = [\"testing\"] }\n\n[dev-dependencies]\nbarras-kernel.workspace = true\n",
+            ),
+            (
+                "crates/testkit",
+                "barras-testkit",
+                "\n[dependencies]\nbarras-kernel = { path = \"../kernel\", features = [\"testing\"] }\n",
+            ),
+        ],
+        "\n[workspace.dependencies]\nbarras-kernel = { path = \"crates/kernel\", features = [\"testing\"] }\n",
+    );
+    assert_eq!(
+        sorted_rules(&check_workspace(root.path()).unwrap()),
+        [
+            ("barras-adapter-http", "barras-kernel", "testing-dev-only"),
+            ("barras-api", "barras-adapter-http", "testing-dev-only"),
+            ("barras-api", "barras-adapter-http", "testing-dev-only"),
+            ("barras-testkit", "barras-kernel", "testing-dev-only"),
+        ]
+    );
+}
+
+#[test]
+fn a_feature_other_than_testing_may_not_turn_a_testing_feature_on() {
+    // `cargo build --workspace` turns on every member's default features, so `default`, or
+    // a feature that some normal dependency turns on, would carry test code into the build.
+    let root = workspace(
+        &[
+            (
+                "crates/kernel",
+                "barras-kernel",
+                "\n[features]\ndefault = [\"testing\"]\ntesting = []\n",
+            ),
+            (
+                "crates/adapters/http",
+                "barras-adapter-http",
+                "\n[features]\ntesting = []\n",
+            ),
+            (
+                "apps/api",
+                "barras-api",
+                "\n[features]\nclock = [\"kernel/testing\"]\nclient = [\"dep:http\", \"http?/testing\"]\n\n[dependencies]\nkernel = { package = \"barras-kernel\", path = \"../../crates/kernel\", default-features = false }\nhttp = { package = \"barras-adapter-http\", path = \"../../crates/adapters/http\", optional = true }\n",
+            ),
+        ],
+        "",
+    );
+    assert_eq!(
+        sorted_rules(&check_workspace(root.path()).unwrap()),
+        [
+            (
+                "barras-api",
+                "[features] client = http?/testing",
+                "testing-dev-only"
+            ),
+            (
+                "barras-api",
+                "[features] clock = kernel/testing",
+                "testing-dev-only"
+            ),
+            (
+                "barras-kernel",
+                "[features] default = testing",
+                "testing-dev-only"
+            ),
+        ]
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn a_crate_folder_that_is_a_symlink_is_refused() {

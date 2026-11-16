@@ -143,6 +143,7 @@ fn is_an_empty_main(source: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
 
     use super::*;
@@ -160,6 +161,7 @@ mod tests {
                     src_path: PathBuf::from(src_path),
                 })
                 .collect(),
+            features: BTreeMap::new(),
         }
     }
 
