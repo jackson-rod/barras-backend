@@ -10,6 +10,7 @@ rust_decimal = { workspace = true, features = ["std"] }
 thiserror.workspace = true
 time.workspace = true
 uuid = { workspace = true, features = ["v7"] }
+workspace-hack.workspace = true
 
 [features]
 # `FixedClock`, for the tests of the crates that may not depend on `barras-testkit`.

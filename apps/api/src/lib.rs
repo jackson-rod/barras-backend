@@ -2,6 +2,9 @@
 //! the composition root; `main.rs` only hands it the command line, so the tests reach the same
 //! code as the binary.
 
+// Taken for its features, not code; named so cargo's unused-dependency lint lets `just lint` pass.
+use workspace_hack as _;
+
 pub mod cli;
 mod config;
 

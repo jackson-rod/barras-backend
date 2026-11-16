@@ -6,7 +6,7 @@ members = [
   "crates/bootstrap",
   "crates/adapters/postgres", "crates/adapters/http", "crates/adapters/realtime",
   "crates/adapters/redis", "crates/adapters/providers",
-  "crates/testkit", "crates/xtask",
+  "crates/testkit", "crates/workspace-hack", "crates/xtask",
 ]
 
 [workspace.package]
@@ -46,6 +46,7 @@ tracing-subscriber = { version = "0.3.23", default-features = false }
 utoipa = { version = "6.0.0", default-features = false }
 utoipa-axum = "0.3.0"
 uuid = "1.29.2"
+workspace-hack = { version = "0.1", path = "crates/workspace-hack" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

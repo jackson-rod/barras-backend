@@ -42,6 +42,12 @@ jobs:
       - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
           tool: just@1.59.0,cargo-deny@0.20.2
+      # The pinned install-action has no manifest for cargo-hakari, so it would fall back to
+      # cargo-binstall and download a prebuilt binary from the project's GitHub releases, with
+      # no signature to check: the crate's binstall metadata declares none. Built instead from
+      # its crates.io source at this version, with the lock file it was released with.
+      - name: Install cargo-hakari
+        run: cargo install --locked cargo-hakari@0.9.39
       # A branch name is chosen by whoever opens the pull request, so it reaches
       # the shell only through env, never through an expression inside run.
       - name: Check the branch name
@@ -58,11 +64,13 @@ jobs:
       # commit message to fix never hides what they find.
       #
       # Before anything compiles the workspace: cargo xtask builds only xtask, and
-      # cargo metadata runs no build script, so no build script of the change can
-      # rewrite what these two read before they read it.
-      - name: Architecture and structure
+      # cargo metadata, which cargo hakari reads too, runs no build script, so no
+      # build script of the change can rewrite what these read before they read it.
+      # hakari-check only reads: a command that rewrites the workspace-hack would
+      # fail the tree check below.
+      - name: Architecture, structure and the workspace-hack
         if: ${{ !cancelled() }}
-        run: just check-arch check-structure
+        run: just check-arch check-structure hakari-check
       - name: Format, lint, deny and the OpenAPI document
         if: ${{ !cancelled() }}
         run: just fmt-check lint deny openapi-check

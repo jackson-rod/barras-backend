@@ -11,6 +11,7 @@ barras-bootstrap.workspace = true
 # The runtime the binary builds by hand.
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 tracing.workspace = true
+workspace-hack.workspace = true
 
 [dev-dependencies]
 # `fetch`; the feature is on only here, so it never reaches the binary.

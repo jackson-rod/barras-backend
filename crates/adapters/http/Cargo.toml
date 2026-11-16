@@ -26,6 +26,7 @@ tracing.workspace = true
 utoipa = { workspace = true, features = ["macros"] }
 utoipa-axum.workspace = true
 uuid = { workspace = true, features = ["v7"] }
+workspace-hack.workspace = true
 
 [features]
 # `TestClient`, its route guard and `fetch`, for the tests of the crates that build an app.

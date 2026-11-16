@@ -5,7 +5,7 @@ default:
 
 setup:
     rustup toolchain install
-    cargo install --locked cargo-nextest@0.9.152 cargo-deny@0.20.2 cargo-llvm-cov@0.9.1 watchexec-cli@2.8.0
+    cargo install --locked cargo-nextest@0.9.152 cargo-deny@0.20.2 cargo-hakari@0.9.39 cargo-llvm-cov@0.9.1 watchexec-cli@2.8.0
     lefthook install
 
 # Runs barras-api with the variables of .env; restarts it when a Rust source or a Cargo.toml changes
@@ -48,6 +48,21 @@ check-arch:
 check-structure:
     cargo xtask check-structure
 
+# crates/workspace-hack is generated from the dependency tree and .config/hakari.toml (ADR-0024).
+# cargo hakari reads the tree with a plain cargo metadata, which runs no build script but would
+# rewrite a stale Cargo.lock.
+
+# Regenerates crates/workspace-hack and every member's line to it, after any dependency change
+hakari:
+    cargo hakari generate
+    cargo hakari manage-deps --yes
+
+# Fails when crates/workspace-hack or a member's line to it is out of step, and fixes neither
+hakari-check:
+    cargo hakari generate --diff
+    cargo hakari manage-deps --dry-run
+    cargo hakari verify
+
 # Rewrites openapi.json from the code; through a temporary file, so a failed build leaves it whole
 openapi:
     mkdir -p target
@@ -86,9 +101,10 @@ test-cov:
 build:
     cargo build --workspace --release --locked
 
-# check-arch and check-structure read the workspace before anything compiles it, so no build
-# script of the change can rewrite what they read: cargo xtask builds only xtask, and cargo
-# metadata --no-deps runs no build script.
+# check-arch, check-structure and hakari-check read the workspace before anything compiles it, so
+# no build script of the change can rewrite what they read: cargo xtask builds only xtask, and
+# cargo metadata runs no build script. hakari-check comes after check-arch, whose --locked fails
+# on a stale Cargo.lock before cargo hakari's own cargo metadata could rewrite it.
 
 # What CI runs, apart from the branch, commit and pull request checks
-verify: fmt-check check-arch check-structure lint deny openapi-check test-cov test-doc build
+verify: fmt-check check-arch check-structure hakari-check lint deny openapi-check test-cov test-doc build

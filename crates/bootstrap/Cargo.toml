@@ -9,6 +9,7 @@ publish.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "signal"] }
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["fmt", "json"] }
+workspace-hack.workspace = true
 
 [dev-dependencies]
 serde = { workspace = true, features = ["derive"] }

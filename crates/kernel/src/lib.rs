@@ -1,5 +1,8 @@
 //! Domain model and ports shared by every layer, with no I/O.
 
+// Taken for its features, not code; named so cargo's unused-dependency lint lets `just lint` pass.
+use workspace_hack as _;
+
 mod clock;
 mod currency;
 mod entitlements;

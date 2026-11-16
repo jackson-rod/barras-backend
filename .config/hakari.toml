@@ -1,0 +1,48 @@
+# Settings of `cargo hakari`, which generates `crates/workspace-hack` (ADR-0024).
+# The options: https://docs.rs/cargo-hakari/0.9.39/cargo_hakari/config/index.html
+# After a change here or to any dependency, run `just hakari`; `just hakari-check` fails until then.
+
+hakari-package = "workspace-hack"
+
+# The latest output format: no feature that another listed feature already turns on, and the
+# dependencies sorted by name.
+dep-format-version = "4"
+
+# The resolver of the root `Cargo.toml`, so that hakari simulates the builds cargo really runs.
+resolver = "3"
+
+# On top of the features every platform shares, hakari unifies those of the platforms we build
+# on: the developers' Macs and CI's Linux runners.
+platforms = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]
+
+# Every dependency is declared once in `[workspace.dependencies]` of the root `Cargo.toml` and
+# taken with `.workspace = true`, the workspace-hack included.
+workspace-hack-line-style = "workspace-dotted"
+
+# hakari works out the generated crate as if these did not exist.
+[traversal-excludes]
+# The repository tool depends on no workspace crate (`tool-isolation`), and what it needs
+# (syn, regex, cargo_metadata) must not shape what the other crates build. `[final-excludes]`
+# would still let its features in.
+workspace-members = ["xtask"]
+# Every member depends on the generated crate, so whatever it holds reaches the release build.
+# hakari unifies each member's builds with and without its dev-dependencies, and with all its
+# features (`testing` included), and has no option to leave either out. So a crate whose extra
+# features only tests ask for stays out, and cargo resolves it as it would without hakari.
+# `[final-excludes]` would drop only its line: hakari would still unify the rest as if it were
+# there, and `cargo hakari verify` would then fail on the crates it reaches (futures-core,
+# tracing-core, syn and others). After `just hakari`, a crate that gains such a feature in the
+# generated crate joins this list.
+third-party = [
+    # `derive` and `email`: only the HTTP adapter's test fixtures derive their rules.
+    { name = "garde" },
+    # The HTTP client (`client`, `client-legacy`): only the HTTP adapter's dev-dependencies and
+    # its `testing` feature, which only dev-dependencies turn on, use it.
+    { name = "hyper" },
+    { name = "hyper-util" },
+    # `test-util`, which pauses the clock in the HTTP adapter's tests; tokio itself treats it in
+    # a release build as an accident.
+    { name = "tokio" },
+    # `std`: only the HTTP client above asks for it.
+    { name = "tracing" },
+]

@@ -1,5 +1,8 @@
 //! HTTP adapter exposing the application over REST.
 
+// Taken for its features, not code; named so cargo's unused-dependency lint lets `just lint` pass.
+use workspace_hack as _;
+
 mod app;
 mod envelope;
 mod error;

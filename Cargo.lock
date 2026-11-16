@@ -131,23 +131,36 @@ dependencies = [
  "utoipa",
  "utoipa-axum",
  "uuid",
+ "workspace-hack",
 ]
 
 [[package]]
 name = "barras-adapter-postgres"
 version = "0.1.0"
+dependencies = [
+ "workspace-hack",
+]
 
 [[package]]
 name = "barras-adapter-providers"
 version = "0.1.0"
+dependencies = [
+ "workspace-hack",
+]
 
 [[package]]
 name = "barras-adapter-realtime"
 version = "0.1.0"
+dependencies = [
+ "workspace-hack",
+]
 
 [[package]]
 name = "barras-adapter-redis"
 version = "0.1.0"
+dependencies = [
+ "workspace-hack",
+]
 
 [[package]]
 name = "barras-api"
@@ -159,6 +172,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -170,6 +184,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -182,6 +197,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -192,11 +208,15 @@ dependencies = [
  "thiserror",
  "time",
  "uuid",
+ "workspace-hack",
 ]
 
 [[package]]
 name = "barras-testkit"
 version = "0.1.0"
+dependencies = [
+ "workspace-hack",
+]
 
 [[package]]
 name = "bitflags"
@@ -1514,6 +1534,20 @@ name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
+
+[[package]]
+name = "workspace-hack"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "memchr",
+ "proc-macro2",
+ "quote",
+ "serde",
+ "serde_core",
+ "syn 3.0.10",
+ "uuid",
+]
 
 [[package]]
 name = "xtask"

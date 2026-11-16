@@ -13,6 +13,7 @@ serde_json.workspace = true
 # The runtime the serve mode builds by hand.
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 tracing.workspace = true
+workspace-hack.workspace = true
 
 [dev-dependencies]
 # The test client; the feature is on only here, so it never reaches the binary.
