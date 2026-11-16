@@ -10,8 +10,6 @@ barras-adapter-http.workspace = true
 barras-bootstrap.workspace = true
 # The error of the canonical OpenAPI JSON, which `RunError` keeps as its source.
 serde_json.workspace = true
-# The runtime the serve mode builds by hand.
-tokio = { workspace = true, features = ["rt-multi-thread"] }
 tracing.workspace = true
 workspace-hack.workspace = true
 

@@ -6,7 +6,7 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
-tokio = { workspace = true, features = ["macros", "rt", "signal"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "signal"] }
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["fmt", "json"] }
 workspace-hack.workspace = true

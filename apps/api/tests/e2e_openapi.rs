@@ -4,18 +4,11 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration test crate: every item is test code
 
 use std::fs;
-use std::path::{Path, PathBuf};
 
 use barras_adapter_http::metadata_problems;
 use barras_api::{ApiConfig, Dependencies, build_app, openapi_json};
 use barras_bootstrap::{AppEnv, Environment, LogLevel};
-use barras_testkit::env_file;
-
-fn repository_file(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join(name)
-}
+use barras_testkit::{env_file, repository_file};
 
 #[test]
 fn every_operation_of_the_document_has_the_metadata_of_the_contract() {

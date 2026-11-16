@@ -13,14 +13,16 @@
 
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
-use std::path::{Path, PathBuf};
-use std::process::{Output, Stdio};
+use std::path::Path;
 use std::time::Duration;
 
 use barras_adapter_http::testing::{TestResponse, fetch};
 use barras_api::ApiConfig;
-use barras_testkit::{BinaryCommand, RunningBinary, env_file};
-use serde_json::Value;
+use barras_testkit::process::{
+    BinaryCommand, RunningBinary, address_in, closed_pipe, describe, is_listening, json_lines,
+    text, with_example_values,
+};
+use barras_testkit::repository_file;
 
 const BINARY: &str = env!("CARGO_BIN_EXE_barras-api");
 
@@ -31,43 +33,6 @@ const PATIENCE: Duration = Duration::from_secs(30);
 /// A free port of the loopback interface, which the system picks when the binary binds it.
 const ANY_PORT: &str = "127.0.0.1:0";
 
-fn repository_file(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join(name)
-}
-
-/// The binary with the variables of `.env.example` as its whole environment.
-fn with_example_values() -> BinaryCommand {
-    env_file(repository_file(".env.example"))
-        .into_iter()
-        .fold(BinaryCommand::new(BINARY), |command, (name, value)| {
-            command.env(name, value)
-        })
-}
-
-fn text(bytes: &[u8]) -> &str {
-    std::str::from_utf8(bytes).unwrap()
-}
-
-/// The exit status and everything the binary printed, for the message of a failed assertion.
-fn describe(output: &Output) -> String {
-    format!(
-        "{}\nstandard output:\n{}\nstandard error:\n{}",
-        output.status,
-        text(&output.stdout),
-        text(&output.stderr)
-    )
-}
-
-/// Each line of `log`, parsed as JSON; the test fails on a line that is not.
-fn json_lines(log: &[u8]) -> Vec<Value> {
-    text(log)
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap_or_else(|error| panic!("{error}: {line:?}")))
-        .collect()
-}
-
 /// `GET path` on `addr`, from a test that has no runtime of its own.
 fn get(addr: SocketAddr, path: &str) -> TestResponse {
     tokio::runtime::Builder::new_current_thread()
@@ -75,37 +40,6 @@ fn get(addr: SocketAddr, path: &str) -> TestResponse {
         .build()
         .unwrap()
         .block_on(fetch(addr, path))
-}
-
-/// A pipe nobody reads from any more, so that every write to it fails.
-fn closed_pipe() -> Stdio {
-    let (reader, writer) = std::io::pipe().unwrap();
-    drop(reader);
-    Stdio::from(writer)
-}
-
-/// Whether `line`, JSON or readable, is the one the binary logs once both listeners are bound.
-fn is_listening(line: &str) -> bool {
-    match serde_json::from_str::<Value>(line) {
-        Ok(json) => json["fields"]["message"] == "listening",
-        Err(_) => line.contains(": listening "),
-    }
-}
-
-/// The address the `listening` line gives for `field`, whether the line is JSON or readable.
-fn address_in(line: &str, field: &str) -> SocketAddr {
-    let address = match serde_json::from_str::<Value>(line) {
-        Ok(json) => json["fields"][field].as_str().map(str::to_owned),
-        Err(_) => {
-            let prefix = format!("{field}=");
-            line.split_whitespace()
-                .find_map(|word| word.strip_prefix(&prefix))
-                .map(str::to_owned)
-        }
-    };
-    address
-        .and_then(|address| address.parse().ok())
-        .unwrap_or_else(|| panic!("no {field} in {line:?}"))
 }
 
 /// A binary that listens on both its addresses.
@@ -120,7 +54,7 @@ struct Serving {
 fn serve(variables: &[(&str, &str)]) -> Serving {
     let binary = variables
         .iter()
-        .fold(with_example_values(), |command, (name, value)| {
+        .fold(with_example_values(BINARY), |command, (name, value)| {
             command.env(name, value)
         })
         .env("API_BIND_ADDR", ANY_PORT)
@@ -159,7 +93,7 @@ fn an_empty_environment_stops_the_binary_naming_every_variable() {
 
 #[test]
 fn a_log_level_that_is_not_valid_stops_the_binary_before_it_listens() {
-    let output = with_example_values()
+    let output = with_example_values(BINARY)
         .env("LOG_LEVEL", "loud")
         .env("API_BIND_ADDR", ANY_PORT)
         .env("API_INTERNAL_BIND_ADDR", ANY_PORT)
@@ -260,7 +194,7 @@ fn an_address_already_taken_stops_the_binary_and_the_log_says_why() {
     let taken = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let public = taken.local_addr().unwrap();
 
-    let output = with_example_values()
+    let output = with_example_values(BINARY)
         .env("APP_ENV", "staging")
         .env("API_BIND_ADDR", public.to_string())
         .env("API_INTERNAL_BIND_ADDR", ANY_PORT)

@@ -1,16 +1,13 @@
 //! The command line of `barras-api`. With no argument it serves; `openapi` prints the OpenAPI
 //! document and `openapi --check <file>` compares a file with it, both without reading the
-//! environment or opening a socket.
+//! environment or opening a socket. Neither starts the logs, so each says on standard error
+//! what failed, as serving does until its logs are up.
 
-use std::fmt::Display;
 use std::fs;
 use std::io::{self, Write};
-use std::num::NonZeroUsize;
 use std::process::ExitCode;
-use std::thread;
 
-use barras_bootstrap::{Environment, with_sources};
-use tokio::runtime;
+use barras_bootstrap::{Environment, build_runtime, report_failure, report_usage, with_sources};
 
 use crate::{ApiConfig, RunError, openapi_json, run};
 
@@ -18,9 +15,6 @@ const USAGE: &str = "\
 usage: barras-api                          serve the API, configured by the environment
        barras-api openapi                  print the OpenAPI document
        barras-api openapi --check <file>   fail unless <file> holds the document the code generates";
-
-/// The exit status of a command line it does not understand, as with most tools.
-const USAGE_ERROR: u8 = 2;
 
 /// What the arguments ask for.
 #[derive(Debug, PartialEq, Eq)]
@@ -48,10 +42,7 @@ pub fn main_with_args(args: &[String]) -> ExitCode {
         Command::Serve => serve(),
         Command::PrintOpenApi => print_openapi(),
         Command::CheckOpenApi(file) => check_openapi(file),
-        Command::Usage => {
-            report(&USAGE);
-            ExitCode::from(USAGE_ERROR)
-        }
+        Command::Usage => report_usage(&USAGE),
     }
 }
 
@@ -60,20 +51,16 @@ pub fn main_with_args(args: &[String]) -> ExitCode {
 fn serve() -> ExitCode {
     let config = match ApiConfig::from_env(Environment::from_process()) {
         Ok(config) => config,
-        Err(error) => return fail(&error),
+        Err(error) => return report_failure(&error),
     };
-    let runtime = match runtime::Builder::new_multi_thread()
-        .worker_threads(worker_threads())
-        .enable_all()
-        .build()
-    {
+    let runtime = match build_runtime() {
         Ok(runtime) => runtime,
-        Err(error) => return fail(&format!("the tokio runtime could not start: {error}")),
+        Err(error) => return report_failure(&with_sources(&error)),
     };
     match runtime.block_on(run(config)) {
         Ok(()) => ExitCode::SUCCESS,
         // The logs are what failed, so standard error is the only place left to say so.
-        Err(error @ RunError::Logs(_)) => fail(&with_sources(&error)),
+        Err(error @ RunError::Logs(_)) => report_failure(&with_sources(&error)),
         Err(error) => {
             tracing::error!(error = %with_sources(&error), "barras-api stopped on a failure");
             ExitCode::FAILURE
@@ -81,17 +68,10 @@ fn serve() -> ExitCode {
     }
 }
 
-/// One worker per processor, the count tokio picks by default. Given explicitly, so that tokio
-/// never reads `TOKIO_WORKER_THREADS`: the binary's configuration is `ApiConfig`, and tokio
-/// panics on a value it cannot read, printing it.
-fn worker_threads() -> usize {
-    thread::available_parallelism().map_or(1, NonZeroUsize::get)
-}
-
 fn print_openapi() -> ExitCode {
     let document = match openapi_json() {
         Ok(document) => document,
-        Err(error) => return fail(&with_sources(&error)),
+        Err(error) => return report_failure(&with_sources(&error)),
     };
     // `print!` panics when standard output is closed; this reports it like any other failure.
     let mut stdout = io::stdout().lock();
@@ -100,7 +80,7 @@ fn print_openapi() -> ExitCode {
         .and_then(|()| stdout.flush())
     {
         Ok(()) => ExitCode::SUCCESS,
-        Err(error) => fail(&format!(
+        Err(error) => report_failure(&format!(
             "the OpenAPI document could not be written: {error}"
         )),
     }
@@ -110,30 +90,17 @@ fn print_openapi() -> ExitCode {
 fn check_openapi(file: &str) -> ExitCode {
     let document = match openapi_json() {
         Ok(document) => document,
-        Err(error) => return fail(&with_sources(&error)),
+        Err(error) => return report_failure(&with_sources(&error)),
     };
     match fs::read(file) {
         Ok(committed) if committed == document.as_bytes() => ExitCode::SUCCESS,
-        Ok(_) => fail(&format!(
+        Ok(_) => report_failure(&format!(
             "{file} is not the document the code generates: run `just openapi`"
         )),
-        Err(error) => fail(&format!(
+        Err(error) => report_failure(&format!(
             "{file} could not be read ({error}): run `just openapi`"
         )),
     }
-}
-
-fn fail(message: &dyn Display) -> ExitCode {
-    report(message);
-    ExitCode::FAILURE
-}
-
-/// Writes `message` to standard error: the logs are not up, since serving starts them only once
-/// the configuration is read, and no other mode has any.
-fn report(message: &dyn Display) {
-    // `eprintln!` panics when standard error is closed. Then nowhere is left to say anything,
-    // and the exit status still tells the failure, so the write's own failure is dropped.
-    let _ = writeln!(io::stderr().lock(), "{message}");
 }
 
 #[cfg(test)]

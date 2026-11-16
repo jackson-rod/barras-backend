@@ -1,5 +1,8 @@
 //! Starting a workspace binary from its tests: with a clean environment, stopped with
-//! SIGTERM, with everything it printed, and never waited for without a deadline.
+//! SIGTERM, with everything it printed, and never waited for without a deadline; and reading
+//! what it printed, the lines it logs among it.
+
+mod log_lines;
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -10,6 +13,10 @@ use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+pub use log_lines::{address_in, is_listening, json_lines};
+
+use crate::{env_file, repository_file};
 
 /// The variable through which cargo-llvm-cov tells an instrumented binary where to write its
 /// coverage profile.
@@ -105,6 +112,29 @@ impl BinaryCommand {
             child,
         }
     }
+}
+
+/// The binary at `program` with the variables of the repository's `.env.example` as its whole
+/// environment: the configuration a developer starts it with.
+pub fn with_example_values(program: impl AsRef<Path>) -> BinaryCommand {
+    env_file(repository_file(".env.example"))
+        .into_iter()
+        .fold(BinaryCommand::new(program), |command, (name, value)| {
+            command.env(name, value)
+        })
+}
+
+/// A pipe nobody reads from any more, so that every write to it fails: what a binary whose
+/// standard output or standard error is closed writes to.
+pub fn closed_pipe() -> Stdio {
+    let (reader, writer) = io::pipe().unwrap();
+    drop(reader);
+    Stdio::from(writer)
+}
+
+/// What a binary printed, as text; the test fails when it is not UTF-8.
+pub fn text(printed: &[u8]) -> &str {
+    std::str::from_utf8(printed).unwrap()
 }
 
 /// A binary started by [`BinaryCommand::spawn`]. Dropping it kills the process and reaps it,
@@ -330,8 +360,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// The exit status and what the binary printed, for the message of a failed test.
-fn describe(output: &Output) -> String {
+/// The exit status and everything the binary printed, for the message of a failed assertion.
+pub fn describe(output: &Output) -> String {
     format!(
         "{}\nstandard output:\n{}\nstandard error:\n{}",
         output.status,
@@ -373,10 +403,6 @@ mod tests {
     const LARGE_OUTPUT: &str = r#"line=$(printf '%01023d' 0); i=0; while [ "$i" -lt 1024 ]; do echo "$line"; echo "$line" >&2; i=$((i + 1)); done"#;
     const MIB: usize = 1024 * 1024;
     const SIGKILL: i32 = 9;
-
-    fn text(bytes: &[u8]) -> &str {
-        std::str::from_utf8(bytes).unwrap()
-    }
 
     fn os_string(text: &str) -> OsString {
         OsString::from(text)
@@ -479,6 +505,48 @@ mod tests {
         let mut printed: Vec<&str> = text(&output.stdout).lines().collect();
         printed.sort_unstable();
         assert_eq!(printed, expected);
+    }
+
+    #[test]
+    fn with_example_values_the_binary_sees_the_variables_of_env_example_and_no_other() {
+        let output = with_example_values("/usr/bin/env").run_within(Duration::from_secs(10));
+
+        let mut expected: Vec<String> = env_file(repository_file(".env.example"))
+            .into_iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect();
+        if let Some(profile_file) = parent_profile_file() {
+            expected.push(format!("{PROFILE_FILE}={}", profile_file.to_str().unwrap()));
+        }
+        expected.sort();
+        let mut printed: Vec<&str> = text(&output.stdout).lines().collect();
+        printed.sort_unstable();
+        assert_eq!(printed, expected);
+    }
+
+    #[test]
+    fn a_binary_cannot_write_to_a_closed_pipe() {
+        // The shell dies of SIGPIPE, or, where that is ignored, its `echo` fails.
+        let output = BinaryCommand::new("/bin/sh")
+            .arg("-c")
+            .arg("echo lost || exit 3")
+            .stdout(closed_pipe())
+            .run_within(Duration::from_secs(10));
+
+        assert!(!output.status.success(), "{}", describe(&output));
+    }
+
+    #[test]
+    fn describe_gives_the_exit_status_and_both_streams() {
+        let output = BinaryCommand::new("/bin/sh")
+            .arg("-c")
+            .arg("echo out; echo err >&2; exit 3")
+            .run_within(Duration::from_secs(10));
+
+        assert_eq!(
+            describe(&output),
+            "exit status: 3\nstandard output:\nout\n\nstandard error:\nerr\n"
+        );
     }
 
     #[test]
