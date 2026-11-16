@@ -3,8 +3,9 @@
 //! string or the body, any of which may carry a credential.
 
 use serde_json::{Value, json};
+use tracing::Level;
 
-use super::support::{PANIC_TEXT, client, send_logged_json};
+use super::support::{PANIC_TEXT, client, send_logged_json, send_logged_json_at};
 use crate::testing::TestRequest;
 
 const HEADER_SECRET: &str = "header-secret";
@@ -133,6 +134,37 @@ async fn a_server_failure_is_logged_once_with_its_cause_then_as_finished() {
         assert_eq!(lines[1]["fields"]["status"], status);
         for line in &lines {
             assert_eq!(line["spans"][0]["request_id"], "log-probe-2", "{line}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_server_failure_keeps_its_span_when_only_warnings_or_errors_are_logged() {
+    for level in [Level::WARN, Level::ERROR] {
+        for (path, template, status) in [
+            ("/api/v1/panic/formatted", "/api/v1/panic/{payload}", 500),
+            ("/api/v1/bare/503", "/api/v1/bare/{status}", 503),
+        ] {
+            let request = TestRequest::new("GET", path).header("x-request-id", "log-probe-4");
+
+            let (response, lines) = send_logged_json_at(&client(), request, level).await;
+
+            assert_eq!(response.status, status);
+            assert_eq!(
+                events(&lines),
+                [("ERROR", "request failed")],
+                "{level} {path}"
+            );
+            assert_eq!(
+                lines[0]["spans"],
+                json!([{
+                    "name": "request",
+                    "method": "GET",
+                    "path": template,
+                    "request_id": "log-probe-4"
+                }]),
+                "{level} {path}"
+            );
         }
     }
 }

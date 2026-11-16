@@ -12,6 +12,7 @@ use axum::response::{IntoResponse, Response};
 use garde::Validate;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tracing::Level;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::util::SubscriberInitExt;
 use utoipa::ToSchema;
@@ -463,13 +464,23 @@ pub(super) async fn send_logged_json(
     client: &TestClient,
     request: TestRequest,
 ) -> (TestResponse, Vec<Value>) {
+    send_logged_json_at(client, request, Level::TRACE).await
+}
+
+/// As `send_logged_json`, with only what `level` and the levels above it let through, as
+/// `LOG_LEVEL` does.
+pub(super) async fn send_logged_json_at(
+    client: &TestClient,
+    request: TestRequest,
+    level: Level,
+) -> (TestResponse, Vec<Value>) {
     let capture = Capture::default();
     let response = {
         let _default = tracing_subscriber::fmt()
             .json()
             .with_current_span(false)
             .with_span_list(true)
-            .with_max_level(tracing::Level::TRACE)
+            .with_max_level(level)
             .with_writer(capture.clone())
             .finish()
             .set_default();
