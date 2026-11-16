@@ -19,6 +19,13 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   SCCACHE_GHA_ENABLED: "true"
+  # A pull request only reads the cache. Its runs read their own scope before
+  # develop's, so a commit that wrote there could poison the results of the
+  # pull request's next run; pushes to develop and main still write. The token
+  # the cache needs stays in the environment of every later step, so a hostile
+  # build script could still write to the pull request's own scope: the run on
+  # develop after the merge is the authoritative result.
+  SCCACHE_GHA_RW_MODE: ${{ github.event_name == 'pull_request' && 'READ_ONLY' || 'READ_WRITE' }}
   RUSTC_WRAPPER: sccache
 
 jobs:
@@ -27,7 +34,7 @@ jobs:
     timeout-minutes: 20
     steps:
       # Full history: check-commits needs the commits of the branch and the base ref.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -38,46 +45,56 @@ jobs:
           cache: false
           # Its default sets CARGO_BUILD_WARNINGS=deny for every cargo command of the job. Locally only `just lint` denies cargo warnings, through its own flag; CI must compile exactly like `just verify`.
           build-warnings: ""
+      # A fixed sccache release rather than whichever is newest; the action checks
+      # the binary against the checksum file of that release.
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.19.0
+      # Every tool and version here is in the action's manifest, with its checksum.
+      # `fallback: none` makes one that is not fail the step instead of being
+      # fetched by cargo-binstall, with no checksum pinned.
       - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
           tool: just@1.59.0,cargo-deny@0.20.2
+          fallback: none
       # The pinned install-action has no manifest for cargo-hakari, so it would fall back to
       # cargo-binstall and download a prebuilt binary from the project's GitHub releases, with
       # no signature to check: the crate's binstall metadata declares none. Built instead from
       # its crates.io source at this version, with the lock file it was released with.
       - name: Install cargo-hakari
         run: cargo install --locked cargo-hakari@0.9.39
+      # Every check runs even when a step above it failed, so one finding never
+      # hides another.
+      #
       # A branch name is chosen by whoever opens the pull request, so it reaches
       # the shell only through env, never through an expression inside run.
       - name: Check the branch name
-        if: github.event_name == 'pull_request'
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
         env:
           BRANCH_NAME: ${{ github.head_ref }}
         run: cargo xtask check-branch "$BRANCH_NAME"
       - name: Check the commit messages
-        if: github.event_name == 'pull_request'
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
         env:
           BASE_REF: ${{ github.base_ref }}
         run: cargo xtask check-commits "origin/$BASE_REF..HEAD"
-      # The code steps run even when a step above failed, so a branch name or a
-      # commit message to fix never hides what they find.
-      #
-      # Before anything compiles the workspace: cargo xtask builds only xtask, and
-      # cargo metadata, which cargo hakari reads too, runs no build script, so no
-      # build script of the change can rewrite what these read before they read it.
-      # hakari-check only reads: a command that rewrites the workspace-hack would
-      # fail the tree check below.
+      # From here to the pull request text, nothing compiles a member, so no build
+      # script of the change runs before these have read the workspace: cargo xtask
+      # builds only xtask, and cargo metadata, which cargo deny and cargo hakari
+      # read, runs no build script. hakari-check only reads: a command that
+      # rewrote the workspace-hack would fail the tree check below.
       - name: Architecture, structure and the workspace-hack
         if: ${{ !cancelled() }}
         run: just check-arch check-structure hakari-check
-      - name: Format, lint, deny and the OpenAPI document
+      - name: Format
         if: ${{ !cancelled() }}
-        run: just fmt-check lint deny openapi-check
+        run: just fmt-check
+      - name: Advisories, licences, bans and sources
+        if: ${{ !cancelled() }}
+        run: just deny
       # A squash merge makes the title the subject of the commit on develop and may
       # take the description as its body. Both are written by whoever opens the pull
-      # request, so they reach the shell only through env. Last, so the code steps
-      # report whatever the title says; it runs when they fail, too.
+      # request, so they reach the shell only through env.
       - name: Check the pull request title and description
         if: ${{ !cancelled() && github.event_name == 'pull_request' }}
         env:
@@ -86,12 +103,23 @@ jobs:
         run: |
           printf '%s\n\n%s\n' "$PR_TITLE" "$PR_BODY" > "$RUNNER_TEMP/pull-request.txt"
           cargo xtask check-pr "$RUNNER_TEMP/pull-request.txt"
-      # A build script or a check that rewrites a tracked file, or writes one git
-      # does not ignore, would change the code the steps above judged.
+      # The steps that compile the members, and so run their build scripts, come last.
+      - name: Lint
+        if: ${{ !cancelled() }}
+        run: just lint
+      # It builds and starts barras-api; the bound stops a hung build or binary from
+      # holding the job until the job's own limit.
+      - name: OpenAPI document
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        run: just openapi-check
+      # Catches a step that, by mistake, rewrites a tracked file or writes any file
+      # outside target/, ignored ones included, such as .env or lcov.info. It does not
+      # stop a hostile build script, which can undo its writes before this step runs.
       - name: Check that the tree is unchanged
         if: ${{ !cancelled() }}
         run: |
-          changes="$(git status --porcelain --untracked-files=all)"
+          changes="$(git status --porcelain --untracked-files=all --ignored -- . ':!target')"
           if [ -n "$changes" ]; then
             printf 'The steps above changed the tree:\n%s\n' "$changes"
             exit 1
@@ -101,7 +129,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       # llvm-tools, which cargo-llvm-cov needs, is a component in rust-toolchain.toml.
@@ -111,18 +139,29 @@ jobs:
           # Its default sets CARGO_BUILD_WARNINGS=deny for every cargo command of the job. Locally only `just lint` denies cargo warnings, through its own flag; CI must compile exactly like `just verify`.
           build-warnings: ""
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.19.0
       - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
           tool: just@1.59.0,cargo-nextest@0.9.152,cargo-llvm-cov@0.9.1
-      # Every test once under coverage, then the thresholds; the doctests apart,
-      # because cargo-llvm-cov cannot measure them on stable.
-      - run: just test-cov test-doc
-      # A build script or a test that rewrites a tracked file, or writes one git
-      # does not ignore, would change the code the tests ran against.
+          fallback: none
+      # Every test once under coverage, then the thresholds. nextest kills a test
+      # that hangs (.config/nextest.toml).
+      - name: Tests under coverage, and the thresholds
+        run: just test-cov
+      # Apart, because cargo-llvm-cov cannot measure doctests on stable. cargo test
+      # has no limit of its own on a doctest that hangs, so the step has one.
+      - name: Doctests
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: just test-doc
+      # Catches a step that, by mistake, rewrites a tracked file or writes any file
+      # outside target/, ignored ones included, such as .env or lcov.info. It does not
+      # stop a hostile build script, which can undo its writes before this step runs.
       - name: Check that the tree is unchanged
         if: ${{ !cancelled() }}
         run: |
-          changes="$(git status --porcelain --untracked-files=all)"
+          changes="$(git status --porcelain --untracked-files=all --ignored -- . ':!target')"
           if [ -n "$changes" ]; then
             printf 'The steps above changed the tree:\n%s\n' "$changes"
             exit 1
@@ -132,7 +171,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
@@ -141,16 +180,20 @@ jobs:
           # Its default sets CARGO_BUILD_WARNINGS=deny for every cargo command of the job. Locally only `just lint` denies cargo warnings, through its own flag; CI must compile exactly like `just verify`.
           build-warnings: ""
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.19.0
       - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
           tool: just@1.59.0
+          fallback: none
       - run: just build
-      # A build script that rewrites a tracked file, or writes one git does not
-      # ignore, would change the code the release was built from.
+      # Catches a step that, by mistake, rewrites a tracked file or writes any file
+      # outside target/, ignored ones included, such as .env or lcov.info. It does not
+      # stop a hostile build script, which can undo its writes before this step runs.
       - name: Check that the tree is unchanged
         if: ${{ !cancelled() }}
         run: |
-          changes="$(git status --porcelain --untracked-files=all)"
+          changes="$(git status --porcelain --untracked-files=all --ignored -- . ':!target')"
           if [ -n "$changes" ]; then
             printf 'The steps above changed the tree:\n%s\n' "$changes"
             exit 1
