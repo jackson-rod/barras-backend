@@ -26,12 +26,13 @@ use crate::{
     SuccessEnvelope, ValidatedJson, ValidatedQuery,
 };
 
-const MIB: usize = 1024 * 1024;
+const KIB: usize = 1024;
+const MIB: usize = 1024 * KIB;
 
 /// What a test sends where nothing must come back: it could be a password or a token. It is
 /// spelled as an identifier, as many tokens are, so that the shape of a name cannot be what
 /// keeps it out of an answer.
-const SECRET: &str = "sk_live_hunter2Secret";
+const SECRET: &str = "hunter2_Secret_Value";
 
 /// A query string read whole into a map, through a conversion whose error carelessly names, as
 /// a missing field, the first value the caller sent.
@@ -448,6 +449,41 @@ async fn a_missing_field_is_reported_at_its_own_path_not_its_parents() {
             json!([IS_REQUIRED])
         );
     }
+}
+
+/// `body` with a member nobody reads that brings its JSON to exactly `size` bytes.
+fn padded_to(size: usize, mut body: Value) -> String {
+    body["padding"] = json!("");
+    let unpadded = body.to_string().len();
+    body["padding"] = json!("a".repeat(size - unpadded));
+    let padded = body.to_string();
+    assert_eq!(padded.len(), size);
+    padded
+}
+
+#[tokio::test]
+async fn a_missing_field_is_confirmed_only_in_a_body_of_at_most_64_kib() {
+    let at_most = 64 * KIB;
+    for (at, size, field, message) in [
+        ("/email", at_most, "email", IS_REQUIRED),
+        ("/address/zip", at_most, "address.zip", IS_REQUIRED),
+        // Unconfirmed, the field is no key: the object that lacks it is not valid.
+        ("/address/zip", at_most + 1, "address", IS_NOT_VALID),
+    ] {
+        let body = padded_to(size, member_without(at));
+
+        let response = client().send(post_raw("application/json", body)).await;
+
+        assert_eq!(failed_fields(&response), [field], "{at} in {size} bytes");
+        let messages = &response.json()["error"]["fields"][field];
+        assert_eq!(messages, &json!([message]), "{at} in {size} bytes");
+    }
+    // Unconfirmed at the root, no field is left to answer for.
+    let body = padded_to(at_most + 1, member_without("/email"));
+
+    let response = client().send(post_raw("application/json", body)).await;
+
+    assert_error(&response, 400, ApiError::MALFORMED_REQUEST);
 }
 
 #[tokio::test]

@@ -20,6 +20,10 @@ const UNFIT: &str = "Request body cannot be read as the object this route takes"
 /// The most arrays and objects serde_json reads one inside another; it refuses one more.
 const DEEPEST: usize = 127;
 
+/// The largest body, in bytes, of which the check of a missing field builds a tree. A tree
+/// takes many times the size of its text: a body of 1 MiB peaked at about 24 MiB.
+const LARGEST_BODY_SEARCHED: usize = 64 * 1024;
+
 /// The request body, a JSON object, read into `T` and checked against every rule `T` declares.
 /// A handler takes its body with it, never with axum's `Json`, whose rejections are not
 /// envelopes.
@@ -35,6 +39,12 @@ const DEEPEST: usize = 127;
 /// grammar is checked, so a lone surrogate escape (`"\ud800"`), nesting past serde_json's limit
 /// or a number past `f64` (`1e400`) in it is accepted. In a field the DTO reads, such a string
 /// or number answers 422 at that field, and such nesting 400.
+///
+/// A field missing from an object is keyed at its own path (`address.zip`) once a tree of the
+/// body confirms that it is missing, and that tree is built only for a body of at most 64 KiB.
+/// In a larger body the field is not confirmed: the object that lacks it answers `is not
+/// valid`, and at the root, where no field is left to report it at, the body answers 400
+/// `MALFORMED_REQUEST`.
 ///
 /// A field an object of the DTO does not accept (`#[serde(deny_unknown_fields)]`) is reported
 /// at that object, never under its own name, which is the caller's text; at the root, where
@@ -148,10 +158,15 @@ fn nests_too_deep(json: &str) -> bool {
 /// read, and a secret is a value. Only the value at `path` is searched for the key, so that a
 /// field other elements of a list have is still reported missing from the one that lacks it.
 ///
-/// This alone builds a tree of the body, a copy that the size limit of 1 MiB bounds. A body
-/// that is JSON yet has no tree, for a lone surrogate or a number past `f64` in a member the
-/// DTO does not read, bears nothing out.
+/// This alone builds a tree of the body, and a tree takes many times the size of its text, so
+/// a body over `LARGEST_BODY_SEARCHED` (64 KiB) bears nothing out: the field is then not
+/// confirmed missing, and is answered as any other refused value. Nor does a body that is JSON
+/// yet has no tree, for a lone surrogate or a number past `f64` in a member the DTO does not
+/// read.
 fn bears_out(text: &str, path: &Path, name: &str) -> bool {
+    if text.len() > LARGEST_BODY_SEARCHED {
+        return false;
+    }
     let Ok(sent) = serde_json::from_str::<Value>(text) else {
         return false;
     };
