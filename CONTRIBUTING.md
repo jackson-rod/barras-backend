@@ -38,7 +38,7 @@ The full rules are in [CLAUDE.md](CLAUDE.md#git-and-pull-requests); the git hook
 - `git commit --fixup` is refused by the `commit-msg` hook, because a `fixup!` subject does not match the subject rule. Write an ordinary commit instead.
 - A commit message, a pull request title and a pull request description never hold a marker that makes GitHub skip CI: `[skip ci]`, `[ci skip]`, `[no ci]`, `[skip actions]`, `[actions skip]` or a `skip-checks: true` trailer. The `commit-msg` hook refuses them, and CI refuses them in every commit of the branch and in the pull request's text. To write about one in a message, describe it in words.
 - After adding or changing a dependency, refresh `Cargo.lock` with a plain `cargo build` before committing: `cargo xtask` and `cargo deny` run with `--locked`, so the hooks fail on a stale lock file.
-- After adding a crate, or changing a dependency or its features, run `just hakari` and commit what it changes: `crates/workspace-hack/Cargo.toml`, the `workspace-hack` lines of the members and `Cargo.lock`. `just hakari-check` fails until then, in `just verify` and in CI.
+- After adding a crate, or changing a dependency or its features, run `just hakari` and commit what it changes: `crates/workspace-hack/Cargo.toml`, the `workspace-hack` lines of the members and `Cargo.lock`. `just hakari-check`, in `just verify` and in CI, fails while either would change, and when the generated crate changes what a release build compiles: a crate to which only tests ask for more then joins `third-party` under `[traversal-excludes]` in `.config/hakari.toml`.
 - After adding or changing a route, run `just openapi` and commit `openapi.json`. `just openapi-check` fails until then, in `just verify` and in CI.
 
 ## Pull requests
