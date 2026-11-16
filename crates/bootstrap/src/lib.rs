@@ -10,6 +10,6 @@ mod shutdown;
 pub use environment::{
     AppEnv, ConfigError, ConfigProblem, Environment, FromEnvValue, LogLevel, ProblemKind,
 };
-pub use logging::{LoggingError, init_logging, subscriber};
+pub use logging::{LoggingError, build_subscriber, init_logging};
 #[cfg(unix)]
 pub use shutdown::ShutdownSignal;

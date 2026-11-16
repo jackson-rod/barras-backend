@@ -16,32 +16,34 @@ use crate::environment::{AppEnv, LogLevel};
 /// Starts the logs of the process on standard output, in the format of `env`, from `level`
 /// up. A process has one global subscriber, so a second call is an error.
 pub fn init_logging(env: AppEnv, level: LogLevel) -> Result<(), LoggingError> {
-    subscriber(env, level, std::io::stdout)
+    build_subscriber(env, level, std::io::stdout)
         .try_init()
         .map_err(|source| LoggingError { source })
 }
 
-/// The subscriber [`init_logging`] installs, writing to `writer`. `Local` gives readable
-/// lines without colours. Any other environment gives one JSON object per line, with
-/// `timestamp` (RFC 3339, UTC), `level`, `target`, `message` and the event's fields at the
-/// top level, and the fields of the enclosing spans under `spans`. An event below `level`
-/// is not written.
-pub fn subscriber<W>(env: AppEnv, level: LogLevel, writer: W) -> impl Subscriber + Send + Sync
+/// The subscriber [`init_logging`] installs, writing to `writer`. An event below `level` is
+/// not written.
+///
+/// `Local` gives readable lines without colours. Any other environment gives one JSON
+/// object per line, with exactly these keys: `timestamp` (RFC 3339, UTC), `level`,
+/// `target`, `fields` (the event's fields, `message` included) and, inside a span, `spans`
+/// (the name and fields of each enclosing span, the outermost first). Whatever an event or
+/// a span records stays inside `fields` or `spans`, so it cannot shadow those keys.
+pub fn build_subscriber<W>(env: AppEnv, level: LogLevel, writer: W) -> impl Subscriber + Send + Sync
 where
     W: for<'writer> MakeWriter<'writer> + Send + Sync + 'static,
 {
     let format = match env {
         AppEnv::Local => tracing_subscriber::fmt::layer()
+            // tracing-subscriber's `ansi` feature is off, but feature unification (through
+            // cargo-hakari, say) could switch it on, and escape codes garble a log file.
             .with_ansi(false)
-            .with_target(true)
             .with_writer(writer)
             .boxed(),
         AppEnv::Staging | AppEnv::Production => tracing_subscriber::fmt::layer()
             .json()
-            .flatten_event(true)
-            .with_current_span(true)
+            .with_current_span(false)
             .with_span_list(true)
-            .with_target(true)
             .with_writer(writer)
             .boxed(),
     };
@@ -83,10 +85,23 @@ mod tests {
     use std::io;
     use std::sync::{Arc, Mutex};
 
-    use serde_json::Value;
+    use serde::Deserialize;
+    use serde_json::{Map, Value};
     use tracing::{debug, error, info, info_span, trace, warn};
 
     use super::*;
+
+    /// One JSON line. A key outside these, or a key written twice, fails the parse, so a
+    /// line that parses has exactly this shape.
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct JsonLine {
+        timestamp: String,
+        level: String,
+        target: String,
+        fields: Map<String, Value>,
+        spans: Option<Vec<Map<String, Value>>>,
+    }
 
     /// Keeps what a subscriber writes, for the test that holds a clone.
     #[derive(Clone, Default)]
@@ -123,12 +138,12 @@ mod tests {
     /// only, so tests running side by side do not see each other's events.
     fn lines_logged(env: AppEnv, level: LogLevel, emit: impl FnOnce()) -> Vec<String> {
         let capture = Capture::default();
-        let _default = subscriber(env, level, capture.clone()).set_default();
+        let _default = build_subscriber(env, level, capture.clone()).set_default();
         emit();
         capture.lines()
     }
 
-    fn json(line: &str) -> Value {
+    fn parse(line: &str) -> JsonLine {
         serde_json::from_str(line).unwrap_or_else(|error| panic!("{error}: {line}"))
     }
 
@@ -152,20 +167,30 @@ mod tests {
     }
 
     #[test]
-    fn a_deployed_environment_writes_json_with_the_four_fields_at_the_top_level() {
+    fn the_line_parser_refuses_a_key_written_twice() {
+        let doubled = r#"{"timestamp":"t","level":"INFO","level":"x","target":"t","fields":{}}"#;
+        let error = serde_json::from_str::<JsonLine>(doubled).unwrap_err();
+        assert!(
+            error.to_string().contains("duplicate field `level`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_deployed_environment_writes_one_json_object_per_event() {
         for env in [AppEnv::Staging, AppEnv::Production] {
             let lines = lines_logged(env, LogLevel::Info, || {
                 info!(status = 200, "request finished");
             });
 
             assert_eq!(lines.len(), 1, "{env:?}: {lines:?}");
-            let line = json(&lines[0]);
-            let timestamp = line["timestamp"].as_str().unwrap();
-            assert!(is_rfc3339_utc(timestamp), "{timestamp}");
-            assert_eq!(line["level"], "INFO");
-            assert_eq!(line["target"], "barras_bootstrap::logging::tests");
-            assert_eq!(line["message"], "request finished");
-            assert_eq!(line["status"], 200);
+            let line = parse(&lines[0]);
+            assert!(is_rfc3339_utc(&line.timestamp), "{}", line.timestamp);
+            assert_eq!(line.level, "INFO");
+            assert_eq!(line.target, "barras_bootstrap::logging::tests");
+            assert_eq!(line.fields["message"], "request finished");
+            assert_eq!(line.fields["status"], 200);
+            assert!(line.spans.is_none(), "{env:?}");
         }
     }
 
@@ -176,10 +201,37 @@ mod tests {
         });
 
         assert_eq!(lines.len(), 1, "{lines:?}");
-        let line = json(&lines[0]);
-        assert_eq!(line["spans"][0]["name"], "request");
-        assert_eq!(line["spans"][0]["request_id"], "req-7");
-        assert!(line.get("request_id").is_none(), "{line}");
+        let spans = parse(&lines[0]).spans.unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0]["name"], "request");
+        assert_eq!(spans[0]["request_id"], "req-7");
+    }
+
+    #[test]
+    fn no_field_can_shadow_a_key_of_the_line() {
+        let lines = lines_logged(AppEnv::Production, LogLevel::Info, || {
+            info_span!("request", level = "span-level").in_scope(|| {
+                info!(
+                    level = "spoofed-level",
+                    timestamp = "spoofed-time",
+                    target = "spoofed-target",
+                    spans = "spoofed-spans",
+                    "probe"
+                );
+            });
+        });
+
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let line = parse(&lines[0]);
+        assert!(is_rfc3339_utc(&line.timestamp), "{}", line.timestamp);
+        assert_eq!(line.level, "INFO");
+        assert_eq!(line.target, "barras_bootstrap::logging::tests");
+        assert_eq!(line.fields["level"], "spoofed-level");
+        assert_eq!(line.fields["timestamp"], "spoofed-time");
+        assert_eq!(line.fields["target"], "spoofed-target");
+        assert_eq!(line.fields["spans"], "spoofed-spans");
+        assert_eq!(line.fields["message"], "probe");
+        assert_eq!(line.spans.unwrap()[0]["level"], "span-level");
     }
 
     #[test]
@@ -190,10 +242,11 @@ mod tests {
             error!("third");
         });
 
-        assert_eq!(lines.len(), 3, "{lines:?}");
-        for line in &lines {
-            assert!(json(line).is_object(), "{line}");
-        }
+        let messages: Vec<Value> = lines
+            .iter()
+            .map(|line| parse(line).fields["message"].clone())
+            .collect();
+        assert_eq!(messages, ["first", "second", "third"]);
     }
 
     #[test]
@@ -240,10 +293,7 @@ mod tests {
             (LogLevel::Error, &["ERROR"]),
         ] {
             let lines = lines_logged(AppEnv::Staging, level, every_level);
-            let levels: Vec<Value> = lines
-                .iter()
-                .map(|line| json(line)["level"].clone())
-                .collect();
+            let levels: Vec<String> = lines.iter().map(|line| parse(line).level).collect();
             assert_eq!(levels, written, "{level:?}");
         }
     }

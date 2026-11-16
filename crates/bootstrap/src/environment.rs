@@ -134,12 +134,45 @@ impl Environment {
         None
     }
 
-    /// Ends the reading. Returns the configuration the caller assembled from what
-    /// [`required`](Self::required) returned when no problem was recorded, and otherwise
-    /// every problem, in the order the names were asked for.
+    /// Ends the reading: the configuration the caller assembled from what
+    /// [`required`](Self::required) returned, or every problem recorded, in the order the
+    /// names were asked for. Any recorded problem is an error, whatever `config` is, so a
+    /// variable that was read but left out of the configuration still stops the start-up.
+    /// A `config` of `None` with no problem recorded is an error too.
     ///
-    /// `required` returns `None` only after recording a problem, so `config` is `None`
-    /// exactly when there is one. A `None` with no problem recorded is still an error.
+    /// Read every variable first, then build the configuration with `?` inside a closure
+    /// called on the spot:
+    ///
+    /// ```
+    /// use std::net::SocketAddr;
+    ///
+    /// use barras_bootstrap::{AppEnv, ConfigError, Environment};
+    ///
+    /// struct Config {
+    ///     env: AppEnv,
+    ///     bind_addr: SocketAddr,
+    /// }
+    ///
+    /// fn load(mut env: Environment) -> Result<Config, ConfigError> {
+    ///     let app_env = env.required("APP_ENV");
+    ///     let bind_addr = env.required("API_BIND_ADDR");
+    ///     env.finish((|| Some(Config { env: app_env?, bind_addr: bind_addr? }))())
+    /// }
+    ///
+    /// let config = load(Environment::from_pairs([
+    ///     ("APP_ENV", "local"),
+    ///     ("API_BIND_ADDR", "127.0.0.1:8080"),
+    /// ]))?;
+    /// assert_eq!(config.env, AppEnv::Local);
+    /// assert_eq!(config.bind_addr.port(), 8080);
+    ///
+    /// let incomplete = load(Environment::from_pairs([("API_BIND_ADDR", "127.0.0.1:8080")]));
+    /// assert_eq!(
+    ///     incomplete.err().map(|error| error.to_string()).as_deref(),
+    ///     Some("APP_ENV is missing: expected one of local, staging, production"),
+    /// );
+    /// # Ok::<(), ConfigError>(())
+    /// ```
     pub fn finish<T>(self, config: Option<T>) -> Result<T, ConfigError> {
         match config {
             Some(config) if self.problems.is_empty() => Ok(config),
@@ -235,21 +268,58 @@ mod tests {
             .collect()
     }
 
+    /// Accepts any text, so that only the decoding of a value can refuse it.
+    #[derive(Debug, PartialEq)]
+    struct AnyText(String);
+
+    impl FromEnvValue for AnyText {
+        const EXPECTED: &'static str = "any text";
+
+        fn from_env_value(raw: &str) -> Option<Self> {
+            Some(Self(raw.to_owned()))
+        }
+    }
+
     #[test]
     fn values_are_read_into_their_types() {
+        struct Config {
+            env: AppEnv,
+            log_level: LogLevel,
+            bind_addr: SocketAddr,
+        }
         let mut env = Environment::from_pairs([
             ("APP_ENV", "staging"),
             ("LOG_LEVEL", "debug"),
             ("API_BIND_ADDR", "127.0.0.1:8080"),
         ]);
+        let app_env = env.required("APP_ENV");
+        let log_level = env.required("LOG_LEVEL");
+        let bind_addr = env.required("API_BIND_ADDR");
+
+        let config = (|| {
+            Some(Config {
+                env: app_env?,
+                log_level: log_level?,
+                bind_addr: bind_addr?,
+            })
+        })();
+        let config = env.finish(config).unwrap();
+
+        assert_eq!(config.env, AppEnv::Staging);
+        assert_eq!(config.log_level, LogLevel::Debug);
+        assert_eq!(config.bind_addr, "127.0.0.1:8080".parse().unwrap());
+    }
+
+    #[test]
+    fn a_problem_fails_finish_even_when_the_configuration_is_complete() {
+        let mut env = Environment::from_pairs([("APP_ENV", "local")]);
         let app_env = env.required::<AppEnv>("APP_ENV");
-        let log_level = env.required::<LogLevel>("LOG_LEVEL");
-        let bind_addr = env.required::<SocketAddr>("API_BIND_ADDR");
+        // Read, then left out of the configuration by mistake.
+        let _log_level = env.required::<LogLevel>("LOG_LEVEL");
 
-        let config = env.finish(app_env.zip(log_level).zip(bind_addr)).unwrap();
+        let error = env.finish(app_env).unwrap_err();
 
-        let address: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-        assert_eq!(config, ((AppEnv::Staging, LogLevel::Debug), address));
+        assert_eq!(summary(&error), [("LOG_LEVEL", Missing)]);
     }
 
     #[test]
@@ -362,14 +432,21 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_value_that_is_not_unicode_is_not_valid() {
+    fn a_value_that_is_not_unicode_is_not_valid_even_for_a_type_that_takes_any_text() {
         use std::os::unix::ffi::OsStringExt;
 
-        let not_unicode = OsString::from_vec(b"loc\xffal".to_vec());
-        let mut env = Environment::from_pairs([("APP_ENV", not_unicode)]);
-        let app_env = env.required::<AppEnv>("APP_ENV");
-        let error = env.finish(app_env).unwrap_err();
-        assert_eq!(summary(&error), [("APP_ENV", Invalid)]);
+        let not_unicode = OsString::from_vec(b"pass\xffword".to_vec());
+        let mut env = Environment::from_pairs([
+            ("DATABASE_PASSWORD", not_unicode),
+            ("DATABASE_USER", OsString::from("barras")),
+        ]);
+        let user = env.required::<AnyText>("DATABASE_USER");
+        let password = env.required::<AnyText>("DATABASE_PASSWORD");
+        assert_eq!(user, Some(AnyText("barras".to_owned())));
+
+        let error = env.finish(user.zip(password)).unwrap_err();
+
+        assert_eq!(summary(&error), [("DATABASE_PASSWORD", Invalid)]);
     }
 
     #[test]
@@ -449,14 +526,15 @@ mod tests {
     #[test]
     fn the_process_environment_is_read_by_name() {
         let mut env = Environment::from_process();
-        // `PATH` is set wherever the tests run, and it is no socket address.
-        let path = env.required::<SocketAddr>("PATH");
+        // cargo and nextest set `CARGO_PKG_NAME` for every test, and it is no socket
+        // address.
+        let package = env.required::<SocketAddr>("CARGO_PKG_NAME");
         let unset = env.required::<SocketAddr>("BARRAS_BOOTSTRAP_TEST_NEVER_SET");
-        let error = env.finish(path.zip(unset)).unwrap_err();
+        let error = env.finish(package.zip(unset)).unwrap_err();
         assert_eq!(
             summary(&error),
             [
-                ("PATH", Invalid),
+                ("CARGO_PKG_NAME", Invalid),
                 ("BARRAS_BOOTSTRAP_TEST_NEVER_SET", Missing)
             ]
         );
