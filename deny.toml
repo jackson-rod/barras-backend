@@ -32,7 +32,9 @@ ignore = true
 [bans]
 deny = [
     { crate = "sqlx", wrappers = ["barras-adapter-postgres", "barras-testkit"], reason = "database access lives in the postgres adapter" },
-    { crate = "axum", wrappers = ["barras-adapter-http", "barras-adapter-realtime"], reason = "web framework lives in the HTTP and realtime adapters" },
+    # `utoipa-axum` depends on axum directly: it builds the axum router and the OpenAPI
+    # document from the same handlers, for the HTTP adapter.
+    { crate = "axum", wrappers = ["barras-adapter-http", "barras-adapter-realtime", "utoipa-axum"], reason = "web framework lives in the HTTP and realtime adapters" },
     { crate = "reqwest", wrappers = ["barras-adapter-providers"], reason = "outbound HTTP lives in the providers adapter" },
     { crate = "redis", wrappers = ["barras-adapter-redis", "barras-testkit"], reason = "Redis access lives in the redis adapter" },
 ]

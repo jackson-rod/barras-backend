@@ -33,6 +33,7 @@ tokio = "1.54.1"
 tracing = { version = "0.1.44", default-features = false }
 tracing-subscriber = { version = "0.3.23", default-features = false }
 utoipa = { version = "6.0.0", default-features = false }
+utoipa-axum = "0.3.0"
 uuid = "1.29.2"
 
 [workspace.lints.rust]
