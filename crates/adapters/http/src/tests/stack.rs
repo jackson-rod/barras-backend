@@ -443,6 +443,7 @@ fn the_document_is_the_base_with_every_route_under_the_prefix() {
             "/api/v1/length",
             "/api/v1/members",
             "/api/v1/panic/{payload}",
+            "/api/v1/profiles",
             "/api/v1/refused",
             "/api/v1/small",
         ]

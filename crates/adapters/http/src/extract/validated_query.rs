@@ -17,7 +17,8 @@ const UNREADABLE: &str = "Query string cannot be read";
 /// A parameter that is missing, has the wrong type or breaks a rule answers 422
 /// `VALIDATION_FAILED` under its name. A query string `T` cannot be read from, though no
 /// parameter is to blame, such as one that gives a parameter twice, answers 400
-/// `MALFORMED_REQUEST`.
+/// `MALFORMED_REQUEST`; so does a parameter `T` does not accept
+/// (`#[serde(deny_unknown_fields)]`), whose name is the caller's text.
 #[derive(Debug)]
 pub struct ValidatedQuery<T>(pub T);
 

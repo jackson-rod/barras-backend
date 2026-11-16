@@ -63,6 +63,23 @@ fn get_members(query: &str) -> TestRequest {
     TestRequest::new("GET", &format!("/api/v1/members?{query}"))
 }
 
+/// `body` as JSON to the profiles route.
+fn post_profile(body: &Value) -> TestRequest {
+    TestRequest::new("POST", "/api/v1/profiles").json(body)
+}
+
+/// `body`, written by hand as JSON, to the profiles route.
+fn post_profile_raw(body: String) -> TestRequest {
+    TestRequest::new("POST", "/api/v1/profiles")
+        .header("content-type", "application/json")
+        .body(body)
+}
+
+/// The profiles search, asked for with `query`.
+fn get_profiles(query: &str) -> TestRequest {
+    TestRequest::new("GET", &format!("/api/v1/profiles?{query}"))
+}
+
 /// The keys of `error.fields`, in order, of what must be a validation failure that gives each
 /// field at least one message.
 fn failed_fields(response: &TestResponse) -> Vec<String> {
@@ -280,10 +297,107 @@ async fn every_broken_rule_is_reported_with_all_its_messages() {
 }
 
 #[tokio::test]
+async fn a_valid_profile_reaches_the_handler_whole() {
+    let profile = json!({
+        "displayName": "Ana",
+        "strictNamed": { "maxLevel": 3 },
+        "strict": {},
+        "nickname": "ana",
+        "pair": [1, 2]
+    });
+
+    let response = client().send(post_profile(&profile)).await;
+
+    assert_eq!(response.status, 200);
+    assert_eq!(response.json()["data"], profile);
+}
+
+#[tokio::test]
+async fn a_field_is_reported_under_its_json_name_whichever_check_refused_it() {
+    for (body, field) in [
+        // garde names a field by its Rust name, serde by its JSON name.
+        (json!({ "displayName": "" }), "displayName"),
+        (json!({ "displayName": 7 }), "displayName"),
+        (
+            json!({ "displayName": "Ana", "strictNamed": { "maxLevel": 11 } }),
+            "strictNamed.maxLevel",
+        ),
+        (
+            json!({ "displayName": "Ana", "strictNamed": { "maxLevel": "high" } }),
+            "strictNamed.maxLevel",
+        ),
+    ] {
+        let response = client().send(post_profile(&body)).await;
+
+        assert_eq!(failed_fields(&response), [field], "{body}");
+    }
+}
+
+#[tokio::test]
+async fn an_unknown_field_is_reported_at_the_object_that_refuses_it() {
+    for (body, field) in [
+        (
+            format!(r#"{{"displayName": "Ana", "strictNamed": {{"{SECRET}": 1}}}}"#),
+            "strictNamed",
+        ),
+        (
+            format!(r#"{{"displayName": "Ana", "strict": {{"x, expected {SECRET}": 1}}}}"#),
+            "strict",
+        ),
+    ] {
+        let response = client().send(post_profile_raw(body.clone())).await;
+
+        assert_eq!(failed_fields(&response), [field], "{body}");
+        let messages = &response.json()["error"]["fields"][field];
+        assert_eq!(messages, &json!(["has a field it does not accept"]));
+    }
+}
+
+#[tokio::test]
+async fn an_unknown_field_at_the_root_is_malformed() {
+    let body = format!(r#"{{"displayName": "Ana", "{SECRET}": 1}}"#);
+
+    let response = client().send(post_profile_raw(body)).await;
+
+    assert_error(&response, 400, ApiError::MALFORMED_REQUEST);
+}
+
+#[tokio::test]
+async fn the_error_of_a_type_of_its_own_is_reported_as_not_valid() {
+    for request in [
+        post_profile(&json!({ "displayName": "Ana", "nickname": SECRET })),
+        get_profiles(&format!("nickname={SECRET}")),
+    ] {
+        let response = client().send(request).await;
+
+        assert_eq!(failed_fields(&response), ["nickname"]);
+        let messages = &response.json()["error"]["fields"]["nickname"];
+        assert_eq!(messages, &json!(["is not valid"]));
+    }
+}
+
+#[tokio::test]
+async fn an_array_of_the_wrong_length_for_its_tuple_is_reported_at_its_field() {
+    // serde_json reads the elements past those a tuple takes as trailing characters, though
+    // the body is JSON.
+    for pair in [json!([1, 2, 3]), json!([1])] {
+        let body = json!({ "displayName": "Ana", "pair": pair });
+
+        let response = client().send(post_profile(&body)).await;
+
+        assert_eq!(failed_fields(&response), ["pair"], "{pair}");
+    }
+}
+
+#[tokio::test]
 async fn no_answer_repeats_a_value_that_was_sent() {
     // serde's own words inside the value, as if to end its quote early.
     let quoting = format!("x\", expected {SECRET}");
     let truncated = format!(r#"{{"email": "{SECRET}""#);
+    // No DTO holds a map keyed by what the caller sends, so a body shaped as one names no
+    // field that could carry its keys back.
+    let mut with_a_map = member();
+    with_a_map["map"] = Value::Object([(SECRET.to_owned(), json!("x"))].into_iter().collect());
     for (request, status) in [
         (post(&member_with("/address/zip", json!(SECRET))), 422),
         (post(&member_with("/address/zip", json!(quoting))), 422),
@@ -293,6 +407,40 @@ async fn no_answer_repeats_a_value_that_was_sent() {
         (post_raw("application/json", truncated), 400),
         (get_members(&format!("limit={SECRET}")), 422),
         (get_members(&format!("limit=5&name={SECRET}")), 422),
+        (
+            post_profile_raw(format!(
+                r#"{{"displayName": "Ana", "strictNamed": {{"{SECRET}": 1}}}}"#
+            )),
+            422,
+        ),
+        (
+            post_profile_raw(format!(
+                r#"{{"displayName": "Ana", "strict": {{"x, expected {SECRET}": 1}}}}"#
+            )),
+            422,
+        ),
+        (
+            post_profile_raw(format!(r#"{{"displayName": "Ana", "{SECRET}": 1}}"#)),
+            400,
+        ),
+        (
+            post_profile(&json!({ "displayName": "Ana", "nickname": SECRET })),
+            422,
+        ),
+        (get_profiles(&format!("nickname={SECRET}")), 422),
+        (post(&with_a_map), 200),
+        (
+            post_profile_raw(format!(
+                r#"{{"displayName": "Ana", "map": {{"{SECRET}": "x"}}}}"#
+            )),
+            400,
+        ),
+        (
+            post_profile_raw(format!(
+                r#"{{"displayName": "Ana", "rangedMap": {{"{SECRET}": {{"v": 0}}}}}}"#
+            )),
+            400,
+        ),
     ] {
         let response = client().send(request).await;
 

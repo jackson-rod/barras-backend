@@ -5,6 +5,7 @@
 //! module. An integration test would get it only through a dev dependency of this crate on
 //! itself, which `check-arch` refuses as an adapter depending on an adapter.
 
+mod field_guard;
 mod http_metrics;
 mod request_log;
 mod route_guard;

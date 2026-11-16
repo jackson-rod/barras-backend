@@ -22,7 +22,12 @@ const UNFIT: &str = "Request body cannot be read as the object this route takes"
 /// A body not sent as JSON (`application/json` or `application/<x>+json`, parameters aside)
 /// answers 415 `UNSUPPORTED_MEDIA_TYPE`; one over the size limit, 413 `PAYLOAD_TOO_LARGE`; one
 /// that is not a JSON object, 400 `MALFORMED_REQUEST`; and one whose fields are missing, have
-/// the wrong type or break a rule, 422 `VALIDATION_FAILED` with each such field.
+/// the wrong type or break a rule, 422 `VALIDATION_FAILED` with each such field. An array of
+/// the wrong length for the tuple it fills is a field of the wrong type too.
+///
+/// A field an object of the DTO does not accept (`#[serde(deny_unknown_fields)]`) is reported
+/// at that object, never under its own name, which is the caller's text; at the root, where
+/// no field is left to report it at, the body answers 400 `MALFORMED_REQUEST`.
 #[derive(Debug)]
 pub struct ValidatedJson<T>(pub T);
 
@@ -57,8 +62,10 @@ where
         let value: T = serde_path_to_error::deserialize(&mut deserializer).map_err(|error| {
             // serde stops at the first value it refuses, which may come before the place where
             // the body stops being JSON; a body that is not JSON is malformed, whatever it holds.
-            // Only this path reads the body twice.
-            if error.inner().is_data() && serde_json::from_slice::<IgnoredAny>(&bytes).is_ok() {
+            // In a body that is JSON, the fault is a value's, even one serde_json words as
+            // syntax: the elements of an array past those a tuple takes. Only this path reads
+            // the body twice.
+            if serde_json::from_slice::<IgnoredAny>(&bytes).is_ok() {
                 refused_value(error.path(), &without_position(error.inner()), UNFIT)
             } else {
                 ApiError::malformed_request(NOT_JSON)
@@ -73,7 +80,7 @@ where
 }
 
 /// `application/json` or `application/<x>+json`, in any case, its parameters aside.
-fn is_json(headers: &HeaderMap) -> bool {
+pub(crate) fn is_json(headers: &HeaderMap) -> bool {
     let Some(Ok(content_type)) = headers.get(CONTENT_TYPE).map(|value| value.to_str()) else {
         return false;
     };

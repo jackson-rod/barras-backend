@@ -245,6 +245,104 @@ async fn list_members(ValidatedQuery(listing): ValidatedQuery<Listing>) -> ApiRe
     Ok(ApiSuccess::ok("Listing read", listing))
 }
 
+/// A profile to create: fields whose Rust names are not their JSON names, and the shapes whose
+/// refusal could carry back what was sent: objects that refuse a field they do not name, a
+/// type whose own error quotes the value, and a tuple.
+#[derive(Debug, Deserialize, Serialize, Validate, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NewProfile {
+    #[garde(length(min = 1, max = 20))]
+    display_name: String,
+    #[garde(dive)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    strict_named: Option<StrictNamed>,
+    #[garde(skip)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    strict: Option<Strict>,
+    #[garde(skip)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    nickname: Option<Nickname>,
+    #[garde(skip)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Vec<u32>>)]
+    pair: Option<(u32, u32)>,
+}
+
+/// An object that refuses a field it does not name.
+#[derive(Debug, Deserialize, Serialize, Validate, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StrictNamed {
+    #[garde(inner(range(max = 10)))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_level: Option<u8>,
+}
+
+/// An object that takes no field at all.
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+struct Strict {}
+
+/// Lower-case letters, read through a conversion whose error carelessly quotes the value
+/// after the words serde writes before what it expected.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(try_from = "String")]
+struct Nickname(String);
+
+impl TryFrom<String> for Nickname {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, String> {
+        if value.bytes().all(|byte| byte.is_ascii_lowercase()) {
+            Ok(Self(value))
+        } else {
+            Err(format!("not a nickname, expected {value} to be lower-case"))
+        }
+    }
+}
+
+/// Create a profile, answering it as the handler received it.
+#[utoipa::path(
+    post,
+    path = "/profiles",
+    tag = "fixtures",
+    request_body = NewProfile,
+    responses(
+        (status = 200, description = "The profile read", body = SuccessEnvelope<NewProfile>),
+        (status = 422, description = "A field failed validation", body = ErrorEnvelope),
+    ),
+)]
+async fn create_profile(
+    ValidatedJson(profile): ValidatedJson<NewProfile>,
+) -> ApiResult<NewProfile> {
+    Ok(ApiSuccess::ok("Profile read", profile))
+}
+
+/// Which profiles to find, read from the query string.
+#[derive(Debug, Deserialize, Serialize, Validate, ToSchema)]
+struct ProfileQuery {
+    #[garde(skip)]
+    #[schema(value_type = Option<String>)]
+    nickname: Option<Nickname>,
+}
+
+/// Find profiles, answering the query as the handler received it.
+#[utoipa::path(
+    get,
+    path = "/profiles",
+    tag = "fixtures",
+    params(("nickname" = Option<String>, Query, description = "The nickname to look for")),
+    responses(
+        (status = 200, description = "The query read", body = SuccessEnvelope<ProfileQuery>),
+        (status = 422, description = "A parameter failed validation", body = ErrorEnvelope),
+    ),
+)]
+async fn find_profiles(
+    ValidatedQuery(query): ValidatedQuery<ProfileQuery>,
+) -> ApiResult<ProfileQuery> {
+    Ok(ApiSuccess::ok("Query read", query))
+}
+
 pub(super) fn fixture_routes() -> ApiRouter {
     ApiRouter::new()
         .route(routes!(small), Access::public(), &[])
@@ -260,6 +358,11 @@ pub(super) fn fixture_routes() -> ApiRouter {
         )
         .route(
             routes!(list_members, create_member),
+            Access::public(),
+            &[ApiError::VALIDATION_FAILED],
+        )
+        .route(
+            routes!(find_profiles, create_profile),
             Access::public(),
             &[ApiError::VALIDATION_FAILED],
         )

@@ -1,4 +1,5 @@
-//! An in-process client for the public app, and the route guard of spec §9.3.
+//! An in-process client for the public app, the route guard of spec §9.3, and a guard on the
+//! keys of a validation failure.
 
 use std::collections::BTreeSet;
 
@@ -10,12 +11,19 @@ use serde_json::Value;
 use tower::ServiceExt;
 
 use crate::app::HttpApp;
+use crate::error::ApiError;
+use crate::extract::{IS_REQUIRED, is_json};
 use crate::middleware::MatchedRoute;
 use crate::openapi::operations;
 
 /// Sends requests to an app in-process, through the whole stack of middleware, and fails the
 /// test when a route the OpenAPI document does not have served one: so any test that reaches
 /// a route registered around `ApiRouter::route` fails, naming it.
+///
+/// It also fails the test when a validation failure answered to a JSON body has a key in
+/// `error.fields` that names no member of that body, or, for a field reported missing, no
+/// parent in it: the app finds the field to flag by that key, so a key spelled otherwise, a
+/// Rust name where the body has a camelCase one, say, flags nothing.
 pub struct TestClient {
     router: Router,
     /// Each operation of the document, as its method and its path template.
@@ -39,6 +47,7 @@ impl TestClient {
     }
 
     pub async fn send(&self, request: TestRequest) -> TestResponse {
+        let sent = request.json_body();
         let Ok(response) = self.router.clone().oneshot(request.into_http()).await;
         let (parts, body) = response.into_parts();
         let matched_route = parts.extensions.get::<MatchedRoute>().cloned();
@@ -46,12 +55,16 @@ impl TestClient {
             self.hold_to_the_document(served);
         }
         let body = to_bytes(body, usize::MAX).await.unwrap();
-        TestResponse {
+        let response = TestResponse {
             status: parts.status.as_u16(),
             headers: parts.headers,
             body,
             matched_route,
+        };
+        if let Some(sent) = &sent {
+            hold_the_keys_to_the_body(&response, sent);
         }
+        response
     }
 
     fn hold_to_the_document(&self, served: &MatchedRoute) {
@@ -70,6 +83,51 @@ impl TestClient {
             );
         }
     }
+}
+
+/// On a 422 `VALIDATION_FAILED`, each key of `error.fields` must name a member of `sent`, the
+/// JSON body of the request, or, when the key is reported missing, a parent object in it.
+fn hold_the_keys_to_the_body(response: &TestResponse, sent: &Value) {
+    if response.status != 422
+        || response.error_code().as_deref() != Some(ApiError::VALIDATION_FAILED)
+    {
+        return;
+    }
+    let answer = response.json();
+    let fields = answer["error"]["fields"].as_object().into_iter().flatten();
+    for (key, messages) in fields {
+        let missing = messages
+            .as_array()
+            .is_some_and(|messages| messages.iter().any(|message| message == IS_REQUIRED));
+        // A missing field is a name after its parent's path, never an index.
+        let parent = key.rsplit_once('.').map_or("", |(parent, _)| parent);
+        let names_a_member = member(sent, key).is_some();
+        let names_a_missing_field = missing && member(sent, parent).is_some_and(Value::is_object);
+        if !names_a_member && !names_a_missing_field {
+            panic!(
+                "error.fields has the key {key}, which names no member of the body that was \
+                 sent: key a field by its path in the body, its JSON names in camelCase"
+            );
+        }
+    }
+}
+
+/// The member of `body` at `key`, a path such as `address.zip` or `tags[1]`; the empty key is
+/// the body itself.
+fn member<'body>(body: &'body Value, key: &str) -> Option<&'body Value> {
+    let mut value = body;
+    for segment in key.split('.') {
+        let (name, mut indices) = segment.split_at(segment.find('[').unwrap_or(segment.len()));
+        if !name.is_empty() {
+            value = value.as_object()?.get(name)?;
+        }
+        while !indices.is_empty() {
+            let (index, rest) = indices.strip_prefix('[')?.split_once(']')?;
+            value = value.as_array()?.get(index.parse::<usize>().ok()?)?;
+            indices = rest;
+        }
+    }
+    Some(value)
 }
 
 /// A request to send: a method, a path with its query, headers and a body.
@@ -119,6 +177,14 @@ impl TestRequest {
     pub fn streamed(mut self) -> Self {
         self.streamed = true;
         self
+    }
+
+    /// The body, when it is sent as JSON and is JSON.
+    fn json_body(&self) -> Option<Value> {
+        if !is_json(&self.headers) {
+            return None;
+        }
+        serde_json::from_slice(&self.body).ok()
     }
 
     fn into_http(self) -> Request<Body> {
