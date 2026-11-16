@@ -27,10 +27,11 @@ Barras is a mobile app for people in Colombia who invest: their money and the ma
 git clone https://github.com/jackson-rod/barras-backend.git  # get the code
 cd barras-backend                                           # every command runs from the repository root
 git switch develop                                          # the integration branch: every work branch starts here
-rustup toolchain install                                    # installs Rust 1.100.0 with rustfmt and clippy, as rust-toolchain.toml pins it
-just setup                                                  # installs cargo-nextest and cargo-deny, then the git hooks
+just setup                                                  # installs Rust 1.100.0 as rust-toolchain.toml pins it, cargo-nextest and cargo-deny, then the git hooks
 just verify                                                 # format, lint, deny, architecture, structure, tests, release build; must end without error
 ```
+
+The first `just setup` compiles cargo-nextest and cargo-deny from source and takes a few minutes.
 
 ## Everyday commands
 

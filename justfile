@@ -4,7 +4,7 @@ default:
     @just --list
 
 setup:
-    rustup show active-toolchain
+    rustup toolchain install
     cargo install --locked cargo-nextest@0.9.152 cargo-deny@0.20.2
     lefthook install
 
@@ -15,7 +15,7 @@ dev-ingest:
     cargo run -p barras-ingest
 
 lint:
-    cargo clippy --workspace --all-targets --locked -- -D warnings
+    cargo clippy --workspace --all-targets --locked --config 'build.warnings="deny"' -- -D warnings
 
 fmt:
     cargo fmt --all
@@ -35,6 +35,7 @@ check-structure:
 
 test:
     cargo nextest run --workspace --locked
+    cargo test --workspace --doc --locked
 
 build:
     cargo build --workspace --release --locked

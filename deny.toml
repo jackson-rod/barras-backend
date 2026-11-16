@@ -24,11 +24,11 @@ allow = [
 [licenses.private]
 ignore = true
 
-# Hexagonal boundary: each outside-world crate may be a direct dependency
-# of its adapter only. `wrappers` exempts direct dependents; every
-# transitive path is still denied. When a third-party crate that wraps one
-# of these arrives (for example `utoipa-axum`), add it to its row with a
-# comment that says why.
+# Hexagonal boundary: a ban with `wrappers` lets only the listed crates
+# depend on the banned crate directly. A crate that reaches it through one
+# of them, such as an app through its adapter, is allowed, and that is
+# intended. When a third-party crate that wraps one of these arrives (for
+# example `utoipa-axum`), add it to its row with a comment that says why.
 [bans]
 deny = [
     { crate = "sqlx", wrappers = ["barras-adapter-postgres", "barras-testkit"], reason = "database access lives in the postgres adapter" },
