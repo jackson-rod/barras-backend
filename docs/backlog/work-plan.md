@@ -21,6 +21,7 @@ Repository tags: BE backend, FE frontend, DOC docs, DS design, OWN the owner.
 | 11 | F-11 | Foundations | FE | Spike: candlestick chart library and its performance on a mid-range Android |
 | 12 | F-12 | Foundations | BE | Hosting and environments ADR; container images; staging deploy |
 | 13 | F-13 | Foundations | OWN | Accounts and identifiers: Apple Developer, Google Play, Expo, RevenueCat, bundle id, domain |
+| 92 | F-14 | Foundations | BE | Harden the repository checks (fixes deferred from BAR-2) |
 | 14 | A-01 | Sign up and sign in | DOC | Identity spec |
 | 15 | A-02 | Sign up and sign in | BE | Users, roles and permissions; email sign-up with verification; sign-in; token refresh; sign-out; password reset |
 | 16 | A-03 | Sign up and sign in | BE | Sign in with Apple and Google; account linking |
