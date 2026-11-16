@@ -8,7 +8,7 @@ use crate::error::KernelError;
 // The size of the Postgres column `numeric(20,2)`.
 const DECIMAL_PLACES: u32 = 2;
 const MAX_INTEGER_DIGITS: u32 = 18;
-/// One past the largest amount, in absolute value.
+/// Every amount is below this in absolute value: the largest is one cent under it.
 const LIMIT: i64 = 10_i64.pow(MAX_INTEGER_DIGITS);
 
 /// An amount with its currency, sized as the Postgres column `numeric(20,2)`: at most 18
@@ -59,10 +59,14 @@ impl Money {
         self.amount.is_sign_negative()
     }
 
+    /// Fails with `CurrencyMismatch` on two currencies, and with `AmountOverflow` when
+    /// the sum leaves the range.
     pub fn checked_add(self, other: Self) -> Result<Self, KernelError> {
         self.combine(other, Decimal::checked_add)
     }
 
+    /// Fails with `CurrencyMismatch` on two currencies, and with `AmountOverflow` when
+    /// the difference leaves the range.
     pub fn checked_sub(self, other: Self) -> Result<Self, KernelError> {
         self.combine(other, Decimal::checked_sub)
     }
@@ -175,6 +179,9 @@ mod tests {
             "0x10",
             "1234567890123456789",
             "1234567890123456789.00",
+            // 19 digits whose value is in range: the count is the rule, not the size.
+            "0123456789012345678",
+            "0000000000000000000",
         ] {
             let error = Money::parse(text, "COP").unwrap_err();
             assert_eq!(error.code(), "INVALID_AMOUNT", "{text:?}");

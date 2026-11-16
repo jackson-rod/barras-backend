@@ -25,13 +25,13 @@ impl Clock for SystemClock {
 mod fixed {
     use std::sync::{Mutex, MutexGuard, PoisonError};
 
-    use time::{Duration, OffsetDateTime};
+    use time::{Duration, OffsetDateTime, UtcOffset};
 
     use super::Clock;
 
-    /// A clock for tests: it returns the instant it was given and moves only when told.
-    /// It moves through a shared reference, so a test keeps one handle while the code
-    /// under test holds another.
+    /// A clock for tests: it returns the instant it was given, in UTC as the port
+    /// promises, and moves only when told. It moves through a shared reference, so a
+    /// test keeps one handle while the code under test holds another.
     #[derive(Debug)]
     pub struct FixedClock {
         now: Mutex<OffsetDateTime>,
@@ -40,12 +40,12 @@ mod fixed {
     impl FixedClock {
         pub fn new(at: OffsetDateTime) -> Self {
             Self {
-                now: Mutex::new(at),
+                now: Mutex::new(in_utc(at)),
             }
         }
 
         pub fn set(&self, at: OffsetDateTime) {
-            *self.lock() = at;
+            *self.lock() = in_utc(at);
         }
 
         /// Moves the clock by `duration`, backwards when it is negative. At either end of
@@ -67,18 +67,30 @@ mod fixed {
             *self.lock()
         }
     }
+
+    /// The same instant at the UTC offset. A test seeded with a local time would
+    /// otherwise see another date than production, where the clock is in UTC.
+    fn in_utc(at: OffsetDateTime) -> OffsetDateTime {
+        // Only an instant within a day of either end of the calendar has no UTC form.
+        // It is kept as given: `to_offset` would panic on it.
+        at.checked_to_offset(UtcOffset::UTC).unwrap_or(at)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use time::{Duration, UtcOffset};
+    use time::{Duration, PrimitiveDateTime, UtcOffset};
 
     use super::*;
 
     fn instant() -> OffsetDateTime {
         OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap()
+    }
+
+    fn bogota() -> UtcOffset {
+        UtcOffset::from_hms(-5, 0, 0).unwrap()
     }
 
     #[test]
@@ -95,6 +107,40 @@ mod tests {
         let clock = FixedClock::new(instant());
         assert_eq!(clock.now(), instant());
         assert_eq!(clock.now(), instant());
+    }
+
+    #[test]
+    fn a_fixed_clock_tells_the_time_in_utc_whatever_offset_it_was_given() {
+        let evening_in_bogota = instant().to_offset(bogota()).replace_hour(21).unwrap();
+        let clock = FixedClock::new(evening_in_bogota);
+
+        let now = clock.now();
+        assert_eq!(now.offset(), UtcOffset::UTC);
+        assert_eq!(now, evening_in_bogota);
+        // The date is where the two offsets part: it is already tomorrow in UTC.
+        assert_eq!(now.date(), evening_in_bogota.date().next_day().unwrap());
+    }
+
+    #[test]
+    fn a_fixed_clock_stays_in_utc_when_it_is_set_and_advanced() {
+        let clock = FixedClock::new(instant());
+
+        clock.set(instant().to_offset(bogota()));
+        assert_eq!(clock.now().offset(), UtcOffset::UTC);
+        assert_eq!(clock.now(), instant());
+
+        clock.advance(Duration::hours(30));
+        assert_eq!(clock.now().offset(), UtcOffset::UTC);
+        assert_eq!(clock.now(), instant() + Duration::hours(30));
+    }
+
+    #[test]
+    fn an_instant_too_late_to_have_a_utc_form_is_kept_as_given() {
+        let last_in_bogota = PrimitiveDateTime::MAX.assume_offset(bogota());
+        let clock = FixedClock::new(last_in_bogota);
+        assert_eq!(clock.now(), last_in_bogota);
+        clock.set(last_in_bogota);
+        assert_eq!(clock.now(), last_in_bogota);
     }
 
     #[test]

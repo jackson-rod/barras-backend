@@ -52,6 +52,21 @@ mod tests {
     }
 
     #[test]
+    fn every_code_reads_back_as_it_was_written() {
+        let mut count = 0;
+        for first in 'A'..='Z' {
+            for second in 'A'..='Z' {
+                for third in 'A'..='Z' {
+                    let code = String::from_iter([first, second, third]);
+                    assert_eq!(Currency::new(&code).unwrap().as_str(), code);
+                    count += 1;
+                }
+            }
+        }
+        assert_eq!(count, 26 * 26 * 26);
+    }
+
+    #[test]
     fn anything_else_is_refused() {
         for code in [
             "",

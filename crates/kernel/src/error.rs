@@ -3,6 +3,7 @@
 use thiserror::Error;
 
 use crate::currency::Currency;
+use crate::page::PageLimit;
 
 /// What kind of failure an error is, in terms every adapter can map to its own protocol.
 /// The domain does not know HTTP: only the HTTP adapter turns a kind into a status.
@@ -39,7 +40,7 @@ pub enum KernelError {
     InvalidAmount,
     #[error("invalid id: expected a UUID in its hyphenated lower-case form")]
     InvalidId,
-    #[error("invalid page limit: expected a number from 1 to 50")]
+    #[error("invalid page limit: expected a number from 1 to {}", PageLimit::MAX)]
     InvalidPageLimit,
     #[error("invalid cursor: expected 1 to 512 characters, each a letter, a digit, '-' or '_'")]
     InvalidCursor,
@@ -71,7 +72,8 @@ impl AppError for KernelError {
             | Self::InvalidId
             | Self::InvalidPageLimit
             | Self::InvalidCursor => ErrorKind::Validation,
-            // Both are a bug in the caller, never the user's fault.
+            // A mismatch is a bug in the caller. An overflow can come from real data, but
+            // no single input is wrong, so it is not a validation failure either.
             Self::CurrencyMismatch { .. } | Self::AmountOverflow => ErrorKind::Internal,
         }
     }
@@ -86,38 +88,34 @@ mod tests {
         right: Currency::USD,
     };
 
+    const EVERY_ERROR: [KernelError; 7] = [
+        KernelError::InvalidCurrency,
+        KernelError::InvalidAmount,
+        KernelError::InvalidId,
+        KernelError::InvalidPageLimit,
+        KernelError::InvalidCursor,
+        MISMATCH,
+        KernelError::AmountOverflow,
+    ];
+
+    /// The table of spec §6.2. The `match` has no wildcard arm, so a new variant does not
+    /// compile until it has its row here; list it in `EVERY_ERROR` as well.
+    fn expected(error: KernelError) -> (&'static str, ErrorKind) {
+        match error {
+            KernelError::InvalidCurrency => ("INVALID_CURRENCY", ErrorKind::Validation),
+            KernelError::InvalidAmount => ("INVALID_AMOUNT", ErrorKind::Validation),
+            KernelError::InvalidId => ("INVALID_ID", ErrorKind::Validation),
+            KernelError::InvalidPageLimit => ("INVALID_PAGE_LIMIT", ErrorKind::Validation),
+            KernelError::InvalidCursor => ("INVALID_CURSOR", ErrorKind::Validation),
+            KernelError::CurrencyMismatch { .. } => ("CURRENCY_MISMATCH", ErrorKind::Internal),
+            KernelError::AmountOverflow => ("AMOUNT_OVERFLOW", ErrorKind::Internal),
+        }
+    }
+
     #[test]
     fn kernel_errors_keep_their_codes_and_kinds() {
-        let table = [
-            (
-                KernelError::InvalidCurrency,
-                "INVALID_CURRENCY",
-                ErrorKind::Validation,
-            ),
-            (
-                KernelError::InvalidAmount,
-                "INVALID_AMOUNT",
-                ErrorKind::Validation,
-            ),
-            (KernelError::InvalidId, "INVALID_ID", ErrorKind::Validation),
-            (
-                KernelError::InvalidPageLimit,
-                "INVALID_PAGE_LIMIT",
-                ErrorKind::Validation,
-            ),
-            (
-                KernelError::InvalidCursor,
-                "INVALID_CURSOR",
-                ErrorKind::Validation,
-            ),
-            (MISMATCH, "CURRENCY_MISMATCH", ErrorKind::Internal),
-            (
-                KernelError::AmountOverflow,
-                "AMOUNT_OVERFLOW",
-                ErrorKind::Internal,
-            ),
-        ];
-        for (error, code, kind) in table {
+        for error in EVERY_ERROR {
+            let (code, kind) = expected(error);
             assert_eq!(error.code(), code);
             assert_eq!(error.kind(), kind, "{code}");
         }
@@ -125,15 +123,7 @@ mod tests {
 
     #[test]
     fn every_kernel_error_has_a_developer_message() {
-        for error in [
-            KernelError::InvalidCurrency,
-            KernelError::InvalidAmount,
-            KernelError::InvalidId,
-            KernelError::InvalidPageLimit,
-            KernelError::InvalidCursor,
-            MISMATCH,
-            KernelError::AmountOverflow,
-        ] {
+        for error in EVERY_ERROR {
             assert!(!error.to_string().is_empty(), "{}", error.code());
         }
     }

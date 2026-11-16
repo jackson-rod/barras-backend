@@ -32,14 +32,15 @@ impl PageLimit {
 pub struct Cursor(String);
 
 impl Cursor {
-    pub fn new(token: impl Into<String>) -> Result<Self, KernelError> {
-        let token = token.into();
-        let has_valid_length = (1..=MAX_CURSOR_LENGTH).contains(&token.len());
-        let is_in_the_set = token
+    /// Checks the token before it takes it, so a refused `&str` is never copied.
+    pub fn new(token: impl AsRef<str> + Into<String>) -> Result<Self, KernelError> {
+        let text = token.as_ref();
+        let has_valid_length = (1..=MAX_CURSOR_LENGTH).contains(&text.len());
+        let is_in_the_set = text
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_');
         if has_valid_length && is_in_the_set {
-            Ok(Self(token))
+            Ok(Self(token.into()))
         } else {
             Err(KernelError::InvalidCursor)
         }
