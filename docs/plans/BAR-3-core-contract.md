@@ -144,7 +144,9 @@ Skill: `security-and-hardening`.
 - Modify: `Cargo.toml` (`syn`, `proc-macro2` in `[workspace.dependencies]`), `crates/xtask/Cargo.toml`, `crates/xtask/src/{arch,main,lib,error}.rs`, `crates/xtask/tests/arch_workspace.rs`
 - Create: `crates/xtask/src/coverage.rs` (submodules under `crates/xtask/src/coverage/` when it grows), `crates/xtask/tests/coverage_cli.rs`
 
-A code review and a security audit of the first version (commits `e978670` and `f749706`) found ways to pass both gates wrongly: test lines counted as covered production lines, production lines dropped as test lines, a crate left out of the report skipping its bar, and layer rules defeated by a renamed package, a crate outside the workspace or the generated `workspace-hack` crate. What follows is the end state, the fixes included.
+A code review and a security audit of the first version (commits `e978670` and `f749706`) found ways to pass both gates wrongly: test lines counted as covered production lines, production lines dropped as test lines, a crate left out of the report skipping its bar, and layer rules defeated by a renamed package, a crate outside the workspace or the generated `workspace-hack` crate. A re-review and a re-audit of those fixes (`a26a23f`, `e7bb417`) found more. What follows is the end state, both rounds included.
+
+**What the gates guard against.** They must not pass by mistake: any shape an honest contributor, human or agent, could write that hides code from the measure or slips a layer rule is refused or measured. They do not guard against a hostile author: the change's own code runs in the same CI job before the gates finish, a test or a build script can rewrite the report or the tool, and the gate files belong to the change. The owner reads every change to them; CODEOWNERS on them is an open owner decision.
 
 **Part A: `check-arch`**
 
@@ -160,42 +162,55 @@ A dependency on a workspace member is known by the member it resolves to (by pac
 | `bootstrap-apps-only` (new) | Only a crate under `apps/` may depend on the member at `crates/bootstrap`, in any kind |
 | `testkit-dev-only` (changed) | Decided by the member at `crates/testkit`, not by its name |
 | `hack-isolation` (new) | Every dependency of `crates/workspace-hack`, in any kind, comes from crates.io |
-| `hack-is-a-stub` (new) | `crates/workspace-hack` has exactly one library target, at `src/lib.rs`, and at most one build script, at `build.rs`; `src/lib.rs` holds no item and no attribute but doc comments; `build.rs` holds only `fn main() {}`; the folder holds no other `.rs` file. The allowlists accept this crate only because it cannot carry code |
+| `hack-is-a-stub` (new) | `crates/workspace-hack` has exactly one library target, at `src/lib.rs`, and at most one build script, at `build.rs`; `src/lib.rs` holds no item and no attribute but doc comments; `build.rs` holds only `fn main() {}`; the folder holds no other `.rs` file, no symlink and no entry that is neither a regular file nor a folder. The allowlists accept this crate only because it cannot carry code |
+| `no-build-script` (new) | `crates/kernel` and each `crates/modules/<m>` have no build script: code it generates would escape the coverage measure, and pure domain code needs none |
 | `unknown-location`, `not-a-member` (changed) | `crates/bootstrap` and `crates/workspace-hack` are known folders, and must be members when they hold a `Cargo.toml` |
 | `tool-isolation` (unchanged) | `xtask` may not depend on `workspace-hack` either |
 
-`crates/bootstrap` and `crates/workspace-hack` do not exist until Tasks 3 and 14; the tests build them as fixtures, and the real workspace stays clean.
+`crates/workspace-hack` does not exist until Task 14; the tests build it as a fixture, and the real workspace stays clean. One folder walker, which refuses symlinks and special entries, and one list of crate folders serve both `check-arch` and `check-coverage`.
 
 **Part B: `check-coverage <lcov-file> [workspace-root]`**
 
 The optional root lets the tests run the binary on a temporary workspace. Without it the root is this repository, whatever the current directory.
 
-*The report.* LCOV is parsed by hand, strictly: an `SF` that is relative or holds `..`, a `DA` outside a record, a record inside another, a report cut short, and a `DA` line past the end of its source file are errors. A file named by two records counts a line once, as hit if either record hit it. Every error names the report's path and the line, and a path taken from the report is printed escaped. The report and each source file are read only when they are regular files (not a symlink, a FIFO or a device) and under a size cap: 64 MiB for the report, 1 MiB for a source file.
+*The report.* LCOV is parsed by hand, strictly: an `SF` that is relative or holds `..`, a `DA` outside a record, a record inside another, a report cut short, and a `DA` line past the end of its source file are errors. A file named by two records counts a line once, as hit if either record hit it. Every non-empty line is a known LCOV record at column 0 (`TN`, `SF`, `FN`, `FNDA`, `FNF`, `FNH`, `DA`, `LF`, `LH`, `BRDA`, `BRF`, `BRH`, `VER`, `end_of_record`, or whatever subset cargo-llvm-cov 0.9.1 really writes); anything else is an error. Every error that comes from the report names it and the line, and a path taken from the report is printed escaped. The report and each source file are read only when they are regular files (not a symlink, a FIFO or a device) and under a size cap: 64 MiB for the report, 1 MiB for a source file.
 
 *Which lines count.*
 - An `SF` outside the root, under the spelling given or the canonical one, is ignored. An `SF` inside the root but outside every known crate folder and outside `target/` is an error, so code included from elsewhere cannot escape the bars. A missing source file inside the root is an error, under either spelling.
 - Only files under a crate's `src/` are measured. The rest of the crate folder (`tests/`, `benches/`, `examples/`, `build.rs`) is not. `crates/testkit` and `crates/workspace-hack` are not measured.
 - Every `.rs` file under the `src/` of each measured crate is parsed with `syn`, whether the report names it or not, and a file that does not parse is an error. Line positions come from `proc-macro2` with its `span-locations` feature.
+- A source file under a measured `src/` that holds a function body outside test items must be named by the report. cargo-llvm-cov drops some paths by default (`tests.rs`, `*_tests.rs`, any path with `/rustc/<hex>/`, …), and a crate whose tests never run is absent from the report; neither can escape the bars this way, and every crate with code has a figure.
+- A source nested deeper than 256 groups is an error naming the file, found by a walk that does not recurse, before the parse; the parse runs on a thread with a large stack.
 - An item that carries exactly `#[cfg(test)]` is test code at any depth: in a file, in an inline module, in an `impl`, `trait` or `extern` block. The lines of its whole span, its attributes and doc comments included, are left out. `#[cfg(any(test, feature = "<name>"))]`, test support that other crates' tests use, counts as production.
 - These are errors, each naming the file and the line, because each would hide code from the measure:
   - a `cfg` predicate that names `test` in any other form (`not(test)`, `all(test, …)`, …), or `#[cfg(test)]` anywhere but on an item;
+  - a `cfg` or `cfg_attr` predicate that uses anything but `test` (as the test mark), `feature = "…"`, `unix`, `windows` and the `target_*` keys, combined with `all`, `any` and `not`, or that puts `not` around a `feature`: code that only a release build (`debug_assertions`), a custom cfg or a missing feature compiles is never measured;
   - a `cfg` or `cfg_attr` predicate that names `coverage`, and any `coverage(…)` attribute;
+  - outside test items, the identifiers `cfg`, `cfg_attr`, `coverage`, `test` or `include`, or the keyword `mod`, inside a `macro_rules!` body or a macro call: macros are not expanded, so they could otherwise produce every shape this list refuses;
+  - the identifier `include` anywhere, test code included, except in `include!(concat!(env!("OUT_DIR"), "<literal without ..>"))`: an included file is measured, or dropped, under its own path;
   - a `cfg_attr` whose attributes include `cfg`;
   - an out-of-line `#[cfg(test)] mod <name>;` whose name is not `tests`;
   - an out-of-line `mod <name>;` without `#[cfg(test)]` whose name is `tests` or ends in `_tests`: cargo-llvm-cov drops such files, so production code in them would escape;
   - a `#[path]` attribute on a module;
   - a file under a measured `src/` named `*_tests.rs` or `*-tests.rs`, or a folder there named `examples` or `benches`.
-- A `tests.rs` file or a `tests/` folder inside `src/` is a test module: it is not parsed, and cargo-llvm-cov leaves it out of the report.
+- A `tests.rs` file or a `tests/` folder inside `src/` is a test module, which cargo-llvm-cov leaves out of the report. It is parsed only for `include` and `#[path]`, so it cannot pull production code into a test build.
 
 *The bars.* Lines are grouped by crate folder: `crates/kernel`, `crates/modules/<m>`, `crates/adapters/<a>`, `crates/bootstrap`, `crates/xtask`, `apps/<a>`. They are compared with integers (`hit * 100 >= bar * found`): 95 for `crates/kernel` and for each `crates/modules/<m>`, 85 for the total of the measured crates. `crates/kernel` and every `crates/modules/<m>` that holds a `Cargo.toml` must have a figure: absent from the report, or present with no production line, is a failure. Any other crate with no counted line has no figure. A report with no measured line at all fails. Failures are typed (`UnderBar`, `NotInReport`, `NothingMeasured`) with a `Display`, and the tests assert the variant. The tool prints one line per crate (`crates/kernel: 97.3% (220/226)`) and the total, cut and not rounded, so 94.99% never reads as 95.0%. Any failure exits 1.
 
-*Accepted limits*, recorded in ADR-0027 (Task 15): a stale report is caught only when it names a line past a file's end, so `just test-cov` always regenerates it; the total averages across crates; code generated under `target/` and code a macro expands are not measured as such; `check-coverage` trusts the report it is given, and the gate files themselves belong to whoever changes them, so the owner reads every change to them.
+*Accepted limits*, recorded in ADR-0027 (Task 15), with the threat model above:
+- A stale report is caught only when it names a line past a file's end, so `just test-cov` always regenerates it; the report comes from the change's own code and can be forged.
+- The total averages across crates. Trivially covered production lines, and test support under `any(test, feature = "…")`, count as production: only review sees padding.
+- Code generated under `target/` and code a macro expands are not measured as such; a dependency's proc macro can emit any attribute, and only adapters and apps can take such dependencies.
+- Code compiled out of the coverage build by a feature the workspace build leaves off is not measured.
+- Test attributes not named `test` (`#[rstest]`, `#[test_case]`) are not recognised as test marks; the kernel's and the modules' dev dependencies allow none of them.
+- A file swapped for a FIFO between the check and the open is a residual race.
 
 **Steps**
 - [x] Part A, first version: `feat(BAR-3): teach check-arch the bootstrap and workspace-hack folders` (`e978670`).
 - [x] Part B, first version: `feat(BAR-3): add the check-coverage subcommand` (`f749706`).
-- [ ] Review fixes to Part A, test first: each rule above gets a test that fails on the first version. Commit: `fix(BAR-3): close the check-arch rules found open in review`
-- [ ] Review fixes to Part B, test first, same way. Commit: `fix(BAR-3): read sources with syn in check-coverage and fail closed`
+- [x] Review fixes to Part A, test first: each rule above gets a test that fails on the first version. Commit: `fix(BAR-3): close the check-arch rules found open in review`
+- [x] Review fixes to Part B, test first, same way. Commit: `fix(BAR-3): read sources with syn in check-coverage and fail closed` (`e7bb417`; Part A was `a26a23f`).
+- [ ] Second round, test first: `refactor(BAR-3): share one folder walker and one list of crate folders in xtask` (no change in behaviour), `fix(BAR-3): refuse symlinks and build scripts where check-arch cannot see code`, `fix(BAR-3): close the remaining ways around check-coverage`.
 
 ---
 
@@ -642,7 +657,7 @@ Skills: `ci-cd-and-automation`, `security-and-hardening`.
 | `test-doc` | `cargo test --workspace --doc --locked` |
 | `test-int` | `cargo nextest run --workspace --locked -E 'binary(/^(e2e\|int)_/)'` |
 | `test-cov` | `mkdir -p target/coverage`, then `cargo llvm-cov nextest --workspace --locked --no-cfg-coverage --lcov --output-path target/coverage/lcov.info`, then `cargo xtask check-coverage target/coverage/lcov.info` |
-| `verify` | `fmt-check lint deny check-arch check-structure openapi-check test-cov test-doc build` (Task 14 adds `hakari-check` after `check-structure`) |
+| `verify` | `fmt-check check-arch check-structure lint deny openapi-check test-cov test-doc build` (Task 14 adds `hakari-check` after `check-structure`) |
 
 The two filters as they are written in the `justfile` (the table escapes the bar only for Markdown):
 
@@ -661,7 +676,9 @@ test-int:
 **CI**
 - `checks`: the step "Check the pull request title and description" moves after "Format, lint, deny, architecture and structure", and that code step gains `openapi-check`. The branch-name and commit-message steps stay first: they do not hide the code checks, because the code step runs with `if: ${{ !cancelled() }}`. Every value written by whoever opens the pull request still reaches the shell only through `env`.
 - `test`: installs `cargo-nextest@0.9.152` and `cargo-llvm-cov@0.9.1` through the pinned `install-action`, and runs `just test-cov test-doc`.
-- `build`: unchanged. No new permission, no new secret, no new third-party action.
+- `checks` runs `check-arch` and `check-structure` before anything compiles the workspace: `cargo xtask` builds only xtask and `cargo metadata --no-deps` runs no build script, so a build script in the change cannot rewrite a check before it runs. The local `verify` keeps the same order.
+- Every job ends with a step that fails when a tracked file changed or an untracked one appeared (`git status --porcelain` is not empty), so a build script or a test that rewrites the tree is caught.
+- `build`: unchanged otherwise. No new permission, no new secret, no new third-party action.
 
 **`deny.toml`**
 - `wildcards = "deny"` and `allow-wildcard-paths = true`.
@@ -719,9 +736,9 @@ Skill: `documentation-and-adrs`.
 
 | ADR | Decision |
 | --- | --- |
-| 0024 (amended, then `Accepted`) | Adds: members known by their folder, and `package-name`; `path-outside-members` and `apps-are-roots`; `barras-kernel` only at the member's path; the `workspace-hack` exception (a path dependency in the kernel's and modules' lists, a wrapper in the bans, `xtask` left out) and the two rules that make it safe, `hack-isolation` and `hack-is-a-stub`; the bans on `axum-core`, `hyper`, `hyper-util` and the deny list of alternatives. Its Context says the owner confirmed the stricter rule on 2026-11-15 |
+| 0024 (amended, then `Accepted`) | Adds: members known by their folder, and `package-name`; `path-outside-members` and `apps-are-roots`; `barras-kernel` only at the member's path; the `workspace-hack` exception (a path dependency in the kernel's and modules' lists, a wrapper in the bans, `xtask` left out) and the two rules that make it safe, `hack-isolation` and `hack-is-a-stub`; `no-build-script` for the kernel and the modules; the bans on `axum-core`, `hyper`, `hyper-util` and the deny list of alternatives. Its Context says the owner confirmed the stricter rule on 2026-11-15 |
 | 0026 | `barras-bootstrap`: what it holds, its row in the dependency table, the two rules; Barras builds and runs only on Unix, because the shutdown signal is SIGTERM and SIGINT |
-| 0027 | Tiers by file name (`e2e_`, `int_`); coverage over production lines, per crate; the kernel at 95%; what is not measured; doctests outside the measure; how `check-coverage` reads the sources (`syn`, `#[cfg(test)]` items) and the shapes it refuses; its accepted limits (Task 2) |
+| 0027 | Tiers by file name (`e2e_`, `int_`); coverage over production lines, per crate; the kernel at 95%; what is not measured; doctests outside the measure; how `check-coverage` reads the sources (`syn`, `#[cfg(test)]` items) and the shapes it refuses; what the gates guard against and what they do not; its accepted limits (Task 2) |
 | 0028 | `barras-api openapi` and `--check`; the canonical file; the metadata of spec §7.2; `ApiRouter` as the only door; the three-layer guard |
 | 0029 | The adapter's own codes and statuses; camelCase; no 204; `x-request-id`; the body limit and compression; the internal port without envelope; metrics from an explicit registry |
 
