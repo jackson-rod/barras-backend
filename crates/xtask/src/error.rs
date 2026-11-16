@@ -61,6 +61,21 @@ pub enum XtaskError {
         line: usize,
         problem: SourceProblem,
     },
+    /// An error about what the record at `line` of the report names.
+    #[error("{}:{line}: {error}", escaped(report))]
+    InReport {
+        report: PathBuf,
+        line: usize,
+        error: Box<XtaskError>,
+    },
+    #[error(
+        "{} holds a function body, and the coverage report {} does not name it: its tests never ran, or cargo-llvm-cov dropped its path",
+        escaped(path),
+        escaped(report)
+    )]
+    Unreported { report: PathBuf, path: PathBuf },
+    #[error("could not parse on a thread of its own: {0}")]
+    ParseThread(std::io::Error),
 }
 
 /// A file or a folder under a measured `src/` that would hide code from the measure, or
@@ -118,9 +133,19 @@ pub enum SourceProblem {
     #[error("a `#[path]` attribute, which can point a module at any file")]
     PathAttribute,
     #[error(
-        "an `include!` of a file by its path, which can bring in code from a file the measure leaves out: write it as a module"
+        "`include` other than in `include!(concat!(env!(\"OUT_DIR\"), \"…\"))`: an included file is measured, or dropped, under its own path"
     )]
-    IncludeByPath,
+    Include,
+    #[error("nested deeper than 256 groups, more than check-coverage reads")]
+    TooDeep,
+    #[error(
+        "a `cfg` predicate uses more than `test`, `feature = \"…\"`, `unix`, `windows` and the `target_*` keys, or puts `not` around a feature: code only a release build, a custom cfg or a missing feature compiles is never measured"
+    )]
+    CfgOutsideAllowlist,
+    #[error(
+        "a macro names `cfg`, `cfg_attr`, `coverage`, `test`, `include` or `mod`: macros are not expanded, so it could produce any shape check-coverage refuses"
+    )]
+    MacroCouldHideCode,
     #[error("a test function outside a `#[cfg(test)]` item, whose lines would count as production")]
     TestOutsideTestCode,
 }
@@ -208,6 +233,15 @@ mod tests {
                 path: path.clone(),
                 line: 3,
                 problem: SourceProblem::PathAttribute,
+            },
+            XtaskError::InReport {
+                report: path.clone(),
+                line: 4,
+                error: Box::new(XtaskError::StrayFile { path: path.clone() }),
+            },
+            XtaskError::Unreported {
+                report: path.clone(),
+                path: path.clone(),
             },
         ] {
             let message = error.to_string();

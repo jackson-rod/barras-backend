@@ -2,9 +2,11 @@
 //! crate, whether the report names it or not.
 
 use std::collections::BTreeMap;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::thread;
 
-use super::source::Source;
+use super::source::{Finding, Source};
 use crate::error::{LayoutProblem, XtaskError};
 use crate::layout::{Layer, crate_folders, layer_of};
 use crate::regular_file::read_regular_file;
@@ -31,10 +33,11 @@ pub fn measured_crates(root: &Path) -> Result<Vec<PathBuf>, XtaskError> {
     Ok(crates)
 }
 
-/// Every source under the `src/` of each of `crates`, by its path relative to `root`.
-/// A `tests.rs` file or a `tests` folder is a test module: cargo-llvm-cov leaves it out
-/// of the report, and it is not read. A hidden entry is not read either: no module can
-/// name it, and a report that measures one is refused as a file that was not read.
+/// Every source under the `src/` of each of `crates`, by its path relative to `root`. A
+/// `tests.rs` file or a file under a `tests` folder is a test module, which cargo-llvm-cov
+/// leaves out of the report: it is only checked for `include` and `#[path]`, and is not
+/// one of the sources. A hidden entry is not read: no module can name it, and a report
+/// that measures one is refused as a file that was not read.
 pub fn read_sources(
     root: &Path,
     crates: &[PathBuf],
@@ -46,9 +49,7 @@ pub fn read_sources(
             continue;
         }
         let entries = walk(root, &src, |entry| {
-            entry.name().is_some_and(|name| {
-                !name.starts_with('.') && !matches!(name, "tests" | "examples" | "benches")
-            })
+            entry.name().is_some_and(|name| !name.starts_with('.'))
         })?;
         for entry in entries {
             let name = utf8_name(&entry.path)?;
@@ -59,32 +60,64 @@ pub fn read_sources(
                 path: entry.path.clone(),
                 problem,
             };
+            let test_module = is_test_module(&src, &entry.path);
             match entry.kind {
                 EntryKind::Symlink => return Err(layout(LayoutProblem::Symlink)),
                 EntryKind::Special => return Err(layout(LayoutProblem::SpecialFile)),
-                EntryKind::Folder if matches!(name, "examples" | "benches") => {
+                EntryKind::Folder if !test_module && matches!(name, "examples" | "benches") => {
                     return Err(layout(LayoutProblem::DroppedFolder));
                 }
                 EntryKind::Folder => {}
+                EntryKind::File if !name.ends_with(".rs") => {}
+                EntryKind::File
+                    if !test_module
+                        && (name.ends_with("_tests.rs") || name.ends_with("-tests.rs")) =>
+                {
+                    return Err(layout(LayoutProblem::DroppedFileName));
+                }
                 EntryKind::File => {
-                    if !name.ends_with(".rs") || name == "tests.rs" {
-                        continue;
-                    }
-                    if name.ends_with("_tests.rs") || name.ends_with("-tests.rs") {
-                        return Err(layout(LayoutProblem::DroppedFileName));
-                    }
                     let text = read_regular_file(&root.join(&entry.path), SOURCE_LIMIT)?;
-                    let source = Source::read(&text).map_err(|finding| XtaskError::Source {
+                    let at_its_line = |finding: Finding| XtaskError::Source {
                         path: entry.path.clone(),
                         line: finding.line,
                         problem: finding.problem,
-                    })?;
-                    sources.insert(entry.path, source);
+                    };
+                    if test_module {
+                        on_a_large_stack(|| Source::check_test_module(&text))?
+                            .map_err(at_its_line)?;
+                    } else {
+                        let source =
+                            on_a_large_stack(|| Source::read(&text))?.map_err(at_its_line)?;
+                        sources.insert(entry.path, source);
+                    }
                 }
             }
         }
     }
     Ok(sources)
+}
+
+/// A `tests.rs` file, or anything under a folder named `tests`, inside `src`.
+fn is_test_module(src: &Path, path: &Path) -> bool {
+    let inner = path.strip_prefix(src).unwrap_or(path);
+    inner.iter().any(|part| part == "tests")
+        || inner.file_name().is_some_and(|name| name == "tests.rs")
+}
+
+/// syn parses by recursion, a few frames for each level of nesting: 256 nested blocks take
+/// about 8 MiB of stack in a debug build, more than a thread is given by default.
+const PARSE_STACK: usize = 64 * 1024 * 1024;
+
+/// The result of `work`, run on a thread of its own with a large stack.
+fn on_a_large_stack<T: Send>(work: impl FnOnce() -> T + Send) -> Result<T, XtaskError> {
+    thread::scope(|scope| {
+        thread::Builder::new()
+            .stack_size(PARSE_STACK)
+            .spawn_scoped(scope, work)
+            .map_err(XtaskError::ParseThread)?
+            .join()
+            .map_err(|_| XtaskError::ParseThread(io::Error::other("the parse stopped short")))
+    })
 }
 
 fn utf8_name(path: &Path) -> Result<&str, XtaskError> {
@@ -163,13 +196,22 @@ mod tests {
             "apps/api/Cargo.toml",
             "apps/api/src/main.rs",
         ]);
-        for not_rust in [
+        for test_module in [
             "crates/kernel/src/tests.rs",
             "crates/kernel/src/money/tests/helpers.rs",
+        ] {
+            // Read for `include` and `#[path]` only: nothing else here is refused.
+            write(
+                root.path(),
+                test_module,
+                "#[cfg(not(coverage))]\nfn helper() {}\n",
+            );
+        }
+        for hidden in [
             "crates/kernel/src/.hidden.rs",
             "crates/kernel/src/.cache/x.rs",
         ] {
-            write(root.path(), not_rust, "fn not_parsed( {\n");
+            write(root.path(), hidden, "fn not_parsed( {\n");
         }
         let read: Vec<PathBuf> = read_all(root.path()).unwrap().into_keys().collect();
         assert_eq!(

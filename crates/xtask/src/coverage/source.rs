@@ -4,20 +4,32 @@
 use std::collections::BTreeSet;
 
 use proc_macro2::extra::invalidate_current_thread_spans;
-use proc_macro2::{Delimiter, Ident, LexError, LineColumn, Span, TokenStream, TokenTree};
+use proc_macro2::{Delimiter, LexError, LineColumn, Span, TokenStream, TokenTree};
 use syn::ext::IdentExt;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
-use syn::{AttrStyle, Attribute, ForeignItem, ImplItem, Item, ItemMod, Meta, TraitItem};
+use syn::{
+    AttrStyle, Attribute, ExprClosure, ForeignItem, ImplItem, ImplItemFn, Item, ItemFn, ItemMod,
+    Macro, Meta, TraitItem, TraitItemFn,
+};
 
 use super::attributes::{is_cfg_test, problem_of};
 use crate::error::SourceProblem;
+
+/// Deeper than code a person writes. Within it, the parse fits the stack it runs on.
+const MAX_DEPTH: usize = 256;
+
+/// What a macro outside test code may not name: macros are not expanded, so one that
+/// names any of these could produce any shape the measure refuses.
+const MACRO_REFUSED: [&str; 6] = ["cfg", "cfg_attr", "coverage", "test", "include", "mod"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Source {
     pub line_count: usize,
     /// The lines, numbered from 1, that hold test code and nothing else.
     pub test_lines: BTreeSet<usize>,
+    /// A function or closure body outside test code: the report must then name the file.
+    pub has_function_body: bool,
 }
 
 /// A shape check-coverage refuses, at the line where it starts.
@@ -28,22 +40,20 @@ pub struct Finding {
 }
 
 impl Source {
-    /// Reads the Rust source `text`. The first finding by line, if any, is the error.
+    /// Reads the Rust source `text`. The first finding by line, if any, is the error. syn
+    /// parses by recursion, so this runs on a stack of several megabytes: see `sources.rs`.
     pub fn read(text: &str) -> Result<Self, Finding> {
         let _spans = SpanScope;
-        let unparsable = |line| Finding {
-            line,
+        let tokens = tokenize(text)?;
+        let file: syn::File = syn::parse2(tokens.clone()).map_err(|error| Finding {
+            line: error.span().start().line,
             problem: SourceProblem::Unparsable,
-        };
-        let tokens: TokenStream = text
-            .parse()
-            .map_err(|error: LexError| unparsable(error.span().start().line))?;
-        let file: syn::File =
-            syn::parse2(tokens.clone()).map_err(|error| unparsable(error.span().start().line))?;
+        })?;
         let mut walk = ItemWalk::default();
         walk.visit_file(&file);
         let mut scan = TokenScan {
             test_items: &walk.test_items,
+            all_test_code: false,
             production_lines: BTreeSet::new(),
             findings: Vec::new(),
         };
@@ -61,13 +71,69 @@ impl Source {
         Ok(Self {
             line_count: text.lines().count(),
             test_lines,
+            has_function_body: walk.has_function_body,
         })
     }
+
+    /// Checks a test module that cargo-llvm-cov leaves out of its report, a `tests.rs` or a
+    /// file under a `tests/` folder. Only `include` and `#[path]` matter there: either could
+    /// pull production code into a test build, where it would run without being measured.
+    pub fn check_test_module(text: &str) -> Result<(), Finding> {
+        let _spans = SpanScope;
+        let mut scan = TokenScan {
+            test_items: &[],
+            all_test_code: true,
+            production_lines: BTreeSet::new(),
+            findings: Vec::new(),
+        };
+        scan.scan(tokenize(text)?);
+        match scan.findings.iter().min_by_key(|finding| finding.line) {
+            Some(first) => Err(*first),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The tokens of `text`, refused when they do not lex or nest deeper than `MAX_DEPTH`.
+fn tokenize(text: &str) -> Result<TokenStream, Finding> {
+    let tokens: TokenStream = text.parse().map_err(|error: LexError| Finding {
+        line: error.span().start().line,
+        problem: SourceProblem::Unparsable,
+    })?;
+    if let Some(line) = too_deep(&tokens) {
+        return Err(Finding {
+            line,
+            problem: SourceProblem::TooDeep,
+        });
+    }
+    Ok(tokens)
+}
+
+/// The line where the first group deeper than `MAX_DEPTH` opens, if any. The walk keeps
+/// its own stack, so that no depth can exhaust the thread's.
+fn too_deep(tokens: &TokenStream) -> Option<usize> {
+    let mut open = vec![tokens.clone().into_iter()];
+    while let Some(next) = open.last_mut().map(Iterator::next) {
+        match next {
+            Some(TokenTree::Group(group)) => {
+                if open.len() > MAX_DEPTH {
+                    return Some(group.span_open().start().line);
+                }
+                open.push(group.stream().into_iter());
+            }
+            Some(_) => {}
+            None => {
+                open.pop();
+            }
+        }
+    }
+    None
 }
 
 /// proc-macro2 keeps the text of every file it parses in a map of its thread, which only
 /// grows, and places every token by a 32-bit offset into it. Clearing the map once a file
-/// is read keeps both bounded, however many files one run reads; no span outlives `read`.
+/// is read keeps both bounded, however many files one thread reads; no span outlives the
+/// call.
 struct SpanScope;
 
 impl Drop for SpanScope {
@@ -76,7 +142,8 @@ impl Drop for SpanScope {
     }
 }
 
-/// Finds the test items, at any depth, and the modules whose files the measure would miss.
+/// Finds the test items, at any depth, the function bodies outside them, the macros that
+/// could hide code, and the modules whose files the measure would miss.
 #[derive(Default)]
 struct ItemWalk {
     /// Where each test item starts and ends, its attributes and doc comments included.
@@ -84,6 +151,7 @@ struct ItemWalk {
     /// The names of the inline modules around the walk, innermost last.
     inline_modules: Vec<String>,
     in_test_code: bool,
+    has_function_body: bool,
     findings: Vec<Finding>,
 }
 
@@ -128,6 +196,40 @@ impl<'ast> Visit<'ast> for ItemWalk {
             self.inline_modules.pop();
         }
     }
+
+    fn visit_item_fn(&mut self, function: &'ast ItemFn) {
+        self.note_a_body();
+        visit::visit_item_fn(self, function);
+    }
+
+    fn visit_impl_item_fn(&mut self, function: &'ast ImplItemFn) {
+        self.note_a_body();
+        visit::visit_impl_item_fn(self, function);
+    }
+
+    fn visit_trait_item_fn(&mut self, function: &'ast TraitItemFn) {
+        if function.default.is_some() {
+            self.note_a_body();
+        }
+        visit::visit_trait_item_fn(self, function);
+    }
+
+    fn visit_expr_closure(&mut self, closure: &'ast ExprClosure) {
+        self.note_a_body();
+        visit::visit_expr_closure(self, closure);
+    }
+
+    fn visit_macro(&mut self, called: &'ast Macro) {
+        if !self.in_test_code
+            && let Some(line) = first_refused_word(&called.tokens)
+        {
+            self.findings.push(Finding {
+                line,
+                problem: SourceProblem::MacroCouldHideCode,
+            });
+        }
+        visit::visit_macro(self, called);
+    }
 }
 
 impl ItemWalk {
@@ -149,6 +251,12 @@ impl ItemWalk {
         self.in_test_code = false;
     }
 
+    fn note_a_body(&mut self) {
+        if !self.in_test_code {
+            self.has_function_body = true;
+        }
+    }
+
     /// cargo-llvm-cov leaves out of its report every file named `tests.rs` or `*_tests.rs`
     /// and every file under a folder named `tests`, and check-coverage reads every other
     /// file under `src/` as production. So a module's name must say what its file holds.
@@ -167,6 +275,26 @@ impl ItemWalk {
             }
         }
     }
+}
+
+/// The line of the first identifier of `tokens`, at any depth, that a macro may not name.
+fn first_refused_word(tokens: &TokenStream) -> Option<usize> {
+    let mut open = vec![tokens.clone().into_iter()];
+    while let Some(next) = open.last_mut().map(Iterator::next) {
+        match next {
+            Some(TokenTree::Group(group)) => open.push(group.stream().into_iter()),
+            Some(TokenTree::Ident(word))
+                if MACRO_REFUSED.iter().any(|refused| word.unraw() == *refused) =>
+            {
+                return Some(word.span().start().line);
+            }
+            Some(_) => {}
+            None => {
+                open.pop();
+            }
+        }
+    }
+    None
 }
 
 fn is_test_item(attributes: &[Attribute]) -> bool {
@@ -228,10 +356,12 @@ fn foreign_item_attributes(item: &ForeignItem) -> &[Attribute] {
 }
 
 /// Goes over every token of the file, macro bodies included, which the syntax tree keeps
-/// as raw tokens: it judges every attribute, wherever it stands, and records which lines
-/// hold production tokens.
+/// as raw tokens: it judges every attribute and every `include`, wherever they stand, and
+/// records which lines hold production tokens.
 struct TokenScan<'a> {
     test_items: &'a [(LineColumn, LineColumn)],
+    /// For a test module file, which is test code from its first line to its last.
+    all_test_code: bool,
     /// Lines that hold a token outside every test item, so that a line a test item shares
     /// with production code is never left out.
     production_lines: BTreeSet<usize>,
@@ -239,18 +369,21 @@ struct TokenScan<'a> {
 }
 
 impl TokenScan<'_> {
+    /// Recursion is safe here: `tokenize` refused anything deeper than `MAX_DEPTH`.
     fn scan(&mut self, stream: TokenStream) {
         let tokens: Vec<TokenTree> = stream.into_iter().collect();
         for (index, token) in tokens.iter().enumerate() {
             let TokenTree::Group(group) = token else {
                 self.note(token.span());
-                if let TokenTree::Ident(name) = token
-                    && includes_by_path(name, &tokens[index + 1..])
-                    && !self.in_test_item(name.span().start())
+                if let TokenTree::Ident(word) = token
+                    && word.unraw() == "include"
+                    && !is_out_dir_include(&tokens[index + 1..])
                 {
+                    // Test code too: an included file is measured, or dropped, under its
+                    // own path, so a test build could run production code no line counts.
                     self.findings.push(Finding {
-                        line: name.span().start().line,
-                        problem: SourceProblem::IncludeByPath,
+                        line: word.span().start().line,
+                        problem: SourceProblem::Include,
                     });
                 }
                 continue;
@@ -274,9 +407,11 @@ impl TokenScan<'_> {
     }
 
     fn in_test_item(&self, position: LineColumn) -> bool {
-        self.test_items
-            .iter()
-            .any(|(start, end)| *start <= position && position < *end)
+        self.all_test_code
+            || self
+                .test_items
+                .iter()
+                .any(|(start, end)| *start <= position && position < *end)
     }
 
     /// An attribute that does not parse is no attribute rustc would take either: a macro
@@ -294,17 +429,43 @@ impl TokenScan<'_> {
     }
 }
 
-/// `include!("…")`: the file a literal names may be one that cargo-llvm-cov leaves out of
-/// its report, such as a `tests.rs`. Generated code, `include!(concat!(env!("OUT_DIR"),
-/// …))`, names no file by a literal of its own.
-fn includes_by_path(name: &Ident, after: &[TokenTree]) -> bool {
-    name.unraw() == "include"
-        && matches!(after, [TokenTree::Punct(bang), TokenTree::Group(arguments), ..]
-            if bang.as_char() == '!'
-                && arguments
-                    .stream()
-                    .into_iter()
-                    .any(|argument| matches!(argument, TokenTree::Literal(_))))
+/// What follows `include` in `include!(concat!(env!("OUT_DIR"), "<file>"))`, with no `..`
+/// in the file: generated code, which lives under `target/`.
+fn is_out_dir_include(after: &[TokenTree]) -> bool {
+    let [TokenTree::Punct(bang), TokenTree::Group(arguments), ..] = after else {
+        return false;
+    };
+    let arguments: Vec<TokenTree> = arguments.stream().into_iter().collect();
+    let [
+        TokenTree::Ident(concat),
+        TokenTree::Punct(concat_bang),
+        TokenTree::Group(parts),
+    ] = arguments.as_slice()
+    else {
+        return false;
+    };
+    let parts: Vec<TokenTree> = parts.stream().into_iter().collect();
+    let [
+        TokenTree::Ident(env),
+        TokenTree::Punct(env_bang),
+        TokenTree::Group(variable),
+        TokenTree::Punct(comma),
+        TokenTree::Literal(file),
+    ] = parts.as_slice()
+    else {
+        return false;
+    };
+    let variable: Vec<TokenTree> = variable.stream().into_iter().collect();
+    let file = file.to_string();
+    bang.as_char() == '!'
+        && concat == "concat"
+        && concat_bang.as_char() == '!'
+        && env == "env"
+        && env_bang.as_char() == '!'
+        && matches!(variable.as_slice(), [TokenTree::Literal(name)] if name.to_string() == "\"OUT_DIR\"")
+        && comma.as_char() == ','
+        && file.starts_with('"')
+        && !file.contains("..")
 }
 
 /// The `#` that makes the bracket group after `before` an attribute: `#[…]` or `#![…]`.
@@ -634,7 +795,7 @@ mod tests {
                     "    mod tests {}",
                     "}",
                 ],
-                (2, CfgTestNotOnItem),
+                (2, MacroCouldHideCode),
             ),
         ] {
             assert_eq!(finding(source), expected, "{source:?}");
@@ -642,34 +803,281 @@ mod tests {
     }
 
     #[test]
-    fn an_include_of_a_file_by_its_path_is_refused_outside_test_code() {
+    fn include_is_refused_anywhere_but_in_an_include_from_out_dir() {
         for (source, line) in [
             (&["pub fn f() {}", "include!(\"tests.rs\");"][..], 2),
+            (&["include!(concat!(\"../tests/\", \"helpers.rs\"));"], 1),
             (
                 &[
-                    "mod logic {",
-                    "    std::include!(\"../tests/helpers.rs\");",
+                    "#[cfg(test)]",
+                    "mod tests {",
+                    "    macro_rules! inc {",
+                    "        ($f:expr) => { include!($f); };",
+                    "    }",
+                    "}",
+                ],
+                4,
+            ),
+            (
+                &["use std::include as inc;", "inc!(\"../tests/helpers.rs\");"],
+                1,
+            ),
+            (
+                &["include!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/src/tests.rs\"));"],
+                1,
+            ),
+            (
+                &["include!(concat!(env!(\"OUT_DIR\"), \"/../../src/tests.rs\"));"],
+                1,
+            ),
+            (
+                &["include!(concat!(env!(\"OUT_DIR\"), \"/gen.rs\", \"x\"));"],
+                1,
+            ),
+            (&["const X: u8 = r#include! { \"x.rs\" };"], 1),
+            (&["fn include() {}"], 1),
+            (
+                &[
+                    "#[cfg(test)]",
+                    "mod tests {",
+                    "    mod again {",
+                    "        include!(\"money.rs\");",
+                    "    }",
+                    "}",
+                ],
+                4,
+            ),
+        ] {
+            assert_eq!(finding(source), (line, Include), "{source:?}");
+        }
+        for source in [
+            &["include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));"][..],
+            &[
+                "mod generated {",
+                "    std::include!(concat!(env!(\"OUT_DIR\"), \"/g.rs\"));",
+                "}",
+            ],
+            &["const TEXT: &str = include_str!(\"../README.md\");"],
+            &["const BYTES: &[u8] = include_bytes!(\"../logo.png\");"],
+        ] {
+            assert!(read(source).is_ok(), "{source:?}");
+        }
+    }
+
+    #[test]
+    fn a_macro_that_names_what_could_hide_code_is_refused_outside_test_code() {
+        for (source, line) in [
+            (
+                &[
+                    "macro_rules! with_attribute {",
+                    "    ($a:meta, $i:item) => { #[$a] $i };",
+                    "}",
+                    "with_attribute!(cfg(not(test)), pub fn shipped() {});",
+                ][..],
+                4,
+            ),
+            (
+                &[
+                    "macro_rules! gated {",
+                    "    ($p:meta, $i:item) => { #[cfg($p)] $i };",
                     "}",
                 ],
                 2,
             ),
-            (&["const X: u8 = r#include! { \"x.rs\", };"], 1),
+            (
+                &[
+                    "macro_rules! with_attribute {",
+                    "    ($a:meta, $i:item) => { #[$a] $i };",
+                    "}",
+                    "with_attribute!(test, fn padding() {});",
+                ],
+                4,
+            ),
+            (
+                &[
+                    "macro_rules! module {",
+                    "    ($name:ident) => { pub mod $name; };",
+                    "}",
+                ],
+                2,
+            ),
+            (
+                &[
+                    "pub fn f() -> u8 {",
+                    "    if cfg!(test) { 1 } else { 0 }",
+                    "}",
+                ],
+                2,
+            ),
+            (
+                &[
+                    "thread_local! {",
+                    "    #[cfg_attr(unix, allow(unused))]",
+                    "    static X: u8 = 1;",
+                    "}",
+                ],
+                2,
+            ),
+            (&["pub fn f() {", "    hide!(r#coverage);", "}"], 2),
+            (
+                &[
+                    "macro_rules! inc {",
+                    "    ($f:expr) => { include!($f); };",
+                    "}",
+                ],
+                2,
+            ),
         ] {
-            assert_eq!(finding(source), (line, IncludeByPath), "{source:?}");
+            assert_eq!(finding(source), (line, MacroCouldHideCode), "{source:?}");
         }
         for source in [
-            &["include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));"][..],
-            &["const TEXT: &str = include_str!(\"../README.md\");"],
+            &[
+                "macro_rules! define_id {",
+                "    ($(#[$attribute:meta])* $name:ident) => {",
+                "        $(#[$attribute])*",
+                "        #[derive(Debug, Clone, Copy)]",
+                "        pub struct $name(u128);",
+                "    };",
+                "}",
+                "define_id!(",
+                "    /// Identifies a user.",
+                "    UserId",
+                ");",
+            ][..],
+            &[
+                "pub fn f(tests: u8) -> String {",
+                "    format!(\"{tests} test\")",
+                "}",
+            ],
             &[
                 "#[cfg(test)]",
                 "mod tests {",
-                "    include!(\"fixtures.rs\");",
+                "    fn f() -> bool {",
+                "        cfg!(test) && matches!(1, 1)",
+                "    }",
                 "}",
             ],
-            &["fn include() {}", "fn f() { include(); }"],
         ] {
             assert!(read(source).is_ok(), "{source:?}");
         }
+    }
+
+    #[test]
+    fn a_cfg_outside_the_allowlist_is_refused_at_its_line() {
+        for source in [
+            &[
+                "pub fn f() {}",
+                "#[cfg(not(debug_assertions))]",
+                "pub fn g() {}",
+            ][..],
+            &["pub fn f() {}", "#[cfg(shipping)]", "pub fn g() {}"],
+            &[
+                "pub fn f() {}",
+                "#[cfg(not(feature = \"cheap\"))]",
+                "pub fn g() {}",
+            ],
+        ] {
+            assert_eq!(finding(source), (2, CfgOutsideAllowlist), "{source:?}");
+        }
+        let allowed = [
+            "#[cfg(unix)]",
+            "mod shutdown;",
+            "#[cfg(all(feature = \"testing\", not(windows)))]",
+            "pub fn g() {}",
+        ];
+        assert!(read(&allowed).is_ok());
+    }
+
+    #[test]
+    fn a_function_body_outside_test_code_is_noted() {
+        for source in [
+            &["pub fn f() {}"][..],
+            &["impl S {", "    pub fn f(&self) {}", "}"],
+            &["pub trait T {", "    fn f(&self) {}", "}"],
+            &["pub static F: fn() -> u8 = || 1;"],
+            &[
+                "#[cfg(any(test, feature = \"testing\"))]",
+                "pub fn helper() {}",
+            ],
+        ] {
+            assert!(read(source).unwrap().has_function_body, "{source:?}");
+        }
+        for source in [
+            &["//! Docs only."][..],
+            &[
+                "mod parser;",
+                "pub use parser::parse;",
+                "pub struct S;",
+                "pub enum E { A }",
+            ],
+            &["pub trait T {", "    fn f(&self);", "}"],
+            &["#[cfg(test)]", "mod tests {", "    fn f() {}", "}"],
+            &["impl S {", "    #[cfg(test)]", "    fn f() {}", "}"],
+            &["unsafe extern \"C\" {", "    fn probe();", "}"],
+        ] {
+            assert!(!read(source).unwrap().has_function_body, "{source:?}");
+        }
+    }
+
+    /// `depth` nested calls inside a function body.
+    fn nested_calls(depth: usize) -> String {
+        format!(
+            "fn id(n: u8) -> u8 {{\n    n\n}}\n\npub fn deep() -> u8 {{\n    {}1{}\n}}\n",
+            "id(".repeat(depth),
+            ")".repeat(depth)
+        )
+    }
+
+    #[test]
+    fn a_source_nested_deeper_than_256_groups_is_refused_before_the_parse() {
+        // The body's braces are one group already, so 256 calls nest 257 deep.
+        let error = Source::read(&nested_calls(256)).unwrap_err();
+        assert_eq!((error.line, error.problem), (6, TooDeep));
+        let error = Source::read(&nested_calls(200_000)).unwrap_err();
+        assert_eq!((error.line, error.problem), (6, TooDeep));
+        let error = Source::check_test_module(&nested_calls(1000)).unwrap_err();
+        assert_eq!((error.line, error.problem), (6, TooDeep));
+    }
+
+    #[test]
+    fn a_source_nested_256_groups_deep_parses_on_a_large_stack() {
+        let read = std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| Source::read(&nested_calls(255)).map(|source| source.line_count))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(read, Ok(7));
+    }
+
+    #[test]
+    fn a_test_module_file_is_checked_for_include_and_path_only() {
+        let refused = [
+            (
+                &["fn helper() {}", "include!(\"../lib.rs\");"][..],
+                (2, Include),
+            ),
+            (
+                &["#[path = \"../lib.rs\"]", "mod copy;"],
+                (1, PathAttribute),
+            ),
+            (
+                &[
+                    "fn f() {",
+                    "    #[cfg_attr(unix, path = \"x.rs\")]",
+                    "    mod x {}",
+                    "}",
+                ],
+                (2, PathAttribute),
+            ),
+            (&["fn broken( {"], (1, Unparsable)),
+        ];
+        for (source, expected) in refused {
+            let error = Source::check_test_module(&(source.join("\n") + "\n")).unwrap_err();
+            assert_eq!((error.line, error.problem), expected, "{source:?}");
+        }
+        let allowed = "#[cfg(not(coverage))]\n#[test]\nfn works() {\n    let test = cfg!(test);\n}\nmod helpers;\n";
+        assert_eq!(Source::check_test_module(allowed), Ok(()));
     }
 
     #[test]

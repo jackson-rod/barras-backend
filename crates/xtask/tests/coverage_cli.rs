@@ -445,8 +445,12 @@ fn an_out_of_line_test_module_named_tests_and_test_support_are_fine() {
     let workspace = Workspace::new()
         .lines("crates/kernel/src/lib.rs", &kernel)
         .file("apps/api/src/main.rs", 100, 100);
-    // cargo-llvm-cov leaves `tests.rs` out of the report, and so does check-coverage.
-    workspace.write("crates/kernel/src/tests.rs", "fn not_parsed( {\n");
+    // cargo-llvm-cov leaves `tests.rs` out of the report, and check-coverage reads it only
+    // for `include` and `#[path]`.
+    workspace.write(
+        "crates/kernel/src/tests.rs",
+        "#[cfg(not(coverage))]\nfn helper() {}\n",
+    );
     let run = workspace.check();
     assert_eq!(run.code, Some(1), "{}", run.stderr);
     assert!(
@@ -684,7 +688,8 @@ fn a_report_that_measures_nothing_fails() {
 
 #[test]
 fn without_a_root_the_workspace_is_this_repository_wherever_the_command_runs() {
-    // A report about another workspace measures nothing here, even from inside it.
+    // A report about another workspace measures nothing here, even from inside it: this
+    // repository's files are then named by no record.
     let other = Workspace::new()
         .file("crates/kernel/src/money.rs", 100, 100)
         .file("apps/api/src/main.rs", 100, 100);
@@ -697,19 +702,18 @@ fn without_a_root_the_workspace_is_this_repository_wherever_the_command_runs() {
             .unwrap(),
     );
     assert_eq!(run.code, Some(1), "{}", run.stdout);
-    assert!(run.stderr.contains("crates/kernel"), "{}", run.stderr);
+    assert_eq!(run.stdout, "");
+    assert!(run.stderr.contains("does not name it"), "{}", run.stderr);
 
-    // A report about the first line of the kernel and of this crate is measured.
+    // A report that runs the first line of every source of this repository passes: each
+    // file with a function body must be named.
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .canonicalize()
         .unwrap();
     let mut own = String::new();
-    for file in ["crates/kernel/src/lib.rs", "crates/xtask/src/main.rs"] {
-        own.push_str(&format!(
-            "SF:{}\nDA:1,1\nend_of_record\n",
-            repository.join(file).display()
-        ));
+    for file in measured_sources_of(&repository) {
+        own.push_str(&format!("SF:{}\nDA:1,1\nend_of_record\n", file.display()));
     }
     fs::write(other.dir.path().join("own.info"), own).unwrap();
     let run = checked(
@@ -720,10 +724,50 @@ fn without_a_root_the_workspace_is_this_repository_wherever_the_command_runs() {
             .unwrap(),
     );
     assert_eq!(run.code, Some(0), "{}", run.stderr);
-    assert_eq!(
-        run.stdout,
-        "crates/kernel: 100.0% (1/1)\ncrates/xtask: 100.0% (1/1)\ntotal: 100.0% (2/2)\n"
-    );
+    for figure in [
+        "crates/kernel: 100.0% (",
+        "crates/xtask: 100.0% (",
+        "total: 100.0% (",
+    ] {
+        assert!(run.stdout.contains(figure), "{figure}: {}", run.stdout);
+    }
+}
+
+/// Every source check-coverage measures in the workspace at `root`: the `.rs` files under
+/// the `src/` of each crate it measures, test modules and hidden entries aside.
+fn measured_sources_of(root: &Path) -> Vec<PathBuf> {
+    let mut pending: Vec<PathBuf> = ["crates/kernel", "crates/bootstrap", "crates/xtask"]
+        .iter()
+        .map(|folder| root.join(folder).join("src"))
+        .collect();
+    for parent in ["apps", "crates/modules", "crates/adapters"] {
+        let Ok(entries) = fs::read_dir(root.join(parent)) else {
+            continue;
+        };
+        for entry in entries {
+            pending.push(entry.unwrap().path().join("src"));
+        }
+    }
+    let mut found = Vec::new();
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_str().unwrap().to_owned();
+            if name.starts_with('.') || name == "tests" || name == "tests.rs" {
+                continue;
+            }
+            if path.is_dir() {
+                pending.push(path);
+            } else if name.ends_with(".rs") {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
 }
 
 #[test]
@@ -735,4 +779,186 @@ fn the_report_is_a_required_argument() {
         "{}",
         run.stderr
     );
+}
+
+/// A workspace of a kernel at 100% and an app at 100%, and the report of a run over it.
+fn a_clean_workspace() -> Workspace {
+    Workspace::new()
+        .file("crates/kernel/src/lib.rs", 100, 100)
+        .file("apps/api/src/main.rs", 100, 100)
+}
+
+#[test]
+fn a_record_line_the_report_does_not_know_is_an_error_naming_the_report() {
+    let workspace = Workspace::new()
+        .lines("crates/kernel/src/lib.rs", &production(90, 10))
+        .file("apps/api/src/main.rs", 100, 100);
+    for (missed, garbled) in [(" DA:91,0", "indented"), ("da:91,0", "lower case")] {
+        let lcov = workspace.lcov.replacen("DA:91,0", missed, 1);
+        let line = lcov.lines().position(|text| text == missed).unwrap() + 1;
+        let garbled_report = Workspace {
+            dir: tempfile::tempdir().unwrap(),
+            lcov,
+        };
+        let run = check(&[&garbled_report.report(), workspace.dir.path()]);
+        assert_eq!(run.code, Some(1), "{garbled}: {}", run.stdout);
+        assert!(
+            run.stderr
+                .contains(&format!("lcov.info is malformed at line {line}")),
+            "{garbled}: {}",
+            run.stderr
+        );
+    }
+}
+
+#[test]
+fn an_error_about_a_file_of_the_report_names_the_report_and_the_line() {
+    let workspace = a_clean_workspace();
+    let line = workspace.lcov.lines().count() + 1;
+    let shared = workspace.write("shared/logic.rs", "pub fn never_tested() {}\n");
+    let run = workspace.record(&shared, &[(1, 0)]).check();
+    assert_eq!(run.code, Some(1), "{}", run.stdout);
+    assert!(
+        run.stderr.contains(&format!("lcov.info:{line}: ")),
+        "{}",
+        run.stderr
+    );
+}
+
+#[test]
+fn a_source_with_code_that_the_report_does_not_name_is_an_error() {
+    // cargo-llvm-cov drops any path with `/rustc/<hex>/`, and `facade` is hex.
+    let workspace = a_clean_workspace().lines(
+        "crates/modules/pricing/src/lib.rs",
+        &[Run("pub mod rustc;"), Run("pub fn tested() {}")],
+    );
+    workspace.write("crates/modules/pricing/src/rustc.rs", "pub mod facade;\n");
+    workspace.write(
+        "crates/modules/pricing/src/rustc/facade.rs",
+        "pub fn never_tested() -> u64 {\n    1\n}\n",
+    );
+    let run = workspace.check();
+    assert_eq!(run.code, Some(1), "{}", run.stdout);
+    assert!(run.stderr.contains("rustc/facade.rs"), "{}", run.stderr);
+
+    // An adapter whose tests never run is absent from the report.
+    let workspace = a_clean_workspace();
+    workspace.write(
+        "crates/adapters/ghost/src/lib.rs",
+        "pub fn never_tested() -> u64 {\n    1\n}\n",
+    );
+    let run = workspace.check();
+    assert_eq!(run.code, Some(1), "{}", run.stdout);
+    assert!(
+        run.stderr.contains("crates/adapters/ghost/src/lib.rs"),
+        "{}",
+        run.stderr
+    );
+}
+
+#[test]
+fn a_source_nested_too_deep_is_an_error_that_names_it_and_never_a_crash() {
+    let workspace = Workspace::new().file("apps/api/src/main.rs", 100, 100);
+    let calls = "id(".repeat(800) + "1" + &")".repeat(800);
+    let path = workspace.write(
+        "crates/kernel/src/lib.rs",
+        &format!(
+            "fn id(n: u64) -> u64 {{\n    n\n}}\n\npub fn deep() -> u64 {{\n    {calls}\n}}\n"
+        ),
+    );
+    let run = workspace
+        .record(&path, &[(1, 1), (2, 1), (5, 1), (6, 1)])
+        .check();
+    assert_eq!(run.code, Some(1), "{}{}", run.stdout, run.stderr);
+    assert!(
+        run.stderr.contains("crates/kernel/src/lib.rs:6: "),
+        "{}",
+        run.stderr
+    );
+}
+
+#[test]
+fn every_shape_check_coverage_cannot_measure_is_an_error_that_names_file_and_line() {
+    for (shape, line) in [
+        ("#[cfg(not(debug_assertions))]\npub fn shipped() {}", 1),
+        ("#[cfg(shipping)]\npub fn shipped() {}", 1),
+        ("#[cfg(not(feature = \"cheap\"))]\npub fn shipped() {}", 1),
+        (
+            "macro_rules! with_attribute {\n    ($a:meta, $i:item) => { #[$a] $i };\n}\nwith_attribute!(cfg(not(test)), pub fn shipped() {});",
+            4,
+        ),
+        (
+            "macro_rules! gated {\n    ($p:meta, $i:item) => { #[cfg($p)] $i };\n}",
+            2,
+        ),
+        (
+            "macro_rules! with_attribute {\n    ($a:meta, $i:item) => { #[$a] $i };\n}\nwith_attribute!(test, fn padding() {});",
+            4,
+        ),
+        (
+            "macro_rules! module {\n    ($name:ident) => { pub mod $name; };\n}",
+            2,
+        ),
+        (
+            "pub fn f() -> u8 {\n    if cfg!(test) { 1 } else { 0 }\n}",
+            2,
+        ),
+        ("include!(concat!(\"../tests/\", \"helpers.rs\"));", 1),
+        ("use std::include as inc;", 1),
+        (
+            "include!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/src/tests.rs\"));",
+            1,
+        ),
+        (
+            "pub fn f() {}\n#[cfg(test)]\nmod tests {\n    include!(\"money.rs\");\n}",
+            4,
+        ),
+    ] {
+        let workspace = Workspace::new().file("apps/api/src/main.rs", 100, 100);
+        let path = workspace.write("crates/kernel/src/lib.rs", &format!("{shape}\n"));
+        let run = workspace.record(&path, &[(1, 1)]).check();
+        assert_eq!(run.code, Some(1), "{shape}: {}", run.stdout);
+        assert!(
+            run.stderr
+                .contains(&format!("crates/kernel/src/lib.rs:{line}: ")),
+            "{shape}: {}",
+            run.stderr
+        );
+    }
+}
+
+#[test]
+fn a_test_module_file_is_read_for_include_and_path() {
+    for (file, text) in [
+        ("crates/kernel/src/tests.rs", "include!(\"lib.rs\");\n"),
+        (
+            "crates/kernel/src/tests/helpers.rs",
+            "#[path = \"../lib.rs\"]\nmod copy;\n",
+        ),
+    ] {
+        let workspace = a_clean_workspace();
+        workspace.write(file, text);
+        let run = workspace.check();
+        assert_eq!(run.code, Some(1), "{file}: {}", run.stdout);
+        assert!(
+            run.stderr.contains(&format!("{file}:1: ")),
+            "{file}: {}",
+            run.stderr
+        );
+    }
+}
+
+#[test]
+fn generated_code_may_be_included_from_out_dir() {
+    let workspace = Workspace::new()
+        .lines(
+            "crates/kernel/src/lib.rs",
+            &[
+                Run("pub fn tested() {}"),
+                Bare("include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));"),
+            ],
+        )
+        .file("apps/api/src/main.rs", 100, 100);
+    let run = workspace.check();
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
 }

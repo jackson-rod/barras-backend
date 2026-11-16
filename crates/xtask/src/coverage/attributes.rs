@@ -20,7 +20,13 @@ pub enum Predicate {
     NamesTest,
     /// `coverage` anywhere, `coverage_nightly` included.
     NamesCoverage,
-    Other,
+    /// Built from `feature = "…"`, `unix`, `windows` and the `target_*` keys with `all`,
+    /// `any` and `not`, and no `not` around a feature: a predicate that holds in the build
+    /// the measure runs whenever it holds in a build that ships.
+    Allowed,
+    /// Anything else: `debug_assertions`, a custom cfg or `not(feature = "…")` compiles
+    /// code that only a build the measure never runs holds.
+    OutsideAllowlist,
 }
 
 pub fn classify(predicate: TokenStream) -> Predicate {
@@ -34,8 +40,40 @@ pub fn classify(predicate: TokenStream) -> Predicate {
         Predicate::TestSupport
     } else if mentions(&tokens, &|word| word == "test", false) {
         Predicate::NamesTest
+    } else if is_allowed(&tokens, false) {
+        Predicate::Allowed
     } else {
-        Predicate::Other
+        Predicate::OutsideAllowlist
+    }
+}
+
+/// Whether `tokens` is one predicate of the allowlist. `under_not` is set inside a `not`,
+/// where a feature is refused: `not(feature = "…")` holds exactly in the builds that leave
+/// the feature off, and the measured build may turn it on.
+fn is_allowed(tokens: &[TokenTree], under_not: bool) -> bool {
+    match tokens {
+        [TokenTree::Ident(word)] => word == "unix" || word == "windows",
+        [
+            TokenTree::Ident(key),
+            TokenTree::Punct(equals),
+            TokenTree::Literal(value),
+        ] if equals.as_char() == '=' && value.to_string().starts_with('"') => {
+            let key = key.to_string();
+            (key == "feature" && !under_not) || key.starts_with("target_")
+        }
+        [TokenTree::Ident(combinator), TokenTree::Group(arguments)]
+            if arguments.delimiter() == Delimiter::Parenthesis =>
+        {
+            let parts = split_at_commas(arguments.stream());
+            if combinator == "all" || combinator == "any" {
+                parts.iter().all(|part| is_allowed(part, under_not))
+            } else if combinator == "not" {
+                matches!(parts.as_slice(), [part] if is_allowed(part, true))
+            } else {
+                false
+            }
+        }
+        _ => false,
     }
 }
 
@@ -61,7 +99,8 @@ pub fn problem_of(meta: &Meta, in_test_code: bool) -> Option<SourceProblem> {
             Predicate::Test => Some(SourceProblem::CfgTestNotOnItem),
             Predicate::NamesTest => Some(SourceProblem::TestInOtherForm),
             Predicate::NamesCoverage => Some(SourceProblem::NamesCoverage),
-            Predicate::TestSupport | Predicate::Other => None,
+            Predicate::OutsideAllowlist => Some(SourceProblem::CfgOutsideAllowlist),
+            Predicate::TestSupport | Predicate::Allowed => None,
         },
         _ if last.as_ref().is_some_and(|word| word == "coverage") => {
             Some(SourceProblem::CoverageAttribute)
@@ -92,7 +131,8 @@ fn cfg_attr_problem(arguments: TokenStream, in_test_code: bool) -> Option<Source
         _ if in_test_code => None,
         Predicate::NamesTest => Some(SourceProblem::TestInOtherForm),
         Predicate::NamesCoverage => Some(SourceProblem::NamesCoverage),
-        Predicate::Test | Predicate::TestSupport | Predicate::Other => None,
+        Predicate::OutsideAllowlist => Some(SourceProblem::CfgOutsideAllowlist),
+        Predicate::Test | Predicate::TestSupport | Predicate::Allowed => None,
     };
     predicate_problem.or_else(|| {
         parts.find_map(|attribute| {
@@ -187,6 +227,14 @@ mod tests {
         assert_eq!(predicate(" test "), Predicate::Test);
         assert!(is_cfg_test(&attribute("cfg(test)")));
         assert!(is_cfg_test(&attribute("cfg( test /* why */ )")));
+        for not_the_mark in [
+            "x::cfg(test)",
+            "cfg::x(test)",
+            "cfg_attr(test)",
+            "cfg = test",
+        ] {
+            assert!(!is_cfg_test(&attribute(not_the_mark)), "{not_the_mark}");
+        }
     }
 
     #[test]
@@ -237,17 +285,50 @@ mod tests {
     }
 
     #[test]
-    fn other_predicates_are_left_alone() {
+    fn features_unix_windows_and_the_target_keys_are_allowed_with_all_any_and_not() {
         for text in [
             "unix",
+            "windows",
             "not(windows)",
             "feature = \"testing\"",
             "feature = \"test-utils\"",
             "target_os = \"linux\"",
+            "target_pointer_width = \"64\"",
+            "not(target_os = \"linux\")",
+            "all(unix, feature = \"testing\")",
+            "any(feature = \"a\", all(windows, target_arch = \"x86_64\"))",
+            "not(any(windows, target_os = \"macos\"))",
+            "all()",
+            "any()",
+        ] {
+            assert_eq!(predicate(text), Predicate::Allowed, "{text}");
+        }
+    }
+
+    #[test]
+    fn anything_else_is_outside_the_allowlist() {
+        for text in [
+            "debug_assertions",
+            "not(debug_assertions)",
+            "shipping",
             "tests",
             "testing",
+            "doc",
+            "docsrs",
+            "miri",
+            "panic = \"abort\"",
+            "not(feature = \"cheap\")",
+            "all(unix, not(feature = \"cheap\"))",
+            "not(any(feature = \"a\", unix))",
+            "not(unix, windows)",
+            "not()",
+            "feature = cheap",
+            "target_os",
+            "r#unix",
+            "any(unix,)",
+            "if(unix)",
         ] {
-            assert_eq!(predicate(text), Predicate::Other, "{text}");
+            assert_eq!(predicate(text), Predicate::OutsideAllowlist, "{text}");
         }
     }
 
@@ -275,6 +356,17 @@ mod tests {
             ("test", TestOutsideTestCode),
             ("tokio::test", TestOutsideTestCode),
             ("cfg_attr(test, test)", TestOutsideTestCode),
+            ("cfg(not(debug_assertions))", CfgOutsideAllowlist),
+            ("cfg(shipping)", CfgOutsideAllowlist),
+            ("cfg(not(feature = \"cheap\"))", CfgOutsideAllowlist),
+            (
+                "cfg_attr(docsrs, doc(cfg(feature = \"x\")))",
+                CfgOutsideAllowlist,
+            ),
+            (
+                "cfg_attr(unix, cfg_attr(shipping, allow(dead_code)))",
+                CfgOutsideAllowlist,
+            ),
         ] {
             assert_eq!(problem(text), Some(expected), "{text}");
         }
@@ -305,7 +397,7 @@ mod tests {
             "cfg(any(test, feature = \"testing\"))",
             "cfg_attr(test, derive(Debug))",
             "cfg_attr(any(test, feature = \"testing\"), allow(dead_code))",
-            "cfg_attr(docsrs, doc(cfg(feature = \"x\")))",
+            "cfg_attr(feature = \"x\", doc = \"x\")",
             "doc = \"cfg(test)\"",
             "doc(cfg(test))",
             "derive(Debug)",

@@ -1,25 +1,41 @@
 //! The LCOV report, read by hand and strictly: anything malformed is an error, never a
 //! record skipped.
 
-use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 use crate::error::XtaskError;
 
-/// Line number to "a test ran it".
-pub type FileLines = BTreeMap<usize, bool>;
+/// The records a report may hold besides `SF`, `DA` and `end_of_record`, which are read.
+/// cargo-llvm-cov 0.9.1 writes `FN`, `FNDA`, `FNF`, `FNH`, `BRF`, `BRH`, `LF` and `LH`; the
+/// rest are LCOV's own. Each repeats or sums the line records, or describes functions and
+/// branches.
+const OTHER_RECORDS: [&str; 11] = [
+    "TN:", "VER:", "FN:", "FNDA:", "FNF:", "FNH:", "BRDA:", "BRF:", "BRH:", "LF:", "LH:",
+];
 
-/// A line counts once, and as run if any record ran it.
-pub fn record(lines: &mut FileLines, line: usize, hit: bool) {
-    *lines.entry(line).or_insert(false) |= hit;
+/// One `SF` record: the source file it names, and its `DA` records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Record {
+    pub path: PathBuf,
+    /// The line of the report that names the file.
+    pub at: usize,
+    pub lines: Vec<LineRecord>,
 }
 
-/// The `DA` records of the LCOV text of the report at `report`, by the source file their
-/// `SF` record names. Every other record repeats or sums these, or describes functions and
-/// branches.
-pub fn parse_lcov(report: &Path, lcov: &str) -> Result<BTreeMap<PathBuf, FileLines>, XtaskError> {
-    let mut files: BTreeMap<PathBuf, FileLines> = BTreeMap::new();
-    let mut open: Option<PathBuf> = None;
+/// One `DA` record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineRecord {
+    /// The line of the source file, numbered from 1.
+    pub line: usize,
+    pub hit: bool,
+    /// The line of the report that holds the record.
+    pub at: usize,
+}
+
+/// The records of the LCOV text of the report at `report`, in the order it gives them.
+pub fn parse_lcov(report: &Path, lcov: &str) -> Result<Vec<Record>, XtaskError> {
+    let mut records = Vec::new();
+    let mut open: Option<Record> = None;
     let mut last = 0;
     for (index, text) in lcov.lines().enumerate() {
         last = index + 1;
@@ -32,18 +48,36 @@ pub fn parse_lcov(report: &Path, lcov: &str) -> Result<BTreeMap<PathBuf, FileLin
             if open.is_some() {
                 return Err(malformed("a record starts inside another"));
             }
-            open = Some(source_path(path).ok_or_else(|| {
+            let path = source_path(path).ok_or_else(|| {
                 malformed("the path of a source file must be absolute and without `..`")
-            })?);
+            })?;
+            open = Some(Record {
+                path,
+                at: last,
+                lines: Vec::new(),
+            });
         } else if let Some(data) = text.strip_prefix("DA:") {
-            let file = open
-                .as_ref()
+            let record = open
+                .as_mut()
                 .ok_or_else(|| malformed("a line record outside a file record"))?;
             let (line, hits) = line_record(data)
                 .ok_or_else(|| malformed("a line record must be `DA:<line>,<hits>`"))?;
-            record(files.entry(file.clone()).or_default(), line, hits > 0);
-        } else if text == "end_of_record" && open.take().is_none() {
-            return Err(malformed("a record ends that never started"));
+            record.lines.push(LineRecord {
+                line,
+                hit: hits > 0,
+                at: last,
+            });
+        } else if text == "end_of_record" {
+            let record = open
+                .take()
+                .ok_or_else(|| malformed("a record ends that never started"))?;
+            records.push(record);
+        } else if !text.is_empty() && !OTHER_RECORDS.iter().any(|kind| text.starts_with(kind)) {
+            // A line record written any other way, indented or in lower case, would drop
+            // its line from the measure.
+            return Err(malformed(
+                "a line that is not an LCOV record, which starts at column 0 with its upper-case name",
+            ));
         }
     }
     if open.is_some() {
@@ -54,7 +88,7 @@ pub fn parse_lcov(report: &Path, lcov: &str) -> Result<BTreeMap<PathBuf, FileLin
             problem: "the last record never ends",
         });
     }
-    Ok(files)
+    Ok(records)
 }
 
 fn source_path(path: &str) -> Option<PathBuf> {
@@ -81,24 +115,32 @@ mod tests {
         lines.join("\n") + "\n"
     }
 
-    fn parse(lcov: &str) -> Result<BTreeMap<PathBuf, FileLines>, XtaskError> {
+    fn parse(lcov: &str) -> Result<Vec<Record>, XtaskError> {
         parse_lcov(Path::new(REPORT), lcov)
     }
 
-    /// One LCOV record: `lines` are (line number, hits).
-    fn one_record(file: &str, lines: &[(usize, u64)]) -> String {
-        let mut record = format!("SF:{file}\n");
-        for (line, hits) in lines {
-            record.push_str(&format!("DA:{line},{hits}\n"));
-        }
-        record.push_str("end_of_record\n");
-        record
+    /// The (source line, hit) pairs of each record, by the path it names.
+    fn lines_of(records: &[Record]) -> Vec<(&str, Vec<(usize, bool)>)> {
+        records
+            .iter()
+            .map(|record| {
+                (
+                    record.path.to_str().unwrap(),
+                    record
+                        .lines
+                        .iter()
+                        .map(|line| (line.line, line.hit))
+                        .collect(),
+                )
+            })
+            .collect()
     }
 
     #[test]
     fn the_line_records_are_read_and_every_other_record_is_ignored() {
         let lcov = text(&[
             "TN:",
+            "VER:2.0",
             "SF:/work/crates/kernel/src/money.rs",
             "FN:3,_RNvCs_6kernel5money",
             "FNDA:7,_RNvCs_6kernel5money",
@@ -113,37 +155,51 @@ mod tests {
             "LF:3",
             "LH:2",
             "end_of_record",
+            "",
             "SF:/work/apps/api/src/main.rs",
             "DA:1,0",
             "end_of_record",
         ]);
         assert_eq!(
-            parse(&lcov).unwrap(),
-            BTreeMap::from([
+            lines_of(&parse(&lcov).unwrap()),
+            [
                 (
-                    PathBuf::from("/work/apps/api/src/main.rs"),
-                    BTreeMap::from([(1, false)])
+                    "/work/crates/kernel/src/money.rs",
+                    vec![(3, true), (4, false), (5, true)]
                 ),
-                (
-                    PathBuf::from("/work/crates/kernel/src/money.rs"),
-                    BTreeMap::from([(3, true), (4, false), (5, true)])
-                ),
-            ])
+                ("/work/apps/api/src/main.rs", vec![(1, false)]),
+            ]
         );
     }
 
     #[test]
-    fn a_file_in_several_records_counts_each_line_once_and_as_run_if_any_record_ran_it() {
-        let file = "/work/crates/kernel/src/id.rs";
-        let lcov = [
-            one_record(file, &[(1, 0), (2, 3), (3, 0)]),
-            one_record("/work/apps/api/src/main.rs", &[(1, 1)]),
-            one_record(file, &[(1, 2), (2, 0), (3, 0), (4, 0)]),
-        ]
-        .concat();
+    fn each_record_keeps_the_report_lines_of_its_file_and_of_its_lines() {
+        let lcov = text(&[
+            "TN:",
+            "SF:/work/a.rs",
+            "DA:9,1",
+            "LF:1",
+            "DA:10,0",
+            "end_of_record",
+        ]);
         assert_eq!(
-            parse(&lcov).unwrap()[Path::new(file)],
-            BTreeMap::from([(1, true), (2, true), (3, false), (4, false)])
+            parse(&lcov).unwrap(),
+            [Record {
+                path: PathBuf::from("/work/a.rs"),
+                at: 2,
+                lines: vec![
+                    LineRecord {
+                        line: 9,
+                        hit: true,
+                        at: 3
+                    },
+                    LineRecord {
+                        line: 10,
+                        hit: false,
+                        at: 5
+                    },
+                ],
+            }]
         );
     }
 
@@ -155,8 +211,17 @@ mod tests {
             "end_of_record",
         ]);
         assert_eq!(
-            parse(&lcov).unwrap()[Path::new("/work/a.rs")],
-            BTreeMap::from([(9, true)])
+            lines_of(&parse(&lcov).unwrap()),
+            [("/work/a.rs", vec![(9, true)])]
+        );
+    }
+
+    fn assert_malformed_at(lcov: &[&str], line: usize) {
+        let error = parse(&text(lcov)).unwrap_err();
+        assert!(
+            matches!(&error, XtaskError::Lcov { report, line: found, .. }
+                if *found == line && report == Path::new(REPORT)),
+            "{lcov:?}: {error}"
         );
     }
 
@@ -195,13 +260,27 @@ mod tests {
                 1,
             ),
         ] {
-            let error = parse(&text(lcov)).unwrap_err();
-            assert!(
-                matches!(&error, XtaskError::Lcov { report, line: found, .. }
-                    if *found == line && report == Path::new(REPORT)),
-                "{lcov:?}: {error}"
-            );
+            assert_malformed_at(lcov, line);
         }
+    }
+
+    #[test]
+    fn a_line_that_is_no_record_is_an_error_that_names_the_report_and_its_line() {
+        for unknown in [
+            " DA:2,0",
+            "\tDA:2,0",
+            "da:2,0",
+            "Da:2,0",
+            "DA :2,0",
+            "\u{feff}DA:2,0",
+            "end_of_record ",
+            " ",
+            "garbage",
+            "LINES:2",
+        ] {
+            assert_malformed_at(&["SF:/work/a.rs", "DA:1,1", unknown, "end_of_record"], 3);
+        }
+        assert_malformed_at(&["\u{feff}SF:/work/a.rs", "DA:1,1", "end_of_record"], 1);
     }
 
     #[test]
@@ -213,28 +292,24 @@ mod tests {
                 &["SF:/work/a.rs", "DA:1,1", "end_of_record", "SF:/work/b.rs"],
                 4,
             ),
-            (&["SF:/work/a.rs", "DA:1,1", "end_of_recor"], 3),
         ] {
-            let error = parse(&text(lcov)).unwrap_err();
-            assert!(
-                matches!(error, XtaskError::Lcov { line: found, .. } if found == line),
-                "{lcov:?}: {error}"
-            );
+            assert_malformed_at(lcov, line);
         }
+        assert_malformed_at(&["SF:/work/a.rs", "DA:1,1", "end_of_recor"], 3);
     }
 
     #[test]
     fn an_empty_text_holds_no_record() {
-        assert_eq!(parse("").unwrap(), BTreeMap::new());
-        assert_eq!(parse("TN:\n\n").unwrap(), BTreeMap::new());
+        assert_eq!(parse("").unwrap(), []);
+        assert_eq!(parse("TN:\n\n").unwrap(), []);
     }
 
     #[test]
     fn windows_line_endings_change_nothing() {
         let lcov = text(&["SF:/work/a.rs", "DA:2,1", "end_of_record"]).replace('\n', "\r\n");
         assert_eq!(
-            parse(&lcov).unwrap()[Path::new("/work/a.rs")],
-            BTreeMap::from([(2, true)])
+            lines_of(&parse(&lcov).unwrap()),
+            [("/work/a.rs", vec![(2, true)])]
         );
     }
 }

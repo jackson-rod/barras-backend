@@ -1,5 +1,6 @@
-//! The one walk over a folder that every check uses. It never follows a symlink, so a
-//! link can neither lead a check out of the folder it reads nor hide what it points at.
+//! The one walk over a folder that check-arch and check-coverage share. It never follows a
+//! symlink, so a link can neither lead a check out of the folder it reads nor hide what it
+//! points at.
 
 use std::fs::{self, FileType};
 use std::path::{Path, PathBuf};

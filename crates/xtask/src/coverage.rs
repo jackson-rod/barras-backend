@@ -14,7 +14,7 @@ use std::ops::AddAssign;
 use std::path::{Path, PathBuf};
 
 pub use bars::{BarFailure, judge};
-use lcov::{FileLines, parse_lcov, record};
+use lcov::{Record, parse_lcov};
 use source::Source;
 use sources::{measured_crates, read_sources};
 
@@ -94,6 +94,9 @@ pub fn measure_coverage_file(root: &Path, report: &Path) -> Result<CoverageRepor
     measure_coverage(root, report, &lcov)
 }
 
+/// Line number to "a test ran it", a line counted once, and as run if any record ran it.
+type FileLines = BTreeMap<usize, bool>;
+
 /// Counts, crate by crate, the production lines that the LCOV text `lcov`, read from
 /// `report`, measured in the workspace at `root`.
 pub fn measure_coverage(
@@ -108,41 +111,25 @@ pub fn measure_coverage(
     let crates = measured_crates(&root)?;
     let sources = read_sources(&root, &crates)?;
     let mut measured: BTreeMap<PathBuf, FileLines> = BTreeMap::new();
-    for (file, lines) in records {
-        let Some(relative) = inside(&root, &file) else {
-            continue;
-        };
-        let path = root.join(&relative);
-        let kind = fs::symlink_metadata(&path)
-            .map_err(XtaskError::io(&path))?
-            .file_type();
-        if !kind.is_file() {
-            return Err(XtaskError::NotARegularFile { path });
-        }
-        match place_of(&relative) {
-            Place::Unmeasured => {}
-            Place::Stray => return Err(XtaskError::StrayFile { path: relative }),
-            Place::Source if sources.contains_key(&relative) => {
-                let merged = measured.entry(relative).or_default();
-                for (line, hit) in lines {
-                    record(merged, line, hit);
-                }
+    for record in &records {
+        merge(&root, &sources, record, &mut measured).map_err(|(line, error)| {
+            XtaskError::InReport {
+                report: report.to_path_buf(),
+                line,
+                error: Box::new(error),
             }
-            // cargo-llvm-cov leaves test modules out; a report that names one anyway still
-            // measures test code there.
-            Place::Source if is_test_module_file(&relative) => {}
-            Place::Source => return Err(XtaskError::NotRead { path: relative }),
-        }
+        })?;
     }
-    let mut figures: BTreeMap<PathBuf, Lines> = BTreeMap::new();
-    for (file, lines) in &measured {
-        let (Some(source), Some(folder)) = (sources.get(file), crate_folder(file)) else {
-            continue;
-        };
-        let counted = production_lines(file, source, lines)?;
-        if counted.found > 0 {
-            *figures.entry(folder.to_path_buf()).or_default() += counted;
-        }
+    // A file the report does not name has no figure: a crate whose tests never ran, or a
+    // path cargo-llvm-cov drops by default (any with `/rustc/<hex>/`), would escape the bars.
+    if let Some((path, _)) = sources
+        .iter()
+        .find(|(path, source)| source.has_function_body && !measured.contains_key(*path))
+    {
+        return Err(XtaskError::Unreported {
+            report: report.to_path_buf(),
+            path: path.clone(),
+        });
     }
     let required = crates
         .into_iter()
@@ -150,9 +137,79 @@ pub fn measure_coverage(
         .chain([PathBuf::from(KERNEL_DIR)])
         .collect();
     Ok(CoverageReport {
-        crates: figures,
+        crates: figures(&sources, &measured),
         required,
     })
+}
+
+/// Adds the lines of `record` to those `measured` holds for its file. An error comes with
+/// the line of the report it is about.
+fn merge(
+    root: &Path,
+    sources: &BTreeMap<PathBuf, Source>,
+    record: &Record,
+    measured: &mut BTreeMap<PathBuf, FileLines>,
+) -> Result<(), (usize, XtaskError)> {
+    let Some(relative) = inside(root, &record.path) else {
+        return Ok(());
+    };
+    let path = root.join(&relative);
+    let kind = fs::symlink_metadata(&path)
+        .map_err(|error| (record.at, XtaskError::io(&path)(error)))?
+        .file_type();
+    if !kind.is_file() {
+        return Err((record.at, XtaskError::NotARegularFile { path }));
+    }
+    let source = match (place_of(&relative), sources.get(&relative)) {
+        (Place::Unmeasured, _) => return Ok(()),
+        (Place::Stray, _) => return Err((record.at, XtaskError::StrayFile { path: relative })),
+        (Place::Source, Some(source)) => source,
+        // cargo-llvm-cov leaves test modules out; a report that names one anyway still
+        // measures test code there.
+        (Place::Source, None) if is_test_module_file(&relative) => return Ok(()),
+        (Place::Source, None) => {
+            return Err((record.at, XtaskError::NotRead { path: relative }));
+        }
+    };
+    if let Some(past) = record
+        .lines
+        .iter()
+        .find(|line| line.line > source.line_count)
+    {
+        // The test items are found in the file as it is now, so the lines of a report
+        // older than it would be the wrong ones.
+        return Err((
+            past.at,
+            XtaskError::StaleReport {
+                path: relative,
+                line: past.line,
+                length: source.line_count,
+            },
+        ));
+    }
+    let merged = measured.entry(relative).or_default();
+    for line in &record.lines {
+        *merged.entry(line.line).or_insert(false) |= line.hit;
+    }
+    Ok(())
+}
+
+/// The production lines of each measured crate that has any, by its folder.
+fn figures(
+    sources: &BTreeMap<PathBuf, Source>,
+    measured: &BTreeMap<PathBuf, FileLines>,
+) -> BTreeMap<PathBuf, Lines> {
+    let mut figures: BTreeMap<PathBuf, Lines> = BTreeMap::new();
+    for (file, lines) in measured {
+        let (Some(source), Some(folder)) = (sources.get(file), crate_folder(file)) else {
+            continue;
+        };
+        let counted = production_lines(source, lines);
+        if counted.found > 0 {
+            *figures.entry(folder.to_path_buf()).or_default() += counted;
+        }
+    }
+    figures
 }
 
 /// Where a file of the report sits, as far as the measure is concerned.
@@ -238,27 +295,18 @@ fn resolved_folders(file: &Path) -> PathBuf {
         .unwrap_or_else(|| file.to_path_buf())
 }
 
-/// The lines of the report for the source `file` that are production lines.
-fn production_lines(file: &Path, source: &Source, lines: &FileLines) -> Result<Lines, XtaskError> {
+/// The lines of the report for `source` that are production lines.
+fn production_lines(source: &Source, lines: &FileLines) -> Lines {
     let mut counted = Lines::default();
-    for (&line, &hit) in lines {
-        if line > source.line_count {
-            // The test items are found in the file as it is now, so the lines of a report
-            // older than it would be the wrong ones.
-            return Err(XtaskError::StaleReport {
-                path: file.to_path_buf(),
-                line,
-                length: source.line_count,
-            });
-        }
-        if !source.test_lines.contains(&line) {
+    for (line, hit) in lines {
+        if !source.test_lines.contains(line) {
             counted += Lines {
-                hit: u64::from(hit),
+                hit: u64::from(*hit),
                 found: 1,
             };
         }
     }
-    Ok(counted)
+    counted
 }
 
 #[cfg(test)]
@@ -307,6 +355,18 @@ mod tests {
 
     fn measure(root: &Path, lcov: &str) -> Result<CoverageReport, XtaskError> {
         measure_coverage(root, Path::new(REPORT), lcov)
+    }
+
+    /// The error about what line `line` of the report names; any other error fails the test.
+    fn at_report_line(error: &XtaskError, line: usize) -> &XtaskError {
+        match error {
+            XtaskError::InReport {
+                report,
+                line: at,
+                error,
+            } if report == Path::new(REPORT) && *at == line => error,
+            other => panic!("no error at line {line} of the report: {other}"),
+        }
     }
 
     fn figures(crates: &[(&str, u64, u64)]) -> BTreeMap<PathBuf, Lines> {
@@ -473,7 +533,8 @@ mod tests {
             let file = plain_source(root.path(), stray, 1);
             let error = measure(root.path(), &record_of(&file, &[(1, 0)])).unwrap_err();
             assert!(
-                matches!(&error, XtaskError::StrayFile { path } if path == Path::new(stray)),
+                matches!(at_report_line(&error, 1), XtaskError::StrayFile { path }
+                    if path == Path::new(stray)),
                 "{stray}: {error}"
             );
         }
@@ -490,7 +551,8 @@ mod tests {
             let file = plain_source(root.path(), not_read, 1);
             let error = measure(root.path(), &record_of(&file, &[(1, 0)])).unwrap_err();
             assert!(
-                matches!(&error, XtaskError::NotRead { path } if path == Path::new(not_read)),
+                matches!(at_report_line(&error, 1), XtaskError::NotRead { path }
+                    if path == Path::new(not_read)),
                 "{not_read}: {error}"
             );
         }
@@ -575,7 +637,8 @@ mod tests {
         ] {
             let error = measure(real.path(), &record_of(&gone, &lines_run(1, 1))).unwrap_err();
             assert!(
-                matches!(&error, XtaskError::Io { path, .. } if path.file_name() == gone.file_name()),
+                matches!(at_report_line(&error, 1), XtaskError::Io { path, .. }
+                    if path.file_name() == gone.file_name()),
                 "{}: {error}",
                 gone.display()
             );
@@ -600,11 +663,92 @@ mod tests {
         for named in [link, fifo, real.join("crates/kernel/src")] {
             let error = measure(root.path(), &record_of(&named, &[(1, 1)])).unwrap_err();
             assert!(
-                matches!(&error, XtaskError::NotARegularFile { path } if *path == named),
+                matches!(at_report_line(&error, 1), XtaskError::NotARegularFile { path }
+                    if *path == named),
                 "{}: {error}",
                 named.display()
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_reached_through_a_link_to_outside_is_judged_where_the_report_spells_it() {
+        let root = workspace(&["crates/kernel"]);
+        let elsewhere = tempfile::tempdir().unwrap();
+        plain_source(elsewhere.path(), "logic.rs", 1);
+        std::os::unix::fs::symlink(elsewhere.path(), root.path().join("shared")).unwrap();
+        let spelled = root.path().canonicalize().unwrap().join("shared/logic.rs");
+        let error = measure(root.path(), &record_of(&spelled, &[(1, 0)])).unwrap_err();
+        assert!(
+            matches!(at_report_line(&error, 1), XtaskError::StrayFile { path }
+                if path == Path::new("shared/logic.rs")),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_the_report_names_is_refused_even_when_it_points_inside() {
+        let root = workspace(&["crates/kernel"]);
+        plain_source(root.path(), "crates/kernel/src/lib.rs", 1);
+        let real = root.path().canonicalize().unwrap();
+        let link = real.join("crates/kernel/tests/copy.rs");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink("../src/lib.rs", &link).unwrap();
+        let error = measure(root.path(), &record_of(&link, &[(1, 1)])).unwrap_err();
+        assert!(
+            matches!(at_report_line(&error, 1), XtaskError::NotARegularFile { path }
+                if *path == link),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_source_with_a_function_body_must_be_named_by_the_report() {
+        let root = workspace(&["crates/kernel", "crates/adapters/ghost"]);
+        let lcov = record_of(
+            &plain_source(root.path(), "crates/kernel/src/lib.rs", 1),
+            &lines_run(1, 1),
+        );
+        write(
+            root.path(),
+            "crates/kernel/src/types.rs",
+            &["pub struct Price(u64);", "pub use std::fs;"],
+        );
+        write(
+            root.path(),
+            "crates/kernel/src/fixtures.rs",
+            &["#[cfg(test)]", "pub fn fixture() {}"],
+        );
+        assert!(measure(root.path(), &lcov).is_ok());
+        write(
+            root.path(),
+            "crates/adapters/ghost/src/lib.rs",
+            &["pub fn never_tested() {}"],
+        );
+        let error = measure(root.path(), &lcov).unwrap_err();
+        assert!(
+            matches!(&error, XtaskError::Unreported { report, path }
+                if report == Path::new(REPORT)
+                    && path == Path::new("crates/adapters/ghost/src/lib.rs")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_file_in_several_records_counts_each_line_once_and_as_run_if_any_record_ran_it() {
+        let root = workspace(&["crates/kernel"]);
+        let file = plain_source(root.path(), "crates/kernel/src/id.rs", 4);
+        let lcov = [
+            record_of(&file, &[(1, 0), (2, 3), (3, 0)]),
+            record_of(&file, &[(1, 2), (2, 0), (3, 0), (4, 0)]),
+        ]
+        .concat();
+        assert_eq!(
+            measure(root.path(), &lcov).unwrap().crates,
+            figures(&[("crates/kernel", 2, 4)])
+        );
     }
 
     #[test]
@@ -613,7 +757,7 @@ mod tests {
         let file = plain_source(root.path(), "crates/kernel/src/id.rs", 3);
         let error = measure(root.path(), &record_of(&file, &[(3, 1), (4, 1)])).unwrap_err();
         assert!(
-            matches!(&error, XtaskError::StaleReport { path, line: 4, length: 3 }
+            matches!(at_report_line(&error, 3), XtaskError::StaleReport { path, line: 4, length: 3 }
                 if path == Path::new("crates/kernel/src/id.rs")),
             "{error}"
         );
