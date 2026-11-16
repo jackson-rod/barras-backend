@@ -4,7 +4,7 @@
 use std::collections::BTreeSet;
 
 use proc_macro2::extra::invalidate_current_thread_spans;
-use proc_macro2::{Delimiter, LexError, LineColumn, Span, TokenStream, TokenTree};
+use proc_macro2::{Delimiter, Ident, LexError, LineColumn, Span, TokenStream, TokenTree};
 use syn::ext::IdentExt;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
@@ -13,23 +13,35 @@ use syn::{
     Macro, Meta, TraitItem, TraitItemFn,
 };
 
-use super::attributes::{is_cfg_test, problem_of};
+use super::attributes::{is_cfg_gate, is_cfg_test, is_named, problem_of};
 use crate::error::SourceProblem;
 
-/// Deeper than code a person writes. Within it, the parse fits the stack it runs on.
+/// Brackets nested deeper than code a person writes. Within it, the parse fits the stack
+/// it runs on. A long chain without brackets, such as `!!!…x` or `Vec<Vec<…>>` a hundred
+/// thousand deep, can still exhaust that stack: check-coverage then stops without naming
+/// the file, and the gate fails.
 const MAX_DEPTH: usize = 256;
-
-/// What a macro outside test code may not name: macros are not expanded, so one that
-/// names any of these could produce any shape the measure refuses.
-const MACRO_REFUSED: [&str; 6] = ["cfg", "cfg_attr", "coverage", "test", "include", "mod"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Source {
     pub line_count: usize,
     /// The lines, numbered from 1, that hold test code and nothing else.
     pub test_lines: BTreeSet<usize>,
-    /// A function or closure body outside test code: the report must then name the file.
+    /// A function or closure body outside test code and under no cfg: unless the `mod`
+    /// that declares the file carries one, the report must name the file.
     pub has_function_body: bool,
+    /// The out-of-line `mod` lines outside test code, for the files they declare.
+    pub modules: Vec<ModuleLine>,
+}
+
+/// An out-of-line `mod` line of a source file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleLine {
+    /// The names of the inline modules around it, outermost first, then its own name.
+    pub path: Vec<String>,
+    /// It, or an item or a module around it, carries a cfg other than the test mark: the
+    /// file it declares may be compiled out of the measured build.
+    pub gated: bool,
 }
 
 /// A shape check-coverage refuses, at the line where it starts.
@@ -72,6 +84,7 @@ impl Source {
             line_count: text.lines().count(),
             test_lines,
             has_function_body: walk.has_function_body,
+            modules: walk.modules,
         })
     }
 
@@ -109,8 +122,8 @@ fn tokenize(text: &str) -> Result<TokenStream, Finding> {
     Ok(tokens)
 }
 
-/// The line where the first group deeper than `MAX_DEPTH` opens, if any. The walk keeps
-/// its own stack, so that no depth can exhaust the thread's.
+/// The line where the first bracket deeper than `MAX_DEPTH` opens, if any. The walk keeps
+/// its own stack, so that no nesting of brackets can exhaust the thread's.
 fn too_deep(tokens: &TokenStream) -> Option<usize> {
     let mut open = vec![tokens.clone().into_iter()];
     while let Some(next) = open.last_mut().map(Iterator::next) {
@@ -142,8 +155,9 @@ impl Drop for SpanScope {
     }
 }
 
-/// Finds the test items, at any depth, the function bodies outside them, the macros that
-/// could hide code, and the modules whose files the measure would miss.
+/// Finds the test items, at any depth, the function bodies outside them and outside every
+/// cfg, the `mod` lines, the `macro_rules!` bodies that could hide code, and the modules
+/// whose files the measure would miss.
 #[derive(Default)]
 struct ItemWalk {
     /// Where each test item starts and ends, its attributes and doc comments included.
@@ -151,11 +165,22 @@ struct ItemWalk {
     /// The names of the inline modules around the walk, innermost last.
     inline_modules: Vec<String>,
     in_test_code: bool,
+    /// How many items around the walk carry a cfg other than the test mark.
+    gates: usize,
     has_function_body: bool,
+    modules: Vec<ModuleLine>,
     findings: Vec<Finding>,
 }
 
 impl<'ast> Visit<'ast> for ItemWalk {
+    fn visit_file(&mut self, file: &'ast syn::File) {
+        // `#![cfg(…)]` at the top of a file gates the whole module, as on its `mod` line.
+        let gated = is_gated(&file.attrs);
+        self.gates += usize::from(gated);
+        visit::visit_file(self, file);
+        self.gates -= usize::from(gated);
+    }
+
     fn visit_item(&mut self, item: &'ast Item) {
         self.enter(item_attributes(item), item, |walk| {
             visit::visit_item(walk, item);
@@ -188,8 +213,17 @@ impl<'ast> Visit<'ast> for ItemWalk {
             });
         }
         let inline = module.content.is_some();
+        let name = module.ident.unraw().to_string();
+        if !inline && !self.in_test_code {
+            let mut path = self.inline_modules.clone();
+            path.push(name.clone());
+            self.modules.push(ModuleLine {
+                path,
+                gated: self.gates > 0,
+            });
+        }
         if inline {
-            self.inline_modules.push(module.ident.unraw().to_string());
+            self.inline_modules.push(name);
         }
         visit::visit_item_mod(self, module);
         if inline {
@@ -219,40 +253,45 @@ impl<'ast> Visit<'ast> for ItemWalk {
         visit::visit_expr_closure(self, closure);
     }
 
+    /// Only a `macro_rules!` definition outside test code is judged: any other macro call
+    /// names only what its expansion compiles in both builds, and `cfg!(…)` compiles both
+    /// branches, so neither hides code.
     fn visit_macro(&mut self, called: &'ast Macro) {
-        if !self.in_test_code
-            && let Some(line) = first_refused_word(&called.tokens)
-        {
-            self.findings.push(Finding {
-                line,
-                problem: SourceProblem::MacroCouldHideCode,
-            });
+        if !self.in_test_code && is_named(&called.path, "macro_rules") {
+            judge_macro_rules_body(&called.tokens, &mut self.findings);
         }
         visit::visit_macro(self, called);
     }
 }
 
 impl ItemWalk {
-    /// Visits an item, as test code from there down when it carries exactly `#[cfg(test)]`.
+    /// Visits an item: as test code from there down when it carries exactly `#[cfg(test)]`,
+    /// and as gated code when it carries another cfg.
     fn enter<T: Spanned>(
         &mut self,
         attributes: &[Attribute],
         item: &T,
         visit: impl FnOnce(&mut Self),
     ) {
-        if self.in_test_code || !is_test_item(attributes) {
-            visit(self);
-            return;
+        let marks_tests = !self.in_test_code && is_test_item(attributes);
+        let gated = is_gated(attributes);
+        if marks_tests {
+            let span = item.span();
+            self.test_items.push((span.start(), span.end()));
+            self.in_test_code = true;
         }
-        let span = item.span();
-        self.test_items.push((span.start(), span.end()));
-        self.in_test_code = true;
+        self.gates += usize::from(gated);
         visit(self);
-        self.in_test_code = false;
+        self.gates -= usize::from(gated);
+        if marks_tests {
+            self.in_test_code = false;
+        }
     }
 
+    /// A body under a cfg may be compiled out of the measured build, a platform's code on
+    /// another platform or a feature left off, so it does not make the report name its file.
     fn note_a_body(&mut self) {
-        if !self.in_test_code {
+        if !self.in_test_code && self.gates == 0 {
             self.has_function_body = true;
         }
     }
@@ -277,24 +316,54 @@ impl ItemWalk {
     }
 }
 
-/// The line of the first identifier of `tokens`, at any depth, that a macro may not name.
-fn first_refused_word(tokens: &TokenStream) -> Option<usize> {
-    let mut open = vec![tokens.clone().into_iter()];
-    while let Some(next) = open.last_mut().map(Iterator::next) {
-        match next {
-            Some(TokenTree::Group(group)) => open.push(group.stream().into_iter()),
-            Some(TokenTree::Ident(word))
-                if MACRO_REFUSED.iter().any(|refused| word.unraw() == *refused) =>
-            {
-                return Some(word.span().start().line);
+/// What a `macro_rules!` body outside test code may not write: the keyword `mod`, whose
+/// module and file would escape the module rules, and a test attribute, whose test would
+/// count as production wherever the macro is called. Its other attributes and its
+/// `include!` are judged by the token scan, as everywhere. An attribute whose path is a
+/// metavariable, `#[$meta]`, carries what its caller writes, and is not refused.
+fn judge_macro_rules_body(body: &TokenStream, findings: &mut Vec<Finding>) {
+    let tokens: Vec<TokenTree> = body.clone().into_iter().collect();
+    for (index, token) in tokens.iter().enumerate() {
+        match token {
+            // `r#mod` is a name, not the keyword, and declares nothing.
+            TokenTree::Ident(word) if word == "mod" => findings.push(Finding {
+                line: word.span().start().line,
+                problem: SourceProblem::MacroWritesModule,
+            }),
+            TokenTree::Group(group) => {
+                if group.delimiter() == Delimiter::Bracket
+                    && let Some(pound) = attribute_pound(&tokens[..index])
+                    && writes_a_test(group.stream())
+                {
+                    findings.push(Finding {
+                        line: pound.start().line,
+                        problem: SourceProblem::MacroWritesTests,
+                    });
+                }
+                judge_macro_rules_body(&group.stream(), findings);
             }
-            Some(_) => {}
-            None => {
-                open.pop();
-            }
+            _ => {}
         }
     }
-    None
+}
+
+/// `#[test]`, `#[cfg(test)]` or another attribute named `test`, written with its path.
+fn writes_a_test(content: TokenStream) -> bool {
+    let Ok(meta) = syn::parse2::<Meta>(content) else {
+        return false;
+    };
+    is_cfg_test(&meta)
+        || meta
+            .path()
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident.unraw() == "test")
+}
+
+fn is_gated(attributes: &[Attribute]) -> bool {
+    attributes
+        .iter()
+        .any(|attribute| is_cfg_gate(&attribute.meta))
 }
 
 fn is_test_item(attributes: &[Attribute]) -> bool {
@@ -375,16 +444,8 @@ impl TokenScan<'_> {
         for (index, token) in tokens.iter().enumerate() {
             let TokenTree::Group(group) = token else {
                 self.note(token.span());
-                if let TokenTree::Ident(word) = token
-                    && word.unraw() == "include"
-                    && !is_out_dir_include(&tokens[index + 1..])
-                {
-                    // Test code too: an included file is measured, or dropped, under its
-                    // own path, so a test build could run production code no line counts.
-                    self.findings.push(Finding {
-                        line: word.span().start().line,
-                        problem: SourceProblem::Include,
-                    });
+                if let TokenTree::Ident(word) = token {
+                    self.judge_include(word, &tokens[index + 1..]);
                 }
                 continue;
             };
@@ -396,6 +457,28 @@ impl TokenScan<'_> {
                 self.judge_attribute(pound, group.stream());
             }
             self.scan(group.stream());
+        }
+    }
+
+    /// `include!`, other than from `OUT_DIR`, and a `use` that names `include`, which would
+    /// let it be called by another name. Test code too: an included file is measured, or
+    /// dropped, under its own path, so a test build could run production code no line
+    /// counts. A field, a method or a variable named `include` is none of these.
+    fn judge_include(&mut self, word: &Ident, after: &[TokenTree]) {
+        let line = if word.unraw() == "include" {
+            let called =
+                matches!(after.first(), Some(TokenTree::Punct(bang)) if bang.as_char() == '!');
+            (called && !is_out_dir_include(after)).then(|| word.span().start().line)
+        } else if word == "use" {
+            use_names_include(after)
+        } else {
+            None
+        };
+        if let Some(line) = line {
+            self.findings.push(Finding {
+                line,
+                problem: SourceProblem::Include,
+            });
         }
     }
 
@@ -427,6 +510,29 @@ impl TokenScan<'_> {
             });
         }
     }
+}
+
+/// The line of `include` in the path of the `use` declaration that `after` follows, up to its
+/// `;`. `use<…>` after `impl Trait +` captures generics, and is no declaration.
+fn use_names_include(after: &[TokenTree]) -> Option<usize> {
+    if matches!(after.first(), Some(TokenTree::Punct(open)) if open.as_char() == '<') {
+        return None;
+    }
+    let mut open = vec![after.iter().cloned().collect::<TokenStream>().into_iter()];
+    while let Some(next) = open.last_mut().map(Iterator::next) {
+        match next {
+            Some(TokenTree::Punct(end)) if end.as_char() == ';' && open.len() == 1 => return None,
+            Some(TokenTree::Ident(name)) if name.unraw() == "include" => {
+                return Some(name.span().start().line);
+            }
+            Some(TokenTree::Group(group)) => open.push(group.stream().into_iter()),
+            Some(_) => {}
+            None => {
+                open.pop();
+            }
+        }
+    }
+    None
 }
 
 /// What follows `include` in `include!(concat!(env!("OUT_DIR"), "<file>"))`, with no `..`
@@ -795,7 +901,7 @@ mod tests {
                     "    mod tests {}",
                     "}",
                 ],
-                (2, MacroCouldHideCode),
+                (2, CfgTestNotOnItem),
             ),
         ] {
             assert_eq!(finding(source), expected, "{source:?}");
@@ -803,7 +909,7 @@ mod tests {
     }
 
     #[test]
-    fn include_is_refused_anywhere_but_in_an_include_from_out_dir() {
+    fn include_is_refused_when_called_or_imported_unless_from_out_dir() {
         for (source, line) in [
             (&["pub fn f() {}", "include!(\"tests.rs\");"][..], 2),
             (&["include!(concat!(\"../tests/\", \"helpers.rs\"));"], 1),
@@ -822,6 +928,8 @@ mod tests {
                 &["use std::include as inc;", "inc!(\"../tests/helpers.rs\");"],
                 1,
             ),
+            (&["use std::{fs, include as inc};"], 1),
+            (&["pub use core::include;"], 1),
             (
                 &["include!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/src/tests.rs\"));"],
                 1,
@@ -835,7 +943,6 @@ mod tests {
                 1,
             ),
             (&["const X: u8 = r#include! { \"x.rs\" };"], 1),
-            (&["fn include() {}"], 1),
             (
                 &[
                     "#[cfg(test)]",
@@ -859,22 +966,78 @@ mod tests {
             ],
             &["const TEXT: &str = include_str!(\"../README.md\");"],
             &["const BYTES: &[u8] = include_bytes!(\"../logo.png\");"],
+            &[
+                "pub struct Query {",
+                "    pub include: Vec<String>,",
+                "}",
+                "impl Query {",
+                "    pub fn include(&self) -> bool {",
+                "        let include = !self.include.is_empty();",
+                "        include",
+                "    }",
+                "}",
+            ],
+            &[
+                "pub fn wants(query: Query) -> Query {",
+                "    Query { include: vec![] }",
+                "}",
+            ],
+            &[
+                "pub fn sized() -> impl Sized + use<> {",
+                "    include_nothing()",
+                "}",
+            ],
+            &[
+                "use std::fs;",
+                "pub fn f(include: bool) -> bool {",
+                "    include",
+                "}",
+            ],
         ] {
             assert!(read(source).is_ok(), "{source:?}");
         }
     }
 
     #[test]
-    fn a_macro_that_names_what_could_hide_code_is_refused_outside_test_code() {
-        for (source, line) in [
+    fn a_macro_rules_body_may_not_write_mod_or_tests_outside_test_code() {
+        for (source, expected) in [
             (
                 &[
-                    "macro_rules! with_attribute {",
-                    "    ($a:meta, $i:item) => { #[$a] $i };",
+                    "macro_rules! module {",
+                    "    ($name:ident) => { pub mod $name; };",
                     "}",
-                    "with_attribute!(cfg(not(test)), pub fn shipped() {});",
                 ][..],
-                4,
+                (2, MacroWritesModule),
+            ),
+            (
+                &[
+                    "macro_rules! padding {",
+                    "    () => {",
+                    "        #[test]",
+                    "        fn padding() {}",
+                    "    };",
+                    "}",
+                ],
+                (3, MacroWritesTests),
+            ),
+            (
+                &[
+                    "macro_rules! fakes {",
+                    "    () => {",
+                    "        #[cfg(test)]",
+                    "        mod fakes {}",
+                    "    };",
+                    "}",
+                ],
+                (3, MacroWritesTests),
+            ),
+            (
+                &[
+                    "macro_rules! async_test {",
+                    "    () => { #[tokio::test] async fn works() {} };",
+                    "}",
+                ],
+                (2, MacroWritesTests),
             ),
             (
                 &[
@@ -882,53 +1045,34 @@ mod tests {
                     "    ($p:meta, $i:item) => { #[cfg($p)] $i };",
                     "}",
                 ],
-                2,
+                (2, CfgOutsideAllowlist),
             ),
             (
                 &[
-                    "macro_rules! with_attribute {",
-                    "    ($a:meta, $i:item) => { #[$a] $i };",
+                    "macro_rules! shipped {",
+                    "    () => { #[cfg(not(debug_assertions))] pub fn f() {} };",
                     "}",
-                    "with_attribute!(test, fn padding() {});",
                 ],
-                4,
+                (2, CfgOutsideAllowlist),
             ),
             (
                 &[
-                    "macro_rules! module {",
-                    "    ($name:ident) => { pub mod $name; };",
+                    "macro_rules! unmeasured {",
+                    "    () => { #[coverage(off)] pub fn f() {} };",
                     "}",
                 ],
-                2,
+                (2, CoverageAttribute),
             ),
-            (
-                &[
-                    "pub fn f() -> u8 {",
-                    "    if cfg!(test) { 1 } else { 0 }",
-                    "}",
-                ],
-                2,
-            ),
-            (
-                &[
-                    "thread_local! {",
-                    "    #[cfg_attr(unix, allow(unused))]",
-                    "    static X: u8 = 1;",
-                    "}",
-                ],
-                2,
-            ),
-            (&["pub fn f() {", "    hide!(r#coverage);", "}"], 2),
             (
                 &[
                     "macro_rules! inc {",
-                    "    ($f:expr) => { include!($f); };",
+                    "    ($f:expr) => { include!($f) };",
                     "}",
                 ],
-                2,
+                (2, Include),
             ),
         ] {
-            assert_eq!(finding(source), (line, MacroCouldHideCode), "{source:?}");
+            assert_eq!(finding(source), expected, "{source:?}");
         }
         for source in [
             &[
@@ -945,15 +1089,54 @@ mod tests {
                 ");",
             ][..],
             &[
-                "pub fn f(tests: u8) -> String {",
-                "    format!(\"{tests} test\")",
+                "macro_rules! check {",
+                "    ($test:expr) => {",
+                "        assert!($test)",
+                "    };",
+                "}",
+            ],
+            &[
+                "macro_rules! run {",
+                "    () => { crate::r#mod::run() };",
+                "}",
+            ],
+            &[
+                "macro_rules! with_attribute {",
+                "    ($a:meta, $i:item) => { #[$a] $i };",
+                "}",
+            ],
+            &[
+                "pub fn port(cfg: &Config) -> String {",
+                "    format!(\"port {}\", cfg.port)",
+                "}",
+            ],
+            &[
+                "impl fmt::Display for Case {",
+                "    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {",
+                "        write!(f, \"{}\", self.test)",
+                "    }",
+                "}",
+            ],
+            &[
+                "pub fn f(test: &str) -> u8 {",
+                "    debug_assert!(cfg!(target_pointer_width = \"64\"));",
+                "    if cfg!(unix) && cfg!(test) { 1 } else { 2 }",
+                "}",
+            ],
+            &[
+                "thread_local! {",
+                "    #[cfg_attr(unix, allow(unused))]",
+                "    static X: u8 = 1;",
                 "}",
             ],
             &[
                 "#[cfg(test)]",
                 "mod tests {",
-                "    fn f() -> bool {",
-                "        cfg!(test) && matches!(1, 1)",
+                "    macro_rules! case {",
+                "        ($name:ident) => {",
+                "            #[test]",
+                "            fn $name() {}",
+                "        };",
                 "    }",
                 "}",
             ],
@@ -984,20 +1167,23 @@ mod tests {
             "mod shutdown;",
             "#[cfg(all(feature = \"testing\", not(windows)))]",
             "pub fn g() {}",
+            "#[cfg(debug_assertions)]",
+            "pub fn dev_only() {}",
         ];
         assert!(read(&allowed).is_ok());
     }
 
     #[test]
-    fn a_function_body_outside_test_code_is_noted() {
+    fn a_function_body_outside_test_code_and_every_cfg_is_noted() {
         for source in [
             &["pub fn f() {}"][..],
             &["impl S {", "    pub fn f(&self) {}", "}"],
             &["pub trait T {", "    fn f(&self) {}", "}"],
             &["pub static F: fn() -> u8 = || 1;"],
             &[
-                "#[cfg(any(test, feature = \"testing\"))]",
-                "pub fn helper() {}",
+                "#[cfg(windows)]",
+                "pub fn win() {}",
+                "pub fn everywhere() {}",
             ],
         ] {
             assert!(read(source).unwrap().has_function_body, "{source:?}");
@@ -1014,9 +1200,50 @@ mod tests {
             &["#[cfg(test)]", "mod tests {", "    fn f() {}", "}"],
             &["impl S {", "    #[cfg(test)]", "    fn f() {}", "}"],
             &["unsafe extern \"C\" {", "    fn probe();", "}"],
+            &["#[cfg(feature = \"extra\")]", "pub fn extra() {}"],
+            &["#[cfg(windows)]", "impl S {", "    pub fn f(&self) {}", "}"],
+            &["#[cfg(unix)]", "mod platform {", "    pub fn f() {}", "}"],
+            &[
+                "#[cfg(any(test, feature = \"testing\"))]",
+                "pub fn helper() {}",
+            ],
+            &["#![cfg(windows)]", "pub fn only_windows() {}"],
         ] {
             assert!(!read(source).unwrap().has_function_body, "{source:?}");
         }
+    }
+
+    #[test]
+    fn each_out_of_line_mod_line_is_kept_with_whether_a_cfg_gates_it() {
+        let source = read(&[
+            "#[cfg(windows)]",
+            "mod win;",
+            "pub mod plain;",
+            "mod outer {",
+            "    pub mod inner;",
+            "}",
+            "#[cfg(unix)]",
+            "mod platform {",
+            "    pub mod r#linux;",
+            "}",
+            "#[cfg(test)]",
+            "mod tests;",
+            "mod inline {}",
+        ])
+        .unwrap();
+        let line = |path: &[&str], gated| ModuleLine {
+            path: path.iter().map(|name| (*name).to_owned()).collect(),
+            gated,
+        };
+        assert_eq!(
+            source.modules,
+            [
+                line(&["win"], true),
+                line(&["plain"], false),
+                line(&["outer", "inner"], false),
+                line(&["platform", "linux"], true),
+            ]
+        );
     }
 
     /// `depth` nested calls inside a function body.

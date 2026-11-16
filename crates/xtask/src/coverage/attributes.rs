@@ -20,12 +20,13 @@ pub enum Predicate {
     NamesTest,
     /// `coverage` anywhere, `coverage_nightly` included.
     NamesCoverage,
-    /// Built from `feature = "…"`, `unix`, `windows` and the `target_*` keys with `all`,
-    /// `any` and `not`, and no `not` around a feature: a predicate that holds in the build
-    /// the measure runs whenever it holds in a build that ships.
+    /// Built from `feature = "…"`, `debug_assertions`, `unix`, `windows` and the `target_*`
+    /// keys with `all`, `any` and `not`, and no `not` around a feature or around
+    /// `debug_assertions`: a predicate that holds in the build the measure runs whenever it
+    /// holds in a build that ships.
     Allowed,
-    /// Anything else: `debug_assertions`, a custom cfg or `not(feature = "…")` compiles
-    /// code that only a build the measure never runs holds.
+    /// Anything else: `not(debug_assertions)`, a custom cfg or `not(feature = "…")`
+    /// compiles code that only a build the measure never runs holds.
     OutsideAllowlist,
 }
 
@@ -48,11 +49,13 @@ pub fn classify(predicate: TokenStream) -> Predicate {
 }
 
 /// Whether `tokens` is one predicate of the allowlist. `under_not` is set inside a `not`,
-/// where a feature is refused: `not(feature = "…")` holds exactly in the builds that leave
-/// the feature off, and the measured build may turn it on.
+/// where a feature and `debug_assertions` are refused: the measured build is a debug build
+/// and may turn a feature on, so the code they leave out of it is never measured.
 fn is_allowed(tokens: &[TokenTree], under_not: bool) -> bool {
     match tokens {
-        [TokenTree::Ident(word)] => word == "unix" || word == "windows",
+        [TokenTree::Ident(word)] => {
+            word == "unix" || word == "windows" || (word == "debug_assertions" && !under_not)
+        }
         [
             TokenTree::Ident(key),
             TokenTree::Punct(equals),
@@ -81,6 +84,12 @@ fn is_allowed(tokens: &[TokenTree], under_not: bool) -> bool {
 pub fn is_cfg_test(meta: &Meta) -> bool {
     matches!(meta, Meta::List(list)
         if is_named(&list.path, "cfg") && classify(list.tokens.clone()) == Predicate::Test)
+}
+
+/// A `cfg` other than the mark of a test item: what it stands on may be compiled out of the
+/// measured build, a platform's code on another platform or a feature left off.
+pub fn is_cfg_gate(meta: &Meta) -> bool {
+    matches!(meta, Meta::List(list) if is_named(&list.path, "cfg")) && !is_cfg_test(meta)
 }
 
 /// What is wrong with the attribute `meta`, if anything. In test code only a `#[path]`
@@ -114,7 +123,7 @@ pub fn problem_of(meta: &Meta, in_test_code: bool) -> Option<SourceProblem> {
 
 /// `path` is the one word `name`. rustc reads `r#cfg` as `cfg`, so a raw identifier is
 /// read the same way.
-fn is_named(path: &Path, name: &str) -> bool {
+pub fn is_named(path: &Path, name: &str) -> bool {
     let mut segments = path.segments.iter();
     match (segments.next(), segments.next()) {
         (Some(segment), None) => segment.arguments.is_none() && segment.ident.unraw() == name,
@@ -222,6 +231,27 @@ mod tests {
     }
 
     #[test]
+    fn a_cfg_gates_unless_it_is_the_test_mark() {
+        for gate in [
+            "cfg(unix)",
+            "cfg(feature = \"extra\")",
+            "cfg(any(test, feature = \"testing\"))",
+            "r#cfg(windows)",
+        ] {
+            assert!(is_cfg_gate(&attribute(gate)), "{gate}");
+        }
+        for not_a_gate in [
+            "cfg(test)",
+            "cfg_attr(unix, allow(dead_code))",
+            "x::cfg(unix)",
+            "doc(cfg(unix))",
+            "allow(unused)",
+        ] {
+            assert!(!is_cfg_gate(&attribute(not_a_gate)), "{not_a_gate}");
+        }
+    }
+
+    #[test]
     fn exactly_test_marks_test_code() {
         assert_eq!(predicate("test"), Predicate::Test);
         assert_eq!(predicate(" test "), Predicate::Test);
@@ -300,6 +330,9 @@ mod tests {
             "not(any(windows, target_os = \"macos\"))",
             "all()",
             "any()",
+            "debug_assertions",
+            "all(unix, debug_assertions)",
+            "any(debug_assertions, feature = \"x\")",
         ] {
             assert_eq!(predicate(text), Predicate::Allowed, "{text}");
         }
@@ -308,8 +341,8 @@ mod tests {
     #[test]
     fn anything_else_is_outside_the_allowlist() {
         for text in [
-            "debug_assertions",
             "not(debug_assertions)",
+            "not(any(debug_assertions, unix))",
             "shipping",
             "tests",
             "testing",

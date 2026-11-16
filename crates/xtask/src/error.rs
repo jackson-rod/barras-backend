@@ -90,9 +90,9 @@ pub enum LayoutProblem {
         "a folder named `examples` or `benches`, which cargo-llvm-cov leaves out of the report"
     )]
     DroppedFolder,
-    #[error("a symlink, which check-coverage does not follow")]
+    #[error("a symlink, which check-arch and check-coverage do not follow")]
     Symlink,
-    #[error("a FIFO, a socket or a device, which check-coverage does not read")]
+    #[error("a FIFO, a socket or a device, which check-arch and check-coverage do not read")]
     SpecialFile,
     #[error("a name that is not UTF-8")]
     NotUtf8Name,
@@ -133,19 +133,23 @@ pub enum SourceProblem {
     #[error("a `#[path]` attribute, which can point a module at any file")]
     PathAttribute,
     #[error(
-        "`include` other than in `include!(concat!(env!(\"OUT_DIR\"), \"…\"))`: an included file is measured, or dropped, under its own path"
+        "`include!` other than `include!(concat!(env!(\"OUT_DIR\"), \"…\"))`, or a `use` of `include`: an included file is measured, or dropped, under its own path"
     )]
     Include,
-    #[error("nested deeper than 256 groups, more than check-coverage reads")]
+    #[error("brackets nested deeper than 256 levels, more than check-coverage reads")]
     TooDeep,
     #[error(
-        "a `cfg` predicate uses more than `test`, `feature = \"…\"`, `unix`, `windows` and the `target_*` keys, or puts `not` around a feature: code only a release build, a custom cfg or a missing feature compiles is never measured"
+        "a `cfg` predicate uses more than `test`, `feature = \"…\"`, `debug_assertions`, `unix`, `windows` and the `target_*` keys, or puts `not` around a feature or `debug_assertions`: code only a release build, a custom cfg or a missing feature compiles is never measured"
     )]
     CfgOutsideAllowlist,
     #[error(
-        "a macro names `cfg`, `cfg_attr`, `coverage`, `test`, `include` or `mod`: macros are not expanded, so it could produce any shape check-coverage refuses"
+        "a `macro_rules!` body that writes `mod`: macros are not expanded, so the module it declares would escape the module rules"
     )]
-    MacroCouldHideCode,
+    MacroWritesModule,
+    #[error(
+        "a `macro_rules!` body that writes `#[test]` or `#[cfg(test)]`: a macro that writes tests must be defined inside the test module"
+    )]
+    MacroWritesTests,
     #[error("a test function outside a `#[cfg(test)]` item, whose lines would count as production")]
     TestOutsideTestCode,
 }

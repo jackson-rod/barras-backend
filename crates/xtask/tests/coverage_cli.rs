@@ -857,7 +857,7 @@ fn a_source_with_code_that_the_report_does_not_name_is_an_error() {
 }
 
 #[test]
-fn a_source_nested_too_deep_is_an_error_that_names_it_and_never_a_crash() {
+fn brackets_nested_too_deep_are_an_error_that_names_the_file() {
     let workspace = Workspace::new().file("apps/api/src/main.rs", 100, 100);
     let calls = "id(".repeat(800) + "1" + &")".repeat(800);
     let path = workspace.write(
@@ -884,23 +884,15 @@ fn every_shape_check_coverage_cannot_measure_is_an_error_that_names_file_and_lin
         ("#[cfg(shipping)]\npub fn shipped() {}", 1),
         ("#[cfg(not(feature = \"cheap\"))]\npub fn shipped() {}", 1),
         (
-            "macro_rules! with_attribute {\n    ($a:meta, $i:item) => { #[$a] $i };\n}\nwith_attribute!(cfg(not(test)), pub fn shipped() {});",
-            4,
-        ),
-        (
             "macro_rules! gated {\n    ($p:meta, $i:item) => { #[cfg($p)] $i };\n}",
             2,
         ),
         (
-            "macro_rules! with_attribute {\n    ($a:meta, $i:item) => { #[$a] $i };\n}\nwith_attribute!(test, fn padding() {});",
-            4,
-        ),
-        (
-            "macro_rules! module {\n    ($name:ident) => { pub mod $name; };\n}",
+            "macro_rules! padding {\n    () => { #[test] fn padding() {} };\n}",
             2,
         ),
         (
-            "pub fn f() -> u8 {\n    if cfg!(test) { 1 } else { 0 }\n}",
+            "macro_rules! module {\n    ($name:ident) => { pub mod $name; };\n}",
             2,
         ),
         ("include!(concat!(\"../tests/\", \"helpers.rs\"));", 1),
@@ -961,4 +953,82 @@ fn generated_code_may_be_included_from_out_dir() {
         .file("apps/api/src/main.rs", 100, 100);
     let run = workspace.check();
     assert_eq!(run.code, Some(0), "{}", run.stderr);
+}
+
+/// A kernel whose `lib.rs` holds `lines`, every one of them run, and an app at 100%.
+fn a_kernel_of(lines: &[&str]) -> Workspace {
+    let lines: Vec<Line> = lines.iter().map(|line| Run(line)).collect();
+    Workspace::new()
+        .lines("crates/kernel/src/lib.rs", &lines)
+        .file("apps/api/src/main.rs", 100, 100)
+}
+
+#[test]
+fn a_file_compiled_out_by_a_cfg_need_not_be_named_by_the_report() {
+    let workspace = a_kernel_of(&[
+        "pub fn f() -> u8 { 1 }",
+        "#[cfg(windows)]",
+        "mod win;",
+        "#[cfg(feature = \"extra\")]",
+        "pub mod extra;",
+        "pub mod gated;",
+    ]);
+    workspace.write(
+        "crates/kernel/src/win.rs",
+        "pub fn only_windows() -> u8 {\n    1\n}\n",
+    );
+    workspace.write(
+        "crates/kernel/src/extra.rs",
+        "pub fn extra() -> u8 {\n    1\n}\n",
+    );
+    workspace.write(
+        "crates/kernel/src/gated.rs",
+        "#[cfg(feature = \"extra\")]\npub fn extra() -> u8 {\n    1\n}\n",
+    );
+    let run = workspace.check();
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+}
+
+#[test]
+fn honest_code_that_names_include_test_or_cfg_passes() {
+    for shape in [
+        &[
+            "pub struct Query {",
+            "    pub include: Vec<String>,",
+            "}",
+            "pub fn wants(query: &Query) -> bool {",
+            "    !query.include.is_empty()",
+            "}",
+        ][..],
+        &[
+            "pub fn label(test: &str) -> String {",
+            "    format!(\"case {test} {}\", test)",
+            "}",
+        ],
+        &[
+            "pub fn f() -> u8 {",
+            "    debug_assert!(cfg!(target_pointer_width = \"64\"));",
+            "    if cfg!(test) { 1 } else { 2 }",
+            "}",
+        ],
+        &[
+            "macro_rules! check {",
+            "    ($test:expr) => {",
+            "        assert!($test)",
+            "    };",
+            "}",
+            "pub fn f() -> u8 {",
+            "    check!(true);",
+            "    1",
+            "}",
+        ],
+        &[
+            "pub fn f() -> u8 { 1 }",
+            "#[cfg(debug_assertions)]",
+            "pub fn dev_only() -> u8 { 2 }",
+        ],
+    ] {
+        let run = a_kernel_of(shape).check();
+        assert_eq!(run.code, Some(0), "{shape:?}: {}", run.stderr);
+    }
 }

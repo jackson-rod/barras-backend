@@ -1,7 +1,7 @@
 //! The sources the measure reads: every `.rs` file under the `src/` of each measured
 //! crate, whether the report names it or not.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -95,6 +95,83 @@ pub fn read_sources(
         }
     }
     Ok(sources)
+}
+
+/// The sources every `mod` line that declares them carries a cfg other than the test mark,
+/// directly, through an item or a module around it, or through the gated module that holds
+/// it: each may be compiled out of the measured build, a platform's code on another
+/// platform or a feature left off, and so be absent from the report. A crate root is never
+/// gated, since it is built as a crate of its own.
+pub fn gated_sources(sources: &BTreeMap<PathBuf, Source>) -> BTreeSet<PathBuf> {
+    let mut declared: BTreeMap<PathBuf, Vec<(&Path, bool)>> = BTreeMap::new();
+    for (file, source) in sources {
+        let folder = module_folder(file);
+        for line in &source.modules {
+            let Some((name, around)) = line.path.split_last() else {
+                continue;
+            };
+            let base = around
+                .iter()
+                .fold(folder.clone(), |base, module| base.join(module));
+            for child in [
+                base.join(format!("{name}.rs")),
+                base.join(name).join("mod.rs"),
+            ] {
+                declared
+                    .entry(child)
+                    .or_default()
+                    .push((file.as_path(), line.gated));
+            }
+        }
+    }
+    // A module's folder lies inside the folder of the module that declares it, so going
+    // from the shallowest folder down settles each declaring module before those it
+    // declares, and no walk can loop.
+    let mut files: Vec<&PathBuf> = sources.keys().filter(|file| !is_crate_root(file)).collect();
+    files.sort_by_cached_key(|file| module_folder(file).components().count());
+    let mut gated = BTreeSet::new();
+    for file in files {
+        if let Some(lines) = declared.get(file.as_path())
+            && lines
+                .iter()
+                .all(|(parent, line_gated)| *line_gated || gated.contains(*parent))
+        {
+            gated.insert(file.clone());
+        }
+    }
+    gated
+}
+
+/// The folder where the out-of-line modules of `file` sit: its own folder for a crate root
+/// or a `mod.rs`, otherwise a folder named after it.
+fn module_folder(file: &Path) -> PathBuf {
+    let folder = file.parent().unwrap_or(Path::new(""));
+    if is_crate_root(file) || file.file_name().is_some_and(|name| name == "mod.rs") {
+        folder.to_path_buf()
+    } else {
+        file.with_extension("")
+    }
+}
+
+/// `src/lib.rs`, `src/main.rs` or a binary under `src/bin/`, the files Cargo builds as
+/// crates of their own.
+fn is_crate_root(file: &Path) -> bool {
+    let in_src = crate_src(file).and_then(|src| file.strip_prefix(src).ok());
+    let parts: Vec<&str> = in_src
+        .map(|inner| inner.iter().filter_map(|part| part.to_str()).collect())
+        .unwrap_or_default();
+    matches!(
+        parts.as_slice(),
+        ["lib.rs" | "main.rs"] | ["bin", _] | ["bin", _, "main.rs"]
+    )
+}
+
+/// The `src` folder of the crate `file` is in.
+fn crate_src(file: &Path) -> Option<PathBuf> {
+    file.ancestors()
+        .skip(1)
+        .find(|folder| layer_of(folder).is_some())
+        .map(|folder| folder.join("src"))
 }
 
 /// A `tests.rs` file, or anything under a folder named `tests`, inside `src`.
@@ -356,5 +433,93 @@ mod tests {
                 if path == Path::new("crates/kernel/src")),
             "{error}"
         );
+    }
+
+    #[test]
+    fn a_source_declared_by_a_gated_mod_line_is_gated_and_so_is_every_module_under_it() {
+        let root = workspace(&["crates/kernel/Cargo.toml"]);
+        for (file, text) in [
+            (
+                "crates/kernel/src/lib.rs",
+                "#[cfg(windows)]\nmod win;\npub mod plain;\npub mod folder;\n#[cfg(unix)]\nmod platform {\n    pub mod linux;\n}\n",
+            ),
+            (
+                "crates/kernel/src/win.rs",
+                "pub mod child;\npub fn f() {}\n",
+            ),
+            ("crates/kernel/src/win/child.rs", "pub fn f() {}\n"),
+            (
+                "crates/kernel/src/plain.rs",
+                "#[cfg(feature = \"extra\")]\npub mod deeper;\npub mod open;\n",
+            ),
+            ("crates/kernel/src/plain/deeper.rs", "pub fn f() {}\n"),
+            ("crates/kernel/src/plain/open.rs", "pub fn f() {}\n"),
+            (
+                "crates/kernel/src/folder/mod.rs",
+                "#[cfg(windows)]\nmod sub;\n",
+            ),
+            ("crates/kernel/src/folder/sub.rs", "pub fn f() {}\n"),
+            ("crates/kernel/src/platform/linux.rs", "pub fn f() {}\n"),
+            (
+                "crates/kernel/src/bin/tool/main.rs",
+                "#[cfg(windows)]\nmod util;\nfn main() {}\n",
+            ),
+            ("crates/kernel/src/bin/tool/util.rs", "pub fn f() {}\n"),
+        ] {
+            write(root.path(), file, text);
+        }
+        let gated = gated_sources(&read_all(root.path()).unwrap());
+        assert_eq!(
+            gated,
+            [
+                "crates/kernel/src/bin/tool/util.rs",
+                "crates/kernel/src/folder/sub.rs",
+                "crates/kernel/src/platform/linux.rs",
+                "crates/kernel/src/plain/deeper.rs",
+                "crates/kernel/src/win.rs",
+                "crates/kernel/src/win/child.rs",
+            ]
+            .map(PathBuf::from)
+            .into()
+        );
+    }
+
+    #[test]
+    fn a_source_some_ungated_mod_line_declares_or_a_crate_root_is_not_gated() {
+        let root = workspace(&["apps/api/Cargo.toml"]);
+        for (file, text) in [
+            ("apps/api/src/lib.rs", "pub mod util;\n"),
+            (
+                "apps/api/src/main.rs",
+                "#[cfg(windows)]\nmod util;\n#[cfg(windows)]\nmod lib;\nfn main() {}\n",
+            ),
+            ("apps/api/src/util.rs", "pub fn f() {}\n"),
+            (
+                "apps/api/src/bin/tool.rs",
+                "#[cfg(windows)]\nmod extra;\nfn main() {}\n",
+            ),
+            ("apps/api/src/bin/extra.rs", "fn main() {}\n"),
+        ] {
+            write(root.path(), file, text);
+        }
+        assert_eq!(
+            gated_sources(&read_all(root.path()).unwrap()),
+            BTreeSet::new()
+        );
+    }
+
+    #[test]
+    fn a_source_nested_as_deep_as_allowed_is_parsed_on_a_stack_large_enough() {
+        // 255 blocks inside a function body: 256 levels, the most allowed, and several
+        // megabytes of stack to parse, more than this test's own thread has.
+        let root = workspace(&["crates/kernel/Cargo.toml"]);
+        let blocks = format!("{}1{}", "{ ".repeat(255), " }".repeat(255));
+        write(
+            root.path(),
+            "crates/kernel/src/lib.rs",
+            &format!("pub fn deep() -> u8 {{\n    {blocks}\n}}\n"),
+        );
+        let sources = read_all(root.path()).unwrap();
+        assert!(sources[Path::new("crates/kernel/src/lib.rs")].has_function_body);
     }
 }

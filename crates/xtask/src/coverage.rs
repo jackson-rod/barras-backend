@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 pub use bars::{BarFailure, judge};
 use lcov::{Record, parse_lcov};
 use source::Source;
-use sources::{measured_crates, read_sources};
+use sources::{gated_sources, measured_crates, read_sources};
 
 use crate::error::{XtaskError, escaped};
 use crate::layout::{KERNEL_DIR, Layer, layer_of};
@@ -122,10 +122,10 @@ pub fn measure_coverage(
     }
     // A file the report does not name has no figure: a crate whose tests never ran, or a
     // path cargo-llvm-cov drops by default (any with `/rustc/<hex>/`), would escape the bars.
-    if let Some((path, _)) = sources
-        .iter()
-        .find(|(path, source)| source.has_function_body && !measured.contains_key(*path))
-    {
+    let gated = gated_sources(&sources);
+    if let Some((path, _)) = sources.iter().find(|(path, source)| {
+        source.has_function_body && !gated.contains(*path) && !measured.contains_key(*path)
+    }) {
         return Err(XtaskError::Unreported {
             report: report.to_path_buf(),
             path: path.clone(),
@@ -732,6 +732,40 @@ mod tests {
             matches!(&error, XtaskError::Unreported { report, path }
                 if report == Path::new(REPORT)
                     && path == Path::new("crates/adapters/ghost/src/lib.rs")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_source_a_cfg_may_compile_out_need_not_be_named_by_the_report() {
+        let root = workspace(&["crates/kernel"]);
+        let lib = write(
+            root.path(),
+            "crates/kernel/src/lib.rs",
+            &[
+                "pub fn tested() {}",
+                "#[cfg(windows)]",
+                "mod win;",
+                "pub mod plain;",
+            ],
+        );
+        let lcov = record_of(&lib, &[(1, 1)]);
+        plain_source(root.path(), "crates/kernel/src/win.rs", 1);
+        write(
+            root.path(),
+            "crates/kernel/src/plain.rs",
+            &["#[cfg(feature = \"extra\")]", "pub fn extra() {}"],
+        );
+        assert!(measure(root.path(), &lcov).is_ok());
+        write(
+            root.path(),
+            "crates/kernel/src/plain.rs",
+            &["pub fn plain() {}"],
+        );
+        let error = measure(root.path(), &lcov).unwrap_err();
+        assert!(
+            matches!(&error, XtaskError::Unreported { path, .. }
+                if path == Path::new("crates/kernel/src/plain.rs")),
             "{error}"
         );
     }
