@@ -2,13 +2,12 @@
 //! document and `openapi --check <file>` compares a file with it, both without reading the
 //! environment or opening a socket.
 
-use std::error::Error;
 use std::fmt::Display;
 use std::fs;
 use std::io::{self, Write};
 use std::process::ExitCode;
 
-use barras_bootstrap::Environment;
+use barras_bootstrap::{Environment, with_sources};
 use tokio::runtime;
 
 use crate::{ApiConfig, RunError, openapi_json, run};
@@ -121,16 +120,6 @@ fn report(message: &dyn Display) {
     eprintln!("{message}");
 }
 
-/// The error's text, then that of each of its sources in turn, joined by `": "`: at most
-/// sixteen, since an error whose sources led back to itself would never end.
-fn with_sources(error: &(dyn Error + 'static)) -> String {
-    std::iter::successors(Some(error), |&error| error.source())
-        .take(16)
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(": ")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,16 +158,5 @@ mod tests {
         ] {
             assert_eq!(Command::parse(&args(words)), Command::Usage, "{words:?}");
         }
-    }
-
-    #[test]
-    fn a_failure_is_reported_with_every_source_in_turn() {
-        let cause = io::Error::other("connection reset");
-        let failure = RunError::Signal(cause);
-
-        assert_eq!(
-            with_sources(&failure),
-            "SIGTERM and SIGINT could not be listened for: connection reset"
-        );
     }
 }
