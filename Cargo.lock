@@ -175,6 +175,14 @@ dependencies = [
 [[package]]
 name = "barras-ingest"
 version = "0.1.0"
+dependencies = [
+ "barras-adapter-http",
+ "barras-bootstrap",
+ "barras-testkit",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "barras-kernel"

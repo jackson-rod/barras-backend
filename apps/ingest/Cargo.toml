@@ -5,5 +5,19 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[dependencies]
+barras-adapter-http.workspace = true
+barras-bootstrap.workspace = true
+# The runtime the binary builds by hand.
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+tracing.workspace = true
+
+[dev-dependencies]
+# `fetch`; the feature is on only here, so it never reaches the binary.
+barras-adapter-http = { workspace = true, features = ["testing"] }
+barras-testkit.workspace = true
+# The JSON lines the binary logs, parsed.
+serde_json.workspace = true
+
 [lints]
 workspace = true
