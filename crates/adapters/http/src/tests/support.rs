@@ -1,6 +1,7 @@
 //! The fixture app the tests run against, its routes documented and registered with
 //! `ApiRouter` as the real app's are, and a writer that keeps what the app logs.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::sync::{Arc, Mutex};
 
@@ -221,6 +222,7 @@ async fn create_member(ValidatedJson(member): ValidatedJson<NewMember>) -> ApiRe
 
 /// Which members to list, read from the query string.
 #[derive(Debug, Deserialize, Serialize, Validate, ToSchema)]
+#[serde(rename_all = "camelCase")]
 struct Listing {
     #[garde(range(min = 1, max = 50))]
     limit: u32,
@@ -247,8 +249,8 @@ async fn list_members(ValidatedQuery(listing): ValidatedQuery<Listing>) -> ApiRe
 }
 
 /// A profile to create: fields whose Rust names are not their JSON names, and the shapes whose
-/// refusal could carry back what was sent: objects that refuse a field they do not name, a
-/// type whose own error quotes the value, and a tuple.
+/// refusal could carry back what was sent: objects that refuse a field they do not name, types
+/// whose own errors quote what was sent, a tuple, two enums and a list of objects.
 #[derive(Debug, Deserialize, Serialize, Validate, ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct NewProfile {
@@ -268,6 +270,83 @@ struct NewProfile {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<Vec<u32>>)]
     pair: Option<(u32, u32)>,
+    #[garde(skip)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<ProfileKind>,
+    #[garde(skip)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<Target>,
+    #[garde(skip)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    code: Option<Code>,
+    #[garde(skip)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    echo: Option<Echo>,
+    #[garde(skip)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Object>)]
+    lookup: Option<Lookup>,
+    #[garde(dive)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    addresses: Option<Vec<Address>>,
+}
+
+/// What a member does with money.
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+enum ProfileKind {
+    Saver,
+    Investor,
+}
+
+/// A target, internally tagged: serde reads its object whole before it knows the variant.
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
+#[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
+enum Target {
+    Saving { amount: u32 },
+}
+
+/// Read through a conversion whose error carelessly starts with the value.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(try_from = "String")]
+struct Code(String);
+
+impl TryFrom<String> for Code {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, String> {
+        Err(format!("{value} is not a valid code"))
+    }
+}
+
+/// Read through a conversion whose error carelessly is the value itself.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(try_from = "String")]
+struct Echo(String);
+
+impl TryFrom<String> for Echo {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, String> {
+        Err(value)
+    }
+}
+
+/// Read from an object through a conversion whose error carelessly names, as a field it
+/// lacks, the first value the object holds.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(try_from = "BTreeMap<String, String>")]
+struct Lookup(BTreeMap<String, String>);
+
+impl TryFrom<BTreeMap<String, String>> for Lookup {
+    type Error = String;
+
+    fn try_from(entries: BTreeMap<String, String>) -> Result<Self, String> {
+        let first = entries.into_values().next().unwrap_or_default();
+        Err(format!("missing field `{first}`"))
+    }
 }
 
 /// An object that refuses a field it does not name.
@@ -321,10 +400,19 @@ async fn create_profile(
 
 /// Which profiles to find, read from the query string.
 #[derive(Debug, Deserialize, Serialize, Validate, ToSchema)]
+#[serde(rename_all = "camelCase")]
 struct ProfileQuery {
     #[garde(skip)]
     #[schema(value_type = Option<String>)]
     nickname: Option<Nickname>,
+    #[garde(skip)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    code: Option<Code>,
+    #[garde(skip)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    echo: Option<Echo>,
 }
 
 /// Find profiles, answering the query as the handler received it.
@@ -332,7 +420,11 @@ struct ProfileQuery {
     get,
     path = "/profiles",
     tag = "fixtures",
-    params(("nickname" = Option<String>, Query, description = "The nickname to look for")),
+    params(
+        ("nickname" = Option<String>, Query, description = "The nickname to look for"),
+        ("code" = Option<String>, Query, description = "The code to look for"),
+        ("echo" = Option<String>, Query, description = "Anything, which is refused"),
+    ),
     responses(
         (status = 200, description = "The query read", body = SuccessEnvelope<ProfileQuery>),
         (status = 422, description = "A parameter failed validation", body = ErrorEnvelope),

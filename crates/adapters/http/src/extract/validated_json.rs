@@ -5,7 +5,9 @@ use axum::extract::{FromRequest, Request};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, StatusCode};
 use garde::Validate;
-use serde::de::{DeserializeOwned, IgnoredAny};
+use serde::de::DeserializeOwned;
+use serde_json::{Map, Value};
+use serde_path_to_error::{Path, Segment};
 
 use super::{broken_rules, refused_value};
 use crate::error::ApiError;
@@ -27,7 +29,10 @@ const UNFIT: &str = "Request body cannot be read as the object this route takes"
 ///
 /// A field an object of the DTO does not accept (`#[serde(deny_unknown_fields)]`) is reported
 /// at that object, never under its own name, which is the caller's text; at the root, where
-/// no field is left to report it at, the body answers 400 `MALFORMED_REQUEST`.
+/// no field is left to report it at, the body answers 400 `MALFORMED_REQUEST`. Inside an
+/// internally tagged enum (`#[serde(tag = …)]`), serde reads the object whole before it knows
+/// the variant, so the path stops at the enum and the field is reported one level up: at the
+/// object that holds the enum, or with 400 when that object is the body itself.
 #[derive(Debug)]
 pub struct ValidatedJson<T>(pub T);
 
@@ -62,13 +67,21 @@ where
         let value: T = serde_path_to_error::deserialize(&mut deserializer).map_err(|error| {
             // serde stops at the first value it refuses, which may come before the place where
             // the body stops being JSON; a body that is not JSON is malformed, whatever it holds.
-            // In a body that is JSON, the fault is a value's, even one serde_json words as
-            // syntax: the elements of an array past those a tuple takes. Only this path reads
-            // the body twice.
-            if serde_json::from_slice::<IgnoredAny>(&bytes).is_ok() {
-                refused_value(error.path(), &without_position(error.inner()), UNFIT)
-            } else {
-                ApiError::malformed_request(NOT_JSON)
+            // Read as a `Value`, it is held to the typed read's own bar: well-formed UTF-8, no
+            // lone surrogate, no nesting past serde_json's limit, in every field, even one the
+            // DTO does not have. In a body that is JSON, the fault is a value's, even one
+            // serde_json words as syntax: the elements of an array past those a tuple takes.
+            // Only this path reads the body twice.
+            match serde_json::from_slice::<Value>(&bytes) {
+                Ok(sent) => refused_value(
+                    error.path(),
+                    &without_position(error.inner()),
+                    UNFIT,
+                    |path, name| {
+                        object_at(&sent, path).is_some_and(|object| !object.contains_key(name))
+                    },
+                ),
+                Err(_) => ApiError::malformed_request(NOT_JSON),
             }
         })?;
         deserializer
@@ -93,6 +106,20 @@ pub(crate) fn is_json(headers: &HeaderMap) -> bool {
         .is_some_and(|(name, suffix)| !name.is_empty() && suffix.eq_ignore_ascii_case("json"));
     kind.eq_ignore_ascii_case("application")
         && (subtype.eq_ignore_ascii_case("json") || has_json_suffix)
+}
+
+/// The object `path` leads to in `sent`, when it leads to one.
+fn object_at<'a>(sent: &'a Value, path: &Path) -> Option<&'a Map<String, Value>> {
+    let mut value = sent;
+    for segment in path.iter() {
+        value = match segment {
+            // An enum's content is the member named after its variant.
+            Segment::Map { key } | Segment::Enum { variant: key } => value.as_object()?.get(key)?,
+            Segment::Seq { index } => value.as_array()?.get(*index)?,
+            Segment::Unknown => return None,
+        };
+    }
+    value.as_object()
 }
 
 /// The first byte of `bytes` that is not JSON white space.

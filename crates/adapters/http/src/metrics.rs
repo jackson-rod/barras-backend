@@ -42,7 +42,8 @@ impl Metrics {
         let durations = HistogramVec::new(
             HistogramOpts::new(
                 "http_request_duration_seconds",
-                "Time to answer an HTTP request, in seconds, by method and route template.",
+                "Time from an HTTP request to the head of its answer, in seconds, by method and \
+                 route template.",
             )
             .buckets(DURATION_BUCKETS.to_vec()),
             &["method", "path"],
@@ -266,6 +267,18 @@ mod tests {
             samples(&text, "http_request_duration_seconds_count"),
             [r#"http_request_duration_seconds_count{method="GET",path="/api/v1/goals/{id}"} 3"#]
         );
+    }
+
+    #[test]
+    fn the_duration_is_said_to_run_to_the_head_of_the_answer() {
+        let metrics = Metrics::new(SERVICE).unwrap();
+        metrics.record_request("GET", "/api/v1/goals", StatusCode::OK, Duration::ZERO);
+
+        let text = metrics.render().unwrap();
+
+        let help = "# HELP http_request_duration_seconds Time from an HTTP request to the head \
+                    of its answer, in seconds, by method and route template.";
+        assert!(text.lines().any(|line| line == help), "{text}");
     }
 
     #[test]

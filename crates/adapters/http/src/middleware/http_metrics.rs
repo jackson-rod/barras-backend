@@ -2,12 +2,11 @@
 //! it. The labels take few values: the method from a fixed set, the route template rather
 //! than the path, and the status.
 
-use std::time::Instant;
-
 use axum::extract::{MatchedPath, Request, State};
 use axum::http::Method;
 use axum::middleware::Next;
 use axum::response::Response;
+use tokio::time::Instant;
 
 use super::matched_route::MatchedRoute;
 use crate::metrics::Metrics;
@@ -27,6 +26,7 @@ pub(super) async fn record_http_metrics(
     let method = method_label(request.method());
     // Read from the request: a 405's path matched a route, which its response does not carry.
     let served = MatchedRoute::of(&request);
+    // tokio's clock, which reads the system's unless a test paused it to time a handler.
     let started = Instant::now();
     let mut response = next.run(request).await;
     // Up to the head of the answer: a body that streams is not waited for.

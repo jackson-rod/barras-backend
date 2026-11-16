@@ -5,6 +5,7 @@ use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use garde::Validate;
 use serde::de::DeserializeOwned;
+use serde_path_to_error::Path;
 
 use super::{broken_rules, refused_value};
 use crate::error::ApiError;
@@ -35,8 +36,15 @@ where
         // Read as axum's `Query` reads it, except that the path of a refused value is kept
         // where this code can see it, not inside a boxed error.
         let pairs = serde_urlencoded::Deserializer::new(form_urlencoded::parse(query.as_bytes()));
-        let value: T = serde_path_to_error::deserialize(pairs)
-            .map_err(|error| refused_value(error.path(), &error.inner().to_string(), UNREADABLE))?;
+        let value: T = serde_path_to_error::deserialize(pairs).map_err(|error| {
+            // A query string is one flat object: a parameter is missing only at its root, and
+            // only when no pair has its name.
+            let lacks = |path: &Path, name: &str| {
+                path.iter().len() == 0
+                    && !form_urlencoded::parse(query.as_bytes()).any(|(sent, _)| sent == name)
+            };
+            refused_value(error.path(), &error.inner().to_string(), UNREADABLE, lacks)
+        })?;
         value.validate().map_err(|report| broken_rules(&report))?;
         Ok(Self(value))
     }

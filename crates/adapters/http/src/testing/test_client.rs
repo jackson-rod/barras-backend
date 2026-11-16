@@ -13,7 +13,7 @@ use tower::ServiceExt;
 
 use crate::app::HttpApp;
 use crate::error::ApiError;
-use crate::extract::{IS_REQUIRED, is_json};
+use crate::extract::{camel_case, is_json};
 use crate::internal::InternalApp;
 use crate::middleware::MatchedRoute;
 use crate::openapi::operations;
@@ -23,9 +23,10 @@ use crate::openapi::operations;
 /// a route registered around `ApiRouter::route` fails, naming it.
 ///
 /// It also fails the test when a validation failure answered to a JSON body has a key in
-/// `error.fields` that names no member of that body, or, for a field reported missing, no
-/// parent in it: the app finds the field to flag by that key, so a key spelled otherwise, a
-/// Rust name where the body has a camelCase one, say, flags nothing.
+/// `error.fields` that names neither a member of that body, nor a parameter of the query
+/// string, nor a field missing from an object of the body: the app finds the field to flag by
+/// that key, so a key spelled otherwise, a Rust name where the body has a camelCase one, say,
+/// flags nothing.
 pub struct TestClient {
     router: Router,
     /// Each operation of the document, as its method and its path template; `None` for the
@@ -60,6 +61,7 @@ impl TestClient {
 
     pub async fn send(&self, request: TestRequest) -> TestResponse {
         let sent = request.json_body();
+        let parameters = request.query_parameters();
         let Ok(response) = self.router.clone().oneshot(request.into_http()).await;
         let (parts, body) = response.into_parts();
         let body = to_bytes(body, usize::MAX).await.unwrap();
@@ -68,7 +70,7 @@ impl TestClient {
             hold_to_the_document(documented, served);
         }
         if let Some(sent) = &sent {
-            hold_the_keys_to_the_body(&response, sent);
+            hold_the_keys_to_the_body(&response, sent, &parameters);
         }
         response
     }
@@ -88,30 +90,38 @@ fn hold_to_the_document(documented: &BTreeSet<(String, String)>, served: &Matche
 }
 
 /// On a 422 `VALIDATION_FAILED`, each key of `error.fields` must name a member of `sent`, the
-/// JSON body of the request, or, when the key is reported missing, a parent object in it.
-fn hold_the_keys_to_the_body(response: &TestResponse, sent: &Value) {
+/// JSON body of the request, one of the `parameters` of its query string, or a field missing
+/// from an object of `sent`, whatever its message: a rule such as garde's `required` reports a
+/// field that was not sent too.
+fn hold_the_keys_to_the_body(response: &TestResponse, sent: &Value, parameters: &BTreeSet<String>) {
     if response.status != 422
         || response.error_code().as_deref() != Some(ApiError::VALIDATION_FAILED)
     {
         return;
     }
     let answer = response.json();
-    let fields = answer["error"]["fields"].as_object().into_iter().flatten();
-    for (key, messages) in fields {
-        let missing = messages
-            .as_array()
-            .is_some_and(|messages| messages.iter().any(|message| message == IS_REQUIRED));
-        // A missing field is a name after its parent's path, never an index.
-        let parent = key.rsplit_once('.').map_or("", |(parent, _)| parent);
-        let names_a_member = member(sent, key).is_some();
-        let names_a_missing_field = missing && member(sent, parent).is_some_and(Value::is_object);
-        if !names_a_member && !names_a_missing_field {
+    let keys = answer["error"]["fields"].as_object().into_iter().flatten();
+    for (key, _) in keys {
+        if member(sent, key).is_none() && !parameters.contains(key) && !is_missing_from(sent, key) {
             panic!(
                 "error.fields has the key {key}, which names no member of the body that was \
                  sent: key a field by its path in the body, its JSON names in camelCase"
             );
         }
     }
+}
+
+/// Whether `key` names a field missing from an object of `body`: a name, never an index, after
+/// the path of an object that holds the name neither as it is nor in camelCase. An object that
+/// holds it in camelCase makes the key the Rust spelling of a field that was sent.
+fn is_missing_from(body: &Value, key: &str) -> bool {
+    let (parent, name) = key.rsplit_once('.').unwrap_or(("", key));
+    !name.contains('[')
+        && member(body, parent)
+            .and_then(Value::as_object)
+            .is_some_and(|object| {
+                !object.contains_key(name) && !object.contains_key(&camel_case(name))
+            })
 }
 
 /// The member of `body` at `key`, a path such as `address.zip` or `tags[1]`; the empty key is
@@ -179,6 +189,14 @@ impl TestRequest {
     pub fn streamed(mut self) -> Self {
         self.streamed = true;
         self
+    }
+
+    /// The names of the parameters of the query string.
+    fn query_parameters(&self) -> BTreeSet<String> {
+        let query = self.path.split_once('?').map_or("", |(_, query)| query);
+        form_urlencoded::parse(query.as_bytes())
+            .map(|(name, _)| name.into_owned())
+            .collect()
     }
 
     /// The body, when it is sent as JSON and is JSON.

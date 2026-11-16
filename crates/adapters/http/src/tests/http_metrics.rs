@@ -1,11 +1,14 @@
 //! The HTTP metrics (spec §6.6): every answer the app gives is counted and timed under its
 //! method, its route template and its status, in the registry the app was built with.
 
+use std::time::Duration;
+
 use serde_json::{Value, json};
+use utoipa_axum::routes;
 
 use super::support::{SERVICE, fixture_app_with, fixture_metrics, send_logged_json};
-use crate::Metrics;
 use crate::testing::{TestClient, TestRequest};
+use crate::{Access, ApiResult, ApiRouter, ApiSuccess, HttpApp, Metrics, NoData, SuccessEnvelope};
 
 const MIB: usize = 1024 * 1024;
 
@@ -36,6 +39,18 @@ fn label<'line>(line: &'line str, name: &str) -> &'line str {
 
 fn get(path: &str) -> TestRequest {
     TestRequest::new("GET", path)
+}
+
+/// Answer once 30 ms have passed.
+#[utoipa::path(
+    get,
+    path = "/slow",
+    tag = "fixtures",
+    responses((status = 200, description = "Answered late", body = SuccessEnvelope<NoData>)),
+)]
+async fn slow() -> ApiResult<NoData> {
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    Ok(ApiSuccess::ok("Answered late", NoData))
 }
 
 #[tokio::test]
@@ -154,6 +169,30 @@ async fn every_request_is_timed_in_the_buckets_of_the_spec() {
         samples(&metrics, "http_request_duration_seconds_count"),
         [r#"http_request_duration_seconds_count{method="GET",path="/api/v1/small"} 1"#]
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_request_is_timed_from_before_its_handler_runs() {
+    let metrics = fixture_metrics();
+    let routes = ApiRouter::new().route(routes!(slow), Access::public(), &[]);
+    let app = HttpApp::builder(SERVICE, metrics.clone())
+        .routes(routes)
+        .build()
+        .unwrap();
+
+    TestClient::new(&app).get("/api/v1/slow").await;
+
+    let buckets = samples(&metrics, "http_request_duration_seconds_bucket");
+    let counted = |edge: &str| {
+        let line = buckets
+            .iter()
+            .find(|line| label(line, "le") == edge)
+            .unwrap();
+        line.rsplit(' ').next().unwrap().to_owned()
+    };
+    // The handler took 30 ms: past the 25 ms edge, within the 50 ms one.
+    assert_eq!(counted("0.025"), "0", "{buckets:?}");
+    assert_eq!(counted("0.05"), "1", "{buckets:?}");
 }
 
 #[tokio::test]

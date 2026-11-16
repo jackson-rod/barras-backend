@@ -12,6 +12,9 @@ use http_body_util::{BodyExt, Full, Limited};
 use serde_json::{Value, json};
 
 use super::support::{NewMember, assert_error, client};
+use crate::extract::{
+    HAS_THE_WRONG_TYPE, HAS_UNKNOWN_FIELD, IS_NOT_ACCEPTED, IS_NOT_VALID, IS_REQUIRED,
+};
 use crate::testing::{TestRequest, TestResponse};
 use crate::{ApiError, ValidatedJson};
 
@@ -150,18 +153,26 @@ async fn the_media_type_is_refused_before_the_body_is_read() {
 #[tokio::test]
 async fn a_body_that_is_not_json_is_malformed() {
     let member = member().to_string();
+    let deep = format!(r#"{{"extra": {}{}}}"#, "[".repeat(200), "]".repeat(200));
     for body in [
-        String::new(),
-        " \r\n\t".to_owned(),
-        r#"{"email": "ana@example.com", "username": "an"#.to_owned(),
-        r#"{email: "ana@example.com"}"#.to_owned(),
-        format!("{member} trailing"),
-        format!("{member}{member}"),
+        Vec::new(),
+        b" \r\n\t".to_vec(),
+        br#"{"email": "ana@example.com", "username": "an"#.to_vec(),
+        br#"{email: "ana@example.com"}"#.to_vec(),
+        format!("{member} trailing").into_bytes(),
+        format!("{member}{member}").into_bytes(),
+        // As strict as the typed read, even in a field the DTO does not have: no ill-formed
+        // UTF-8 in a value or a key, no lone surrogate, no nesting past serde_json's limit.
+        b"{\"text\": \"a\xffb\"}".to_vec(),
+        b"{\"te\xffxt\": 1}".to_vec(),
+        br#"{"text": "\ud800"}"#.to_vec(),
+        deep.into_bytes(),
     ] {
-        let response = client()
-            .send(post_raw("application/json", body.clone()))
-            .await;
+        let shown = String::from_utf8_lossy(&body).into_owned();
 
+        let response = client().send(post_raw("application/json", body)).await;
+
+        assert_eq!(response.status, 400, "{shown}");
         assert_error(&response, 400, ApiError::MALFORMED_REQUEST);
     }
 }
@@ -253,6 +264,87 @@ async fn a_missing_field_is_reported_at_its_own_path_not_its_parents() {
         let response = client().send(post(&member_without(at))).await;
 
         assert_eq!(failed_fields(&response), [field], "{at}");
+        assert_eq!(
+            response.json()["error"]["fields"][field],
+            json!([IS_REQUIRED])
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_field_missing_from_an_element_of_an_array_is_reported_at_its_path() {
+    let body = json!({
+        "displayName": "Ana",
+        "addresses": [{ "street": "Calle 10", "zip": 110_111 }, { "street": "Calle 11" }]
+    });
+
+    let response = client().send(post_profile(&body)).await;
+
+    assert_eq!(failed_fields(&response), ["addresses[1].zip"]);
+    let messages = &response.json()["error"]["fields"]["addresses[1].zip"];
+    assert_eq!(messages, &json!([IS_REQUIRED]));
+}
+
+#[tokio::test]
+async fn a_wrong_type_names_what_was_expected_only_when_it_is_a_primitive() {
+    for (body, field, message) in [
+        (
+            member_with("/address/zip", json!("110111")),
+            "address.zip",
+            "expected u32",
+        ),
+        (
+            member_with("/address/zip", json!(-1)),
+            "address.zip",
+            "expected u32",
+        ),
+        (
+            member_with("/email", json!(7)),
+            "email",
+            "expected a string",
+        ),
+        (
+            member_with("/tags", json!("saver")),
+            "tags",
+            "expected a sequence",
+        ),
+        // serde would say `expected struct Address`: a name of the code, not of the contract.
+        (
+            member_with("/address", json!("Calle 10")),
+            "address",
+            HAS_THE_WRONG_TYPE,
+        ),
+    ] {
+        let response = client().send(post(&body)).await;
+
+        assert_eq!(failed_fields(&response), [field], "{body}");
+        let messages = &response.json()["error"]["fields"][field];
+        assert_eq!(messages, &json!([message]), "{body}");
+    }
+}
+
+#[tokio::test]
+async fn an_unknown_variant_is_not_one_of_the_accepted_values() {
+    let body = json!({ "displayName": "Ana", "kind": "trader" });
+
+    let response = client().send(post_profile(&body)).await;
+
+    assert_eq!(failed_fields(&response), ["kind"]);
+    let messages = &response.json()["error"]["fields"]["kind"];
+    assert_eq!(messages, &json!([IS_NOT_ACCEPTED]));
+}
+
+#[tokio::test]
+async fn an_error_of_a_type_of_its_own_that_reads_as_a_missing_field_is_not_believed() {
+    for request in [
+        post_profile(&json!({ "displayName": "Ana", "echo": "missing field `nickname`" })),
+        get_profiles("echo=missing%20field%20%60nickname%60"),
+    ] {
+        let response = client().send(request).await;
+
+        assert_eq!(failed_fields(&response), ["echo"]);
+        let messages = &response.json()["error"]["fields"]["echo"];
+        assert_eq!(messages, &json!([IS_NOT_VALID]));
     }
 }
 
@@ -303,7 +395,9 @@ async fn a_valid_profile_reaches_the_handler_whole() {
         "strictNamed": { "maxLevel": 3 },
         "strict": {},
         "nickname": "ana",
-        "pair": [1, 2]
+        "pair": [1, 2],
+        "kind": "saver",
+        "target": { "type": "saving", "amount": 5 }
     });
 
     let response = client().send(post_profile(&profile)).await;
@@ -349,8 +443,21 @@ async fn an_unknown_field_is_reported_at_the_object_that_refuses_it() {
 
         assert_eq!(failed_fields(&response), [field], "{body}");
         let messages = &response.json()["error"]["fields"][field];
-        assert_eq!(messages, &json!(["has a field it does not accept"]));
+        assert_eq!(messages, &json!([HAS_UNKNOWN_FIELD]));
     }
+}
+
+#[tokio::test]
+async fn an_unknown_field_inside_an_internally_tagged_enum_is_reported_one_level_up() {
+    // serde reads the enum's object whole before it knows the variant, so the path stops at
+    // the enum; the object that holds it here is the body itself.
+    let body = format!(
+        r#"{{"displayName": "Ana", "target": {{"type": "saving", "amount": 5, "{SECRET}": 1}}}}"#
+    );
+
+    let response = client().send(post_profile_raw(body)).await;
+
+    assert_error(&response, 400, ApiError::MALFORMED_REQUEST);
 }
 
 #[tokio::test]
@@ -372,7 +479,7 @@ async fn the_error_of_a_type_of_its_own_is_reported_as_not_valid() {
 
         assert_eq!(failed_fields(&response), ["nickname"]);
         let messages = &response.json()["error"]["fields"]["nickname"];
-        assert_eq!(messages, &json!(["is not valid"]));
+        assert_eq!(messages, &json!([IS_NOT_VALID]));
     }
 }
 
@@ -394,10 +501,11 @@ async fn no_answer_repeats_a_value_that_was_sent() {
     // serde's own words inside the value, as if to end its quote early.
     let quoting = format!("x\", expected {SECRET}");
     let truncated = format!(r#"{{"email": "{SECRET}""#);
-    // No DTO holds a map keyed by what the caller sends, so a body shaped as one names no
-    // field that could carry its keys back.
-    let mut with_a_map = member();
-    with_a_map["map"] = Value::Object([(SECRET.to_owned(), json!("x"))].into_iter().collect());
+    // A type of the DTO's own whose error starts with the value, and one whose error is the
+    // value: the caller then writes the words the extractor reads.
+    let serde_words = format!("invalid type: x, expected {SECRET}");
+    let missing_words = format!("missing field `{SECRET}`");
+    let target = format!(r#"{{"type": "saving", "amount": 5, "{SECRET}": 1}}"#);
     for (request, status) in [
         (post(&member_with("/address/zip", json!(SECRET))), 422),
         (post(&member_with("/address/zip", json!(quoting))), 422),
@@ -428,17 +536,35 @@ async fn no_answer_repeats_a_value_that_was_sent() {
             422,
         ),
         (get_profiles(&format!("nickname={SECRET}")), 422),
-        (post(&with_a_map), 200),
         (
-            post_profile_raw(format!(
-                r#"{{"displayName": "Ana", "map": {{"{SECRET}": "x"}}}}"#
-            )),
-            400,
+            post_profile(&json!({ "displayName": "Ana", "code": serde_words })),
+            422,
         ),
         (
-            post_profile_raw(format!(
-                r#"{{"displayName": "Ana", "rangedMap": {{"{SECRET}": {{"v": 0}}}}}}"#
+            post_profile(&json!({ "displayName": "Ana", "echo": missing_words })),
+            422,
+        ),
+        (
+            get_profiles(&format!(
+                "code=invalid%20type%3A%20x%2C%20expected%20{SECRET}"
             )),
+            422,
+        ),
+        (
+            get_profiles(&format!("echo=missing%20field%20%60{SECRET}%60")),
+            422,
+        ),
+        (
+            post_profile(&json!({ "displayName": "Ana", "kind": SECRET })),
+            422,
+        ),
+        // The object lacks a key of that name, but no field could be named so.
+        (
+            post_profile(&json!({ "displayName": "Ana", "lookup": { "a": SECRET } })),
+            422,
+        ),
+        (
+            post_profile_raw(format!(r#"{{"displayName": "Ana", "target": {target}}}"#)),
             400,
         ),
     ] {
