@@ -38,6 +38,13 @@
 1. The spec writes `build_app(&ApiConfig, Dependencies)`. Nothing in this ticket's wiring reads the configuration, and `barras-api openapi` must build the app with no environment at all, so the function is `build_app(Dependencies)`. A later ticket that needs a setting in the wiring adds it to `Dependencies`.
 2. The spec gives `barras-bootstrap` a function `shutdown_signal()`. The handlers must be installed before anything is served, so that a failure is a start-up error: it is `ShutdownSignal::install()` followed by `recv()`.
 
+Made during implementation and review, each recorded where it is decided:
+
+3. Spec §10 says the pull request text step runs last in CI's `checks` job. It runs before lint and the OpenAPI check instead, with every code step on `!cancelled()`: nothing the change builds runs before the read-only gates, and a bad title can no longer hide a code check (commit `3b71133`; ADR-0027).
+4. Spec §8.3 says a binary finishes the requests in flight on SIGTERM. They get at most 10 seconds; then the server stops waiting, logs a warning and the process exits 0, so one slow client cannot hold the shutdown (ADR-0029).
+5. Spec §4.6 says the generated `workspace-hack` depends on the union of the third-party dependencies. tokio, garde, hyper and hyper-util are left out of it, because hakari simulates builds with dev-dependencies and would otherwise put test-only features into release binaries; `hakari-check` fails when the release graph differs with and without the hack (ADR-0024).
+6. Spec §14 risk 4 (a real-process test racing for a free port) is gone: the binaries start on `127.0.0.1:0` and the tests read the bound addresses from the `listening` line.
+
 ## Task order
 
 | # | Task | Reviewers |
@@ -130,9 +137,9 @@ pub struct SystemClock;
 - `FixedClock` returns what it was given and moves only when told.
 
 **Steps**
-- [ ] Write the tests of one file, see them fail, implement, see them pass; one file at a time in the order above.
-- [ ] `cargo xtask check-arch` is clean (the kernel's list is `thiserror`, `uuid`, `time`, `rust_decimal`).
-- [ ] Commit: `feat(BAR-3): add the kernel types`
+- [x] Write the tests of one file, see them fail, implement, see them pass; one file at a time in the order above.
+- [x] `cargo xtask check-arch` is clean (the kernel's list is `thiserror`, `uuid`, `time`, `rust_decimal`).
+- [x] Commit: `feat(BAR-3): add the kernel types`
 
 ---
 
@@ -261,11 +268,11 @@ impl ShutdownSignal { pub fn install() -> Result<Self, std::io::Error>; pub asyn
 - `ShutdownSignal`: after `install()`, a test sends SIGTERM, and another SIGINT, to its own process with the `kill` program, and `recv` returns (nextest runs each test in its own process, and tokio's handler is in place); a signal sent before `recv` is kept. `install()` outside a tokio runtime is an error, not a panic. Tokio never removes its handlers, so a second signal during the drain is ignored until `recv` is called again; say so in the doc of `recv`.
 
 **Steps**
-- [ ] Create the crate with the member fields of `CLAUDE.md`; `cargo xtask check-arch` is clean.
-- [ ] `environment.rs`, test first; then the `clippy.toml` change.
-- [ ] `logging.rs`, test first with the capture writer of A.5.
-- [ ] `shutdown.rs` as in A.6.
-- [ ] Commit: `feat(BAR-3): add the bootstrap crate for configuration, logs and shutdown`
+- [x] Create the crate with the member fields of `CLAUDE.md`; `cargo xtask check-arch` is clean.
+- [x] `environment.rs`, test first; then the `clippy.toml` change.
+- [x] `logging.rs`, test first with the capture writer of A.5.
+- [x] `shutdown.rs` as in A.6.
+- [x] Commit: `feat(BAR-3): add the bootstrap crate for configuration, logs and shutdown`
 
 ---
 
@@ -316,8 +323,8 @@ impl IntoResponse for ApiError
 - The schema of `ErrorEnvelope.data` is `{"type":"null"}` (A.2).
 
 **Steps**
-- [ ] `envelope.rs`, then `error.rs`, each test first. The unit tests call `into_response()` and read the body with `http_body_util::BodyExt::collect`.
-- [ ] Commit: `feat(BAR-3): add the response envelopes and the error mapping`
+- [x] `envelope.rs`, then `error.rs`, each test first. The unit tests call `into_response()` and read the body with `http_body_util::BodyExt::collect`.
+- [x] Commit: `feat(BAR-3): add the response envelopes and the error mapping`
 
 ---
 
@@ -360,10 +367,10 @@ pub(crate) fn operations(document: &OpenApi) -> Vec<(&str, &'static str, &Operat
 - `metadata_problems` returns, for a fixture document, one line per missing item of spec §7.2, each naming the method, the path and the item: no `operationId`; no tag; no summary; no 2xx response whose body refers to a `SuccessEnvelope_` component; a 4xx or 5xx response whose body is not `ErrorEnvelope`; a response without `description`; a missing `x-error-codes`, `x-permission` or `x-plan-feature`. After review (`1fbc40b`) it also refuses: a 2xx without a success-envelope body (so no 204; use `NoData`), a `default` response without the error envelope, a duplicated `operationId` (one line naming every use), a blank `x-permission` or `x-plan-feature`, an `x-error-codes` that is not a sorted list of unique codes or repeats a common one, and a root whose title, version or `x-common-error-codes` is wrong. A complete document gives an empty list.
 
 **Steps**
-- [ ] `router.rs`, test first, with a fixture handler carrying `#[utoipa::path]`.
-- [ ] `openapi.rs`, test first.
-- [ ] `cargo deny --locked check bans` is clean.
-- [ ] Commit: `feat(BAR-3): add the documented router and the canonical OpenAPI document`
+- [x] `router.rs`, test first, with a fixture handler carrying `#[utoipa::path]`.
+- [x] `openapi.rs`, test first.
+- [x] `cargo deny --locked check bans` is clean.
+- [x] Commit: `feat(BAR-3): add the documented router and the canonical OpenAPI document`
 
 ---
 
@@ -427,10 +434,10 @@ What Tasks 4 and 5 left for this one:
 `TestClient` is test support compiled as library code, so its module carries `#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]` with the reason on the same line.
 
 **Steps**
-- [ ] `tests/support`: a fixture app with a small success route, a big success route, a panic route, a stock-extractor route. See the tests fail to compile, then fail.
-- [ ] `app.rs` and the fallbacks; then the safety net; then the request id; then compression and the body limit; `TestClient` and `MatchedRoute` along the way.
-- [ ] `route_guard.rs`, test first.
-- [ ] Commit: `feat(BAR-3): add the HTTP app, its middleware and the test client`
+- [x] `tests/support`: a fixture app with a small success route, a big success route, a panic route, a stock-extractor route. See the tests fail to compile, then fail.
+- [x] `app.rs` and the fallbacks; then the safety net; then the request id; then compression and the body limit; `TestClient` and `MatchedRoute` along the way.
+- [x] `route_guard.rs`, test first.
+- [x] Commit: `feat(BAR-3): add the HTTP app, its middleware and the test client`
 
 ---
 
@@ -454,8 +461,8 @@ What Tasks 4 and 5 left for this one:
 - Query: `?limit=abc` on a numeric field gives 422 with the key `limit`; a broken rule gives 422 with its key; a query string that cannot be parsed at all gives 400 `MALFORMED_REQUEST`.
 
 **Steps**
-- [ ] `src/tests/validation.rs` first, then `validated_json.rs`, then `validated_query.rs`.
-- [ ] Commit: `feat(BAR-3): add the validating extractors`
+- [x] `src/tests/validation.rs` first, then `validated_json.rs`, then `validated_query.rs`.
+- [x] Commit: `feat(BAR-3): add the validating extractors`
 
 ---
 
@@ -489,9 +496,9 @@ pub fn builder(service: ServiceInfo, metrics: Metrics) -> HttpAppBuilder;
 - Nothing leaks: a request with `authorization: Bearer header-secret`, `?token=query-secret` and a body holding `body-secret` leaves none of the three in the captured output.
 
 **Steps**
-- [ ] `metrics.rs`, test first; then `http_metrics.rs` in its place in the stack; then `request_log.rs`.
-- [ ] `just deny` is clean.
-- [ ] Commit: `feat(BAR-3): add the request log and the HTTP metrics`
+- [x] `metrics.rs`, test first; then `http_metrics.rs` in its place in the stack; then `request_log.rs`.
+- [x] `just deny` is clean.
+- [x] Commit: `feat(BAR-3): add the request log and the HTTP metrics`
 
 ---
 
@@ -546,8 +553,8 @@ The two public routes are registered with `ApiRouter::route(routes!(…), Access
 - `metadata_problems(app.openapi())` is empty for an app with only the health routes.
 
 **Steps**
-- [ ] `probe.rs` and the readiness logic, test first; then the public routes and DTO; then `internal.rs`; then `server.rs` (A.6) and `fetch.rs`.
-- [ ] Commit: `feat(BAR-3): add health, the internal port and the server`
+- [x] `probe.rs` and the readiness logic, test first; then the public routes and DTO; then `internal.rs`; then `server.rs` (A.6) and `fetch.rs`.
+- [x] Commit: `feat(BAR-3): add health, the internal port and the server`
 
 ---
 
@@ -581,8 +588,8 @@ The crate is test support, so it starts with `#![allow(clippy::unwrap_used, clip
 After review (`68d22a6`) the helper changed: `run` became `run_within(timeout)`, which kills a binary that outlives the deadline and fails with its output; `wait_for_line(predicate, timeout)` reads the child's output while it runs, so the binaries start on `127.0.0.1:0` and the tests read the bound addresses from the `listening` line; `free_local_addr` and `wait_until_listening` are gone with the port race; `stdout`/`stderr` can be set. `env_file` reads `.env.example` with an allow list of characters a shell reads the same way.
 
 **Steps**
-- [ ] Test first, then implement.
-- [ ] Commit: `test(BAR-3): add the process helper to the testkit`
+- [x] Test first, then implement.
+- [x] Commit: `test(BAR-3): add the process helper to the testkit`
 
 ---
 
@@ -639,9 +646,9 @@ openapi-check:
 `openapi` must not truncate the file when the build fails: write to a temporary file and move it.
 
 **Steps**
-- [ ] `config.rs`, test first (unit tests with `Environment::from_pairs`).
-- [ ] `lib.rs` and `e2e_health.rs`; then `cli.rs`, `main.rs`, `.env.example` and `e2e_process.rs`; then `openapi.json` with `just openapi` and `e2e_openapi.rs`.
-- [ ] Commit: `feat(BAR-3): make barras-api a real process with its OpenAPI mode`
+- [x] `config.rs`, test first (unit tests with `Environment::from_pairs`).
+- [x] `lib.rs` and `e2e_health.rs`; then `cli.rs`, `main.rs`, `.env.example` and `e2e_process.rs`; then `openapi.json` with `just openapi` and `e2e_openapi.rs`.
+- [x] Commit: `feat(BAR-3): make barras-api a real process with its OpenAPI mode`
 
 ---
 
@@ -658,8 +665,8 @@ openapi-check:
 Two binaries now share a few lines of `main` (print the configuration error, build the runtime). That is two occurrences: leave them (code standard, "Duplication").
 
 **Steps**
-- [ ] Test first, then implement.
-- [ ] Commit: `feat(BAR-3): make barras-ingest a real process with its internal port`
+- [x] Test first, then implement.
+- [x] Commit: `feat(BAR-3): make barras-ingest a real process with its internal port`
 
 ---
 
@@ -698,7 +705,7 @@ test-int:
 - `rust-toolchain.toml`: `components = ["rustfmt", "clippy", "llvm-tools"]`. A wrong component name is only a warning, so check `rustup component list --installed`.
 
 **CI**
-- `checks`: the step "Check the pull request title and description" moves after "Format, lint, deny, architecture and structure", and that code step gains `openapi-check`. The branch-name and commit-message steps stay first: they do not hide the code checks, because the code step runs with `if: ${{ !cancelled() }}`. Every value written by whoever opens the pull request still reaches the shell only through `env`.
+- `checks`, as built after review: branch name; commit messages; architecture and structure (`check-arch`, `check-structure`, then `hakari-check` in its own step); `fmt-check`; `deny`; the pull request title and description; `lint`; `openapi-check`; the tree check. Every step after the first runs on `if: ${{ !cancelled() }}`, so no failure hides a later check, and nothing the change builds runs before the read-only gates (refinement 3). Every value written by whoever opens the pull request still reaches the shell only through `env`.
 - `test`: installs `cargo-nextest@0.9.152` and `cargo-llvm-cov@0.9.1` through the pinned `install-action`, and runs `just test-cov test-doc`.
 - `checks` runs `check-arch` and `check-structure` before anything compiles the workspace: `cargo xtask` builds only xtask and `cargo metadata --no-deps` runs no build script, so a build script in the change cannot rewrite a check before it runs. The local `verify` keeps the same order.
 - Every job ends with a step that fails when a tracked file changed or an untracked one appeared (`git status --porcelain` is not empty), so a build script or a test that rewrites the tree is caught.
@@ -716,11 +723,11 @@ test-int:
 **Tests:** for each new ban, add the crate temporarily to an app's `Cargo.toml`, see `cargo deny check bans` fail, and remove it. `just verify` passes, and fails when the kernel is under its bar: remove one whole test module of the kernel temporarily and see `check-coverage` name `crates/kernel` (every production line of the kernel is run, so one test is not enough).
 
 **Steps**
-- [ ] `justfile` and `rust-toolchain.toml`; `just test`, `just test-int`, `just test-cov` each run and pass.
-- [ ] `ci.yml`.
-- [ ] `deny.toml`, with the negative checks above.
-- [ ] `just verify` is green. Note its wall time, cold and warm.
-- [ ] Commits: `build(BAR-3): split the tests into tiers and add the coverage thresholds`, `ci(BAR-3): run coverage and the OpenAPI check, and check the pull request text last`, `build(BAR-3): tighten the cargo-deny bans`
+- [x] `justfile` and `rust-toolchain.toml`; `just test`, `just test-int`, `just test-cov` each run and pass.
+- [x] `ci.yml`.
+- [x] `deny.toml`, with the negative checks above.
+- [x] `just verify` is green. Note its wall time, cold and warm.
+- [x] Commits: `build(BAR-3): split the tests into tiers and add the coverage thresholds`, `ci(BAR-3): run coverage and the OpenAPI check, and check the pull request text last`, `build(BAR-3): tighten the cargo-deny bans`
 
 ---
 
@@ -733,20 +740,20 @@ Skills: `ci-cd-and-automation`, `security-and-hardening`.
 - Modify: `Cargo.toml` (`members`; `workspace-hack` in `[workspace.dependencies]`), every member's `Cargo.toml` but `xtask`'s, one source file per managed crate, `deny.toml`, `justfile`, `.github/workflows/ci.yml`
 
 **Steps** (A.8 has the commands and what each one writes)
-- [ ] `cargo install --locked cargo-hakari@0.9.39`; add it to `just setup`.
-- [ ] `cargo hakari init crates/workspace-hack --package-name workspace-hack --yes`.
-- [ ] `.config/hakari.toml`: `resolver = "3"`; `platforms = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]`; `workspace-hack-line-style = "workspace-dotted"`; `[traversal-excludes] workspace-members = ["xtask"]`.
-- [ ] Root `Cargo.toml`: `workspace-hack = { version = "0.1", path = "crates/workspace-hack" }` in `[workspace.dependencies]`.
-- [ ] `cargo hakari generate`, `cargo hakari manage-deps --yes`, `cargo hakari verify`.
-- [ ] After the `### END HAKARI SECTION` marker of `crates/workspace-hack/Cargo.toml`: `[lints.cargo]` with `unused_dependencies = "allow"`, and a comment that says why.
-- [ ] Each managed crate names the dependency once: `use workspace_hack as _;` in its `lib.rs`, with a one-line comment that says why. Check whether a package with a library and a binary needs it in both.
-- [ ] `deny.toml`: `workspace-hack` as a wrapper of each banned crate that entered it, read from `cargo deny --locked check bans`.
-- [ ] `justfile`: `hakari` (`generate`, then `manage-deps --yes`) and `hakari-check` (`generate --diff`, `manage-deps --dry-run`, `verify`); `verify` gains `hakari-check` after `check-structure`.
-- [ ] CI `checks`: installs `cargo-hakari@0.9.39` and runs `hakari-check` in the code step.
-- [ ] `just verify` is green; `cargo xtask check-arch` is clean with the rules of Task 2, `hack-isolation` and `hack-is-a-stub` included; `xtask`'s `Cargo.toml` is untouched. If a generated file breaks `hack-is-a-stub`, stop and report: do not loosen the rule.
-- [ ] Negative check: add a feature to one crate's `tokio`, see `just hakari-check` fail, run `just hakari`, see it pass, revert.
-- [ ] Measure and note: cold `cargo check -p barras-kernel`, and an incremental `cargo check` after a one-line change in the kernel (budget: 5 s).
-- [ ] Commit: `build(BAR-3): adopt cargo-hakari`
+- [x] `cargo install --locked cargo-hakari@0.9.39`; add it to `just setup`.
+- [x] `cargo hakari init crates/workspace-hack --package-name workspace-hack --yes`.
+- [x] `.config/hakari.toml`: `resolver = "3"`; `platforms = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]`; `workspace-hack-line-style = "workspace-dotted"`; `[traversal-excludes] workspace-members = ["xtask"]`.
+- [x] Root `Cargo.toml`: `workspace-hack = { version = "0.1", path = "crates/workspace-hack" }` in `[workspace.dependencies]`.
+- [x] `cargo hakari generate`, `cargo hakari manage-deps --yes`, `cargo hakari verify`.
+- [x] After the `### END HAKARI SECTION` marker of `crates/workspace-hack/Cargo.toml`: `[lints.cargo]` with `unused_dependencies = "allow"`, and a comment that says why.
+- [x] Each managed crate names the dependency once: `use workspace_hack as _;` in its `lib.rs`, with a one-line comment that says why. Check whether a package with a library and a binary needs it in both.
+- [x] `deny.toml`: `workspace-hack` as a wrapper of each banned crate that entered it, read from `cargo deny --locked check bans`.
+- [x] `justfile`: `hakari` (`generate`, then `manage-deps --yes`) and `hakari-check` (`generate --diff`, `manage-deps --dry-run`, `verify`); `verify` gains `hakari-check` after `check-structure`.
+- [x] CI `checks`: installs `cargo-hakari@0.9.39` and runs `hakari-check` in the code step.
+- [x] `just verify` is green; `cargo xtask check-arch` is clean with the rules of Task 2, `hack-isolation` and `hack-is-a-stub` included; `xtask`'s `Cargo.toml` is untouched. If a generated file breaks `hack-is-a-stub`, stop and report: do not loosen the rule.
+- [x] Negative check: add a feature to one crate's `tokio`, see `just hakari-check` fail, run `just hakari`, see it pass, revert.
+- [x] Measure and note: cold `cargo check -p barras-kernel`, and an incremental `cargo check` after a one-line change in the kernel (budget: 5 s).
+- [x] Commit: `build(BAR-3): adopt cargo-hakari`
 
 ---
 
@@ -781,19 +788,30 @@ ADR-0003, ADR-0015, ADR-0016 and ADR-0017 keep their Decisions. A Consequence th
 **Others:** `docs/standards/testing.md` (tiers, coverage); `docs/standards/module-anatomy.md` (the table rows, in step with `CLAUDE.md`); `docs/README.md` (this spec and plan in the table); `docs/backlog/work-plan.md` (a row for BAR-92, F-14, "Harden the repository checks").
 
 **Steps**
-- [ ] Write the ADRs and the index rows; `just check-structure` is clean.
-- [ ] Update each document against the code as it is now, not against this plan: read the `justfile`, `deny.toml` and the crates first.
-- [ ] Commit: `docs(BAR-3): record the core contract in the ADRs, the rules and the README`
+- [x] Write the ADRs and the index rows; `just check-structure` is clean.
+- [x] Update each document against the code as it is now, not against this plan: read the `justfile`, `deny.toml` and the crates first.
+- [x] Commit: `docs(BAR-3): record the core contract in the ADRs, the rules and the README`
 
 ---
 
 ### Task 16: Whole-branch verification and review (gate)
 
-- [ ] `just verify` from a clean tree, cold and warm; note both times. Over 10 minutes: stop and report what could move out of `verify` (spec §14, risk 3).
-- [ ] Walk the four "Done when" items of the card against spec §11 and name the test that proves each.
-- [ ] Whole-branch review: `agent-skills:code-reviewer` on `develop..HEAD`, and `agent-skills:security-auditor` on `justfile`, `lefthook.yml`, `.github/`, `deny.toml`, `clippy.toml`, `crates/xtask/` and `.config/`.
-- [ ] Fix what the reviews find, each fix test first, each in its own commit.
-- [ ] Move the card to `EN PRUEBA`. Stop: the owner decides the push.
+**Measurements** (Apple M4, 2026-11-16; budgets from ADR-0014):
+
+| Measure | Result | Budget |
+| --- | --- | --- |
+| `just verify` from a clean clone of the final branch, cold | 78 s (86 s and 94 s in earlier runs) | 10 min |
+| `just verify`, warm | 17 s | 10 min |
+| `just test`, warm | 9 s with the doctests (3.3 s for the nextest part) | 30 s |
+| incremental `cargo check --workspace` after a one-line kernel change | 2.8 s right after `just verify`, 0.3 s on a warm check cache | 5 s |
+| cold `cargo check -p barras-kernel` | 3.0 s, 28 crates with the workspace-hack (1.9 s before hakari) | none |
+| CI | read it from the first run of the pull request | 10 min |
+
+- [x] `just verify` from a clean tree, cold and warm; note both times. Over 10 minutes: stop and report what could move out of `verify` (spec §14, risk 3).
+- [x] Walk the four "Done when" items of the card against spec §11 and name the test that proves each.
+- [x] Whole-branch review: `agent-skills:code-reviewer` on `develop..HEAD`, and `agent-skills:security-auditor` on `justfile`, `lefthook.yml`, `.github/`, `deny.toml`, `clippy.toml`, `crates/xtask/` and `.config/`.
+- [x] Fix what the reviews find, each fix test first, each in its own commit.
+- [x] Move the card to `EN PRUEBA`. Stop: the owner decides the push.
 
 ---
 
