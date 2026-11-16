@@ -4,8 +4,8 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use super::{CoverageReport, Lines};
-use crate::arch::{Layer, layer_of};
 use crate::error::escaped;
+use crate::layout::{Layer, layer_of};
 
 /// Percent of production lines, for `crates/kernel` and for each `crates/modules/<m>`.
 const CRATE_BAR: u64 = 95;

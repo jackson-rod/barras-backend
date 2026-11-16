@@ -18,13 +18,12 @@ use lcov::{FileLines, parse_lcov, record};
 use source::Source;
 use sources::{measured_crates, read_sources};
 
-use crate::arch::{Layer, layer_of};
 use crate::error::{XtaskError, escaped};
+use crate::layout::{KERNEL_DIR, Layer, layer_of};
 use crate::regular_file::read_regular_file;
 
 /// A report of this workspace is a few megabytes; anything past this is refused unread.
 const REPORT_LIMIT: u64 = 64 * 1024 * 1024;
-const KERNEL_DIR: &str = "crates/kernel";
 
 /// Production lines the tests ran, out of those the report measured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

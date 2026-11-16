@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 
 use super::source::Source;
 use crate::error::{LayoutProblem, XtaskError};
+use crate::layout::{Layer, PARENTS, crate_folders, layer_of};
 use crate::regular_file::read_regular_file;
+use crate::walk::{EntryKind, walk};
 
 /// A hand-written source is far smaller; anything larger is refused unread.
 const SOURCE_LIMIT: u64 = 1024 * 1024;
@@ -16,26 +18,25 @@ const SOURCE_LIMIT: u64 = 1024 * 1024;
 /// `crates/modules/<m>`, `crates/adapters/<a>`, `crates/bootstrap`, `crates/xtask` and
 /// `apps/<a>` that hold a `Cargo.toml`.
 pub fn measured_crates(root: &Path) -> Result<Vec<PathBuf>, XtaskError> {
-    let mut candidates: Vec<PathBuf> = ["crates/bootstrap", "crates/kernel", "crates/xtask"]
-        .map(PathBuf::from)
-        .into();
-    for parent in ["apps", "crates/modules", "crates/adapters"] {
-        if !is_folder(root, Path::new(parent))? {
-            continue;
-        }
-        let dir = root.join(parent);
-        for entry in fs::read_dir(&dir).map_err(XtaskError::io(&dir))? {
-            let path = entry.map_err(XtaskError::io(&dir))?.path();
-            let name = utf8_name(&path)?;
-            // Hidden entries are never members: check-arch ignores them as well.
-            if !name.starts_with('.') {
-                candidates.push(Path::new(parent).join(name));
-            }
-        }
+    for (parent, _) in PARENTS {
+        is_folder(root, Path::new(parent))?;
     }
     let mut crates = Vec::new();
-    for folder in candidates {
-        if is_folder(root, &folder)? && root.join(&folder).join("Cargo.toml").is_file() {
+    for (folder, kind) in crate_folders(root)? {
+        if matches!(
+            layer_of(&folder),
+            Some(Layer::Testkit | Layer::WorkspaceHack)
+        ) {
+            continue;
+        }
+        utf8_name(&folder)?;
+        if kind == EntryKind::Symlink {
+            return Err(XtaskError::Layout {
+                path: folder,
+                problem: LayoutProblem::Symlink,
+            });
+        }
+        if kind == EntryKind::Folder && root.join(&folder).join("Cargo.toml").is_file() {
             crates.push(folder);
         }
     }
@@ -52,58 +53,48 @@ pub fn read_sources(
     crates: &[PathBuf],
 ) -> Result<BTreeMap<PathBuf, Source>, XtaskError> {
     let mut sources = BTreeMap::new();
-    let mut pending: Vec<PathBuf> = Vec::new();
     for folder in crates {
         let src = folder.join("src");
-        if is_folder(root, &src)? {
-            pending.push(src);
+        if !is_folder(root, &src)? {
+            continue;
         }
-    }
-    while let Some(dir) = pending.pop() {
-        let absolute = root.join(&dir);
-        let mut entries = Vec::new();
-        for entry in fs::read_dir(&absolute).map_err(XtaskError::io(&absolute))? {
-            let entry = entry.map_err(XtaskError::io(&absolute))?;
-            let kind = entry.file_type().map_err(XtaskError::io(&entry.path()))?;
-            entries.push((dir.join(entry.file_name()), kind));
-        }
-        entries.sort_by(|(left, _), (right, _)| left.cmp(right));
-        for (path, kind) in entries {
-            let name = utf8_name(&path)?;
-            let layout = |problem| XtaskError::Layout {
-                path: path.clone(),
-                problem,
-            };
+        let entries = walk(root, &src, |entry| {
+            entry.name().is_some_and(|name| {
+                !name.starts_with('.') && !matches!(name, "tests" | "examples" | "benches")
+            })
+        })?;
+        for entry in entries {
+            let name = utf8_name(&entry.path)?;
             if name.starts_with('.') {
                 continue;
             }
-            if kind.is_symlink() {
-                return Err(layout(LayoutProblem::Symlink));
-            }
-            if kind.is_dir() {
-                match name {
-                    "tests" => {}
-                    "examples" | "benches" => return Err(layout(LayoutProblem::DroppedFolder)),
-                    _ => pending.push(path),
+            let layout = |problem| XtaskError::Layout {
+                path: entry.path.clone(),
+                problem,
+            };
+            match entry.kind {
+                EntryKind::Symlink => return Err(layout(LayoutProblem::Symlink)),
+                EntryKind::Special => return Err(layout(LayoutProblem::SpecialFile)),
+                EntryKind::Folder if matches!(name, "examples" | "benches") => {
+                    return Err(layout(LayoutProblem::DroppedFolder));
                 }
-                continue;
+                EntryKind::Folder => {}
+                EntryKind::File => {
+                    if !name.ends_with(".rs") || name == "tests.rs" {
+                        continue;
+                    }
+                    if name.ends_with("_tests.rs") || name.ends_with("-tests.rs") {
+                        return Err(layout(LayoutProblem::DroppedFileName));
+                    }
+                    let text = read_regular_file(&root.join(&entry.path), SOURCE_LIMIT)?;
+                    let source = Source::read(&text).map_err(|finding| XtaskError::Source {
+                        path: entry.path.clone(),
+                        line: finding.line,
+                        problem: finding.problem,
+                    })?;
+                    sources.insert(entry.path, source);
+                }
             }
-            if !kind.is_file() {
-                return Err(layout(LayoutProblem::SpecialFile));
-            }
-            if !name.ends_with(".rs") || name == "tests.rs" {
-                continue;
-            }
-            if name.ends_with("_tests.rs") || name.ends_with("-tests.rs") {
-                return Err(layout(LayoutProblem::DroppedFileName));
-            }
-            let text = read_regular_file(&root.join(&path), SOURCE_LIMIT)?;
-            let source = Source::read(&text).map_err(|finding| XtaskError::Source {
-                path: path.clone(),
-                line: finding.line,
-                problem: finding.problem,
-            })?;
-            sources.insert(path, source);
         }
     }
     Ok(sources)
