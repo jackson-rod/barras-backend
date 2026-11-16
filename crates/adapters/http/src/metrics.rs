@@ -122,6 +122,44 @@ impl Metrics {
         .map_err(MetricsError::register)?;
         Ok(metrics)
     }
+
+    /// Metrics whose registry also holds a family with a sample and no name, which the text
+    /// format refuses, so that every rendering fails: what the internal port must survive.
+    #[cfg(test)]
+    pub(crate) fn unrenderable(service: ServiceInfo) -> Result<Self, MetricsError> {
+        use std::collections::HashMap;
+
+        use prometheus::core::{Collector, Desc};
+        use prometheus::proto::{Metric, MetricFamily};
+
+        struct Nameless(Desc);
+
+        impl Collector for Nameless {
+            fn desc(&self) -> Vec<&Desc> {
+                vec![&self.0]
+            }
+
+            fn collect(&self) -> Vec<MetricFamily> {
+                let mut family = MetricFamily::default();
+                family.mut_metric().push(Metric::default());
+                vec![family]
+            }
+        }
+
+        let metrics = Self::new(service)?;
+        let desc = Desc::new(
+            "nameless".to_owned(),
+            "Never rendered.".to_owned(),
+            Vec::new(),
+            HashMap::new(),
+        )
+        .map_err(MetricsError::register)?;
+        metrics
+            .registry
+            .register(Box::new(Nameless(desc)))
+            .map_err(MetricsError::register)?;
+        Ok(metrics)
+    }
 }
 
 /// The metrics could not be registered or written out: a fault of this code, never of a

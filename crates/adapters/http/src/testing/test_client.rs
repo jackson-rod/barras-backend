@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 use axum::Router;
 use axum::body::{Body, Bytes, to_bytes};
 use axum::http::header::CONTENT_TYPE;
+use axum::http::response::Parts;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request};
 use serde_json::Value;
 use tower::ServiceExt;
@@ -13,6 +14,7 @@ use tower::ServiceExt;
 use crate::app::HttpApp;
 use crate::error::ApiError;
 use crate::extract::{IS_REQUIRED, is_json};
+use crate::internal::InternalApp;
 use crate::middleware::MatchedRoute;
 use crate::openapi::operations;
 
@@ -26,8 +28,9 @@ use crate::openapi::operations;
 /// Rust name where the body has a camelCase one, say, flags nothing.
 pub struct TestClient {
     router: Router,
-    /// Each operation of the document, as its method and its path template.
-    documented: BTreeSet<(String, String)>,
+    /// Each operation of the document, as its method and its path template; `None` for the
+    /// internal app, whose routes the document does not have.
+    documented: Option<BTreeSet<(String, String)>>,
 }
 
 impl TestClient {
@@ -38,7 +41,16 @@ impl TestClient {
             .collect();
         Self {
             router: app.router(),
-            documented,
+            documented: Some(documented),
+        }
+    }
+
+    /// A client of the internal app, with no route guard: its routes are not in the OpenAPI
+    /// document, by design.
+    pub fn internal(app: &InternalApp) -> Self {
+        Self {
+            router: app.router(),
+            documented: None,
         }
     }
 
@@ -50,38 +62,28 @@ impl TestClient {
         let sent = request.json_body();
         let Ok(response) = self.router.clone().oneshot(request.into_http()).await;
         let (parts, body) = response.into_parts();
-        let matched_route = parts.extensions.get::<MatchedRoute>().cloned();
-        if let Some(served) = &matched_route {
-            self.hold_to_the_document(served);
-        }
         let body = to_bytes(body, usize::MAX).await.unwrap();
-        let response = TestResponse {
-            status: parts.status.as_u16(),
-            headers: parts.headers,
-            body,
-            matched_route,
-        };
+        let response = TestResponse::new(parts, body);
+        if let (Some(served), Some(documented)) = (response.matched_route(), &self.documented) {
+            hold_to_the_document(documented, served);
+        }
         if let Some(sent) = &sent {
             hold_the_keys_to_the_body(&response, sent);
         }
         response
     }
+}
 
-    fn hold_to_the_document(&self, served: &MatchedRoute) {
-        let has = |method: &str| {
-            self.documented
-                .contains(&(method.to_owned(), served.template.clone()))
-        };
-        // axum serves `HEAD` with the `GET` handler of a path that has no `HEAD` of its own.
-        let documented =
-            has(served.method.as_str()) || (served.method == Method::HEAD && has("GET"));
-        if !documented {
-            panic!(
-                "{} {} served the request, and the OpenAPI document has no such operation: \
-                 register the route with ApiRouter::route",
-                served.method, served.template
-            );
-        }
+fn hold_to_the_document(documented: &BTreeSet<(String, String)>, served: &MatchedRoute) {
+    let has = |method: &str| documented.contains(&(method.to_owned(), served.template.clone()));
+    // axum serves `HEAD` with the `GET` handler of a path that has no `HEAD` of its own.
+    let documented = has(served.method.as_str()) || (served.method == Method::HEAD && has("GET"));
+    if !documented {
+        panic!(
+            "{} {} served the request, and the OpenAPI document has no such operation: \
+             register the route with ApiRouter::route",
+            served.method, served.template
+        );
     }
 }
 
@@ -214,6 +216,17 @@ pub struct TestResponse {
 }
 
 impl TestResponse {
+    /// The answer whose head is `parts`, its body read whole, with the route that served it
+    /// when a route of an app in this process did.
+    pub(super) fn new(parts: Parts, body: Bytes) -> Self {
+        Self {
+            status: parts.status.as_u16(),
+            matched_route: parts.extensions.get::<MatchedRoute>().cloned(),
+            headers: parts.headers,
+            body,
+        }
+    }
+
     /// The first value of the header `name`.
     pub fn header(&self, name: &str) -> Option<&str> {
         let value = self.headers.get(name)?;
@@ -238,7 +251,8 @@ impl TestResponse {
         Some(body.get("error")?.get("code")?.as_str()?.to_owned())
     }
 
-    /// The route that served the request; `None` when a fallback answered.
+    /// The route that served the request; `None` when a fallback answered, and on an answer
+    /// that came over a socket.
     pub fn matched_route(&self) -> Option<&MatchedRoute> {
         self.matched_route.as_ref()
     }

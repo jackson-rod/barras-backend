@@ -222,7 +222,7 @@ fn status_of(kind: ErrorKind) -> StatusCode {
 
 /// The error's text, then the text of each of its sources in turn, joined by `": "`: at most
 /// sixteen, because an error whose sources lead back to itself would never end.
-fn with_sources(error: &(dyn Error + 'static)) -> String {
+pub(crate) fn with_sources(error: &(dyn Error + 'static)) -> String {
     std::iter::successors(Some(error), |&error| error.source())
         .take(16)
         .map(ToString::to_string)

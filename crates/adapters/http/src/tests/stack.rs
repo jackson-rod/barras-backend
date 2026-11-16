@@ -440,6 +440,8 @@ fn the_document_is_the_base_with_every_route_under_the_prefix() {
             "/api/v1/bare/{status}",
             "/api/v1/big",
             "/api/v1/content/{status}/{kind}",
+            "/api/v1/health",
+            "/api/v1/health/live",
             "/api/v1/length",
             "/api/v1/members",
             "/api/v1/panic/{payload}",
