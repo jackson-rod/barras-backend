@@ -17,8 +17,11 @@ publish = false
 [workspace.dependencies]
 cargo_metadata = "0.23.1"
 regex = "1.13.1"
+rust_decimal = { version = "1.43.0", default-features = false }
 thiserror = "2.0.21"
 tempfile = "3.27.0"
+time = "0.3.55"
+uuid = "1.29.2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
