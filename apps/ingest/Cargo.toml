@@ -5,5 +5,20 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[dependencies]
+barras-adapter-http.workspace = true
+barras-bootstrap.workspace = true
+tracing.workspace = true
+workspace-hack.workspace = true
+
+[dev-dependencies]
+# `fetch`; the feature is on only here, so it never reaches the binary.
+barras-adapter-http = { workspace = true, features = ["testing"] }
+barras-testkit.workspace = true
+# What the binary answers on its internal port, compared as JSON.
+serde_json.workspace = true
+# The runtime a process test runs `fetch` on.
+tokio = { workspace = true, features = ["rt"] }
+
 [lints]
 workspace = true

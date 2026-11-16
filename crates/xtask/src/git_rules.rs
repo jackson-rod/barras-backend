@@ -57,11 +57,36 @@ pub fn strip_git_noise(raw: &str) -> String {
     text
 }
 
-/// Checks the subject format and rejects AI attribution anywhere in the message.
+/// Checks the subject format, and rejects AI attribution and the markers that skip CI
+/// anywhere in the message.
 pub fn check_commit_message(message: &str) -> Result<(), String> {
     let subject = message.lines().next().unwrap_or("");
     check_subject(subject)?;
-    check_attribution(message)
+    check_attribution(message)?;
+    check_skip_markers(message)
+}
+
+/// The markers that make GitHub start no workflow run: the five bracketed ones, and the
+/// skip-checks trailer. A run that never starts never fails, so no check would see the
+/// change, and a squash merge carries the title and may carry the description onto
+/// develop. GitHub does not document its matching to the letter, so case and the spaces
+/// inside are ignored, and the trailer counts anywhere.
+const SKIP_MARKERS: &str = concat!(
+    r"(?i)\[\s*(skip\s+ci|ci\s+skip|no\s+ci|skip\s+actions|actions\s+skip)\s*\]",
+    r"|skip-checks\s*:\s*true",
+);
+
+fn check_skip_markers(message: &str) -> Result<(), String> {
+    let found = Regex::new(SKIP_MARKERS)
+        .map_err(|e| format!("internal error: invalid pattern {SKIP_MARKERS:?}: {e}"))?
+        .find(message);
+    match found {
+        Some(marker) => Err(format!(
+            "no skip-CI marker rule: GitHub starts no CI run for a message that holds {:?}; remove it",
+            marker.as_str()
+        )),
+        None => Ok(()),
+    }
 }
 
 /// The merge and revert subjects that git and GitHub write themselves. Only these skip the
@@ -266,6 +291,48 @@ mod tests {
         ] {
             let message = format!("build(BAR-2): add the workspace\n\n{body}\n");
             assert!(check_commit_message(&message).is_err(), "{body}");
+        }
+    }
+
+    #[test]
+    fn a_marker_that_makes_github_skip_the_run_is_refused_anywhere_in_any_case() {
+        for marker in [
+            "[skip ci]",
+            "[ci skip]",
+            "[no ci]",
+            "[skip actions]",
+            "[actions skip]",
+            "[Skip CI]",
+            "[NO CI]",
+            "[ skip  actions ]",
+        ] {
+            for message in [
+                format!("docs(BAR-3): fix a typo in the readme {marker}\n"),
+                format!(
+                    "docs(BAR-3): fix a typo in the readme\n\nNothing to build here {marker}.\n"
+                ),
+            ] {
+                assert!(check_commit_message(&message).is_err(), "{message}");
+            }
+        }
+        for trailer in ["skip-checks: true", "skip-checks:true", "Skip-Checks: TRUE"] {
+            let as_a_trailer = format!("docs(BAR-3): fix a typo in the readme\n\n\n{trailer}\n");
+            let in_the_body = format!("docs(BAR-3): fix a typo\n\n{trailer} and more.\n");
+            for message in [as_a_trailer, in_the_body] {
+                assert!(check_commit_message(&message).is_err(), "{message}");
+            }
+        }
+    }
+
+    #[test]
+    fn words_about_skipping_ci_are_not_a_marker() {
+        for body in [
+            "The docs job could skip CI work, but it does not.",
+            "skip-checks: false",
+            "A [skip] list and a [ci] note.",
+        ] {
+            let message = format!("docs(BAR-3): explain the CI\n\n{body}\n");
+            assert!(check_commit_message(&message).is_ok(), "{body}");
         }
     }
 

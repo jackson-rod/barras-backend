@@ -1,6 +1,11 @@
 # Syntax of cargo-deny 0.19+ (licenses/bans/sources schema, version 2).
 # https://embarkstudios.github.io/cargo-deny/
 
+# Every feature of every member, so that a banned crate cannot sit unseen behind
+# an optional dependency that no default feature turns on.
+[graph]
+all-features = true
+
 # Explicit so the policy does not change with the tool's defaults.
 [advisories]
 yanked = "deny"
@@ -28,14 +33,55 @@ ignore = true
 # depend on the banned crate directly. A crate that reaches it through one
 # of them, such as an app through its adapter, is allowed, and that is
 # intended. When a third-party crate that wraps one of these arrives (for
-# example `utoipa-axum`), add it to its row with a comment that says why.
+# example `utoipa-axum`), add it to its row with a comment that says why,
+# and ban it in turn with its adapter as its only wrapper: otherwise any
+# crate could reach the banned crate through it.
 [bans]
+# A `*` requirement takes whatever version is newest whenever the lock file
+# is refreshed. A path dependency between our own unpublished crates has no
+# version to give, so it does not count as one.
+wildcards = "deny"
+allow-wildcard-paths = true
 deny = [
     { crate = "sqlx", wrappers = ["barras-adapter-postgres", "barras-testkit"], reason = "database access lives in the postgres adapter" },
-    { crate = "axum", wrappers = ["barras-adapter-http", "barras-adapter-realtime"], reason = "web framework lives in the HTTP and realtime adapters" },
+    # `utoipa-axum` depends on axum directly: it builds the axum router and the OpenAPI
+    # document from the same handlers, for the HTTP adapter.
+    { crate = "axum", wrappers = ["barras-adapter-http", "barras-adapter-realtime", "utoipa-axum"], reason = "web framework lives in the HTTP and realtime adapters" },
+    { crate = "utoipa-axum", wrappers = ["barras-adapter-http"], reason = "it builds axum routers, so any crate that took it would reach axum past its ban: it lives in the HTTP adapter" },
+    # The crates under axum: without these rows a crate could serve HTTP, or call
+    # out, past the axum ban. `axum` depends on all three directly, `hyper-util` on
+    # `hyper`, and the HTTP adapter on `hyper-util` for its test client.
+    { crate = "axum-core", wrappers = ["barras-adapter-http", "barras-adapter-realtime", "axum"], reason = "the core of the web framework lives in the HTTP and realtime adapters" },
+    { crate = "hyper", wrappers = ["barras-adapter-http", "barras-adapter-realtime", "axum", "hyper-util"], reason = "the HTTP server and client under axum live in the HTTP and realtime adapters" },
+    { crate = "hyper-util", wrappers = ["barras-adapter-http", "barras-adapter-realtime", "axum"], reason = "the HTTP server and client under axum live in the HTTP and realtime adapters" },
     { crate = "reqwest", wrappers = ["barras-adapter-providers"], reason = "outbound HTTP lives in the providers adapter" },
     { crate = "redis", wrappers = ["barras-adapter-redis", "barras-testkit"], reason = "Redis access lives in the redis adapter" },
+    # Alternatives to the crates the ADRs chose. No crate may use them, not even
+    # an adapter: each would be a second way to do what one adapter already owns.
+    { crate = "actix-web", reason = "a second web framework: HTTP is axum, in the HTTP adapter (ADR-0004)" },
+    { crate = "rocket", reason = "a second web framework: HTTP is axum, in the HTTP adapter (ADR-0004)" },
+    { crate = "warp", reason = "a second web framework: HTTP is axum, in the HTTP adapter (ADR-0004)" },
+    { crate = "poem", reason = "a second web framework: HTTP is axum, in the HTTP adapter (ADR-0004)" },
+    { crate = "salvo", reason = "a second web framework: HTTP is axum, in the HTTP adapter (ADR-0004)" },
+    { crate = "tide", reason = "a second web framework: HTTP is axum, in the HTTP adapter (ADR-0004)" },
+    { crate = "diesel", reason = "an ORM: data access is hand-written SQL with sqlx, in the postgres adapter (ADR-0007)" },
+    { crate = "sea-orm", reason = "an ORM: data access is hand-written SQL with sqlx, in the postgres adapter (ADR-0007)" },
+    { crate = "tokio-postgres", reason = "a second Postgres driver: data access is sqlx, in the postgres adapter (ADR-0007)" },
+    { crate = "ureq", reason = "a second HTTP client: outbound HTTP is reqwest, in the providers adapter (ADR-0024)" },
+    { crate = "surf", reason = "a second HTTP client: outbound HTTP is reqwest, in the providers adapter (ADR-0024)" },
+    { crate = "isahc", reason = "a second HTTP client: outbound HTTP is reqwest, in the providers adapter (ADR-0024)" },
+    { crate = "curl", reason = "a second HTTP client: outbound HTTP is reqwest, in the providers adapter (ADR-0024)" },
 ]
+
+# axum's own `Json`, `Query` and `Form` extractors exist only with these features. Their
+# rejections are not envelopes, and their messages quote what the caller sent, so a handler
+# takes its body and its query through the HTTP adapter's validating extractors instead.
+# `default-features = false` in every crate keeps them off; this keeps them off whatever a
+# crate writes, `default` included, which turns on all three.
+[[bans.features]]
+crate = "axum"
+deny = ["form", "json", "query"]
+reason = "the stock extractors answer with rejections that are not envelopes and quote the caller's input; handlers use ValidatedJson and ValidatedQuery (ADR-0029)"
 
 [sources]
 unknown-registry = "deny"

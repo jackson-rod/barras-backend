@@ -211,7 +211,7 @@ Adapters mirror the modules: `crates/adapters/postgres/src/<module>/<name>_repos
 
 - Cargo enforces most of this: a module crate cannot import what its `Cargo.toml` does not list.
 - `cargo deny check bans` restricts which crates may depend on sqlx, axum, reqwest and redis.
-- `cargo xtask check-arch` reads `cargo metadata` and fails on any dependency outside each crate's allowlist.
+- `cargo xtask check-arch` reads `cargo metadata` and fails on any dependency outside each crate's allowlist. Only the kernel and the modules have an allowlist; ADR-0024 lists what it checks for every layer.
 - A module that needs something from another module declares its own port. The composition root supplies a bridge that calls the other module's use case. Example: `capital` declares `ExchangeRates`; the bridge calls `indicators`.
 
 Reject on sight: a framework type in a module crate; a database row type in a use case signature; a handler calling a repository; a module depending on another module; `unwrap`, `expect` or `panic!` outside tests.

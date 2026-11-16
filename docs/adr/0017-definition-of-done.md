@@ -25,3 +25,4 @@ Coverage: 95% of lines in module crates and in frontend `domain` and `applicatio
 - Cost: tests, metadata and docs are part of every change.
 - `just verify` runs everything CI runs, and `just test-cov` applies the coverage thresholds.
 - `just check-structure` checks the module README, tests per layer and the ADR index.
+- Pointer: ADR-0027 says how coverage is measured: production lines only, crate by crate, with the kernel held to the modules' bar. `just verify` runs what CI runs apart from the branch, commit and pull request checks and the tree check (`justfile`).

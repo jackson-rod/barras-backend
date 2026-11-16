@@ -1,10 +1,11 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)] // a CLI: its output is the product
 
+use std::path::Path;
 use std::process::{Command, ExitCode};
 
-use xtask::{arch, git_rules, structure};
+use xtask::{arch, coverage, git_rules, structure};
 
-const USAGE: &str = "subcommands:\n  check-branch [name]\n  check-commit-msg <file>\n  check-commits <range>\n  check-pr <file>\n  check-arch\n  check-structure";
+const USAGE: &str = "subcommands:\n  check-branch [name]\n  check-commit-msg <file>\n  check-commits <range>\n  check-pr <file>\n  check-arch\n  check-structure\n  check-coverage <lcov-file> [workspace-root]";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -17,6 +18,10 @@ fn main() -> ExitCode {
         ["check-pr", file] => check_pr_file(file),
         ["check-arch"] => check_architecture(),
         ["check-structure"] => check_repository_structure(),
+        ["check-coverage", report] => check_coverage_report(report, &arch::workspace_root()),
+        // The root is an argument so that the tests of this binary can measure a
+        // temporary workspace. `just test-cov` gives none.
+        ["check-coverage", report, root] => check_coverage_report(report, Path::new(root)),
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);
@@ -113,5 +118,20 @@ fn check_repository_structure() -> Problems {
         Ok(())
     } else {
         Err(problems)
+    }
+}
+
+/// Prints every figure before failing, so a failed run still shows where each crate stands.
+fn check_coverage_report(report: &str, root: &Path) -> Problems {
+    let measured = coverage::measure_coverage_file(root, Path::new(report))
+        .map_err(|e| vec![e.to_string()])?;
+    for line in measured.summary() {
+        println!("{line}");
+    }
+    let failures = coverage::judge(&measured);
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.iter().map(ToString::to_string).collect())
     }
 }

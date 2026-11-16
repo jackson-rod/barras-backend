@@ -5,5 +5,41 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[dependencies]
+# `tokio` and `http1` for `axum::serve`.
+axum = { workspace = true, features = ["http1", "matched-path", "tokio"] }
+barras-kernel.workspace = true
+form_urlencoded = { workspace = true, features = ["alloc"] }
+garde.workspace = true
+# The client of `testing::fetch`.
+hyper-util = { workspace = true, optional = true, features = ["client-legacy", "http1", "tokio"] }
+prometheus.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+serde_path_to_error.workspace = true
+serde_urlencoded.workspace = true
+# The listeners, the shutdown of both servers, and the probes run at once with a time limit.
+tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
+tower = { workspace = true, features = ["util"] }
+tower-http = { workspace = true, features = ["catch-panic", "compression-br", "compression-gzip", "request-id", "trace"] }
+tracing.workspace = true
+utoipa = { workspace = true, features = ["macros"] }
+utoipa-axum.workspace = true
+uuid = { workspace = true, features = ["v7"] }
+workspace-hack.workspace = true
+
+[features]
+# `TestClient`, its route guard and `fetch`, for the tests of the crates that build an app.
+testing = ["dep:hyper-util"]
+
+[dev-dependencies]
+# The fixtures derive their rules; the extractors need only the trait.
+garde = { workspace = true, features = ["derive", "email"] }
+http-body-util.workspace = true
+hyper-util = { workspace = true, features = ["client-legacy", "http1", "tokio"] }
+# `test-util` pauses the clock, so that a probe's time limit is tested without waiting.
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
+tracing-subscriber = { workspace = true, features = ["fmt", "json"] }
+
 [lints]
 workspace = true

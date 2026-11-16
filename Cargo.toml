@@ -3,9 +3,10 @@ resolver = "3"
 members = [
   "apps/api", "apps/ingest",
   "crates/kernel",
+  "crates/bootstrap",
   "crates/adapters/postgres", "crates/adapters/http", "crates/adapters/realtime",
   "crates/adapters/redis", "crates/adapters/providers",
-  "crates/testkit", "crates/xtask",
+  "crates/testkit", "crates/workspace-hack", "crates/xtask",
 ]
 
 [workspace.package]
@@ -15,10 +16,37 @@ rust-version = "1.100"
 publish = false
 
 [workspace.dependencies]
+axum = { version = "0.8.9", default-features = false }
+barras-adapter-http = { path = "crates/adapters/http" }
+barras-bootstrap = { path = "crates/bootstrap" }
+barras-kernel = { path = "crates/kernel" }
+barras-testkit = { path = "crates/testkit" }
 cargo_metadata = "0.23.1"
+form_urlencoded = { version = "1.2.2", default-features = false }
+garde = { version = "0.23.0", default-features = false }
+http-body-util = "0.1.5"
+hyper-util = { version = "0.1.21", default-features = false }
+proc-macro2 = { version = "1.0.107", default-features = false }
+prometheus = { version = "0.14.0", default-features = false }
 regex = "1.13.1"
+rust_decimal = { version = "1.43.0", default-features = false }
+serde = "1.0.229"
+serde_json = "1.0.154"
+serde_path_to_error = "0.1.20"
+serde_urlencoded = "0.7.1"
+syn = { version = "3.0.10", default-features = false }
 thiserror = "2.0.21"
 tempfile = "3.27.0"
+time = "0.3.55"
+tokio = "1.54.1"
+tower = { version = "0.5.3", default-features = false }
+tower-http = { version = "0.7.1", default-features = false }
+tracing = { version = "0.1.44", default-features = false }
+tracing-subscriber = { version = "0.3.23", default-features = false }
+utoipa = { version = "6.0.0", default-features = false }
+utoipa-axum = "0.3.0"
+uuid = "1.29.2"
+workspace-hack = { version = "0.1", path = "crates/workspace-hack" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

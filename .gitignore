@@ -4,4 +4,3 @@ target/
 !.env.example
 .DS_Store
 lcov.info
-*.profraw
