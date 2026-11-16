@@ -31,5 +31,9 @@ When something is not covered: if the decision for an area does not exist, stop 
 | [0021](0021-news-headline-and-link.md) | News as headline and link | Accepted |
 | [0022](0022-informational-suggestions.md) | Informational suggestions and chatbot | Accepted |
 | [0023](0023-subscriptions-through-the-stores.md) | Subscriptions through the stores | Accepted |
-| [0024](0024-enforcement-of-the-layer-rule.md) | Enforcement of the layer rule | Proposed |
+| [0024](0024-enforcement-of-the-layer-rule.md) | Enforcement of the layer rule | Accepted |
 | [0025](0025-tickets-cards-and-merges.md) | Tickets, cards and merges | Proposed |
+| [0026](0026-process-start-up-crate.md) | The process start-up crate | Accepted |
+| [0027](0027-test-tiers-and-coverage.md) | Test tiers and coverage | Accepted |
+| [0028](0028-openapi-pipeline.md) | The OpenAPI pipeline | Accepted |
+| [0029](0029-http-contract-details.md) | Details of the HTTP contract | Accepted |

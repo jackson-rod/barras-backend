@@ -22,3 +22,4 @@ Date: 2026-11-15
 - Cost: a bridge and a port for each cross-module need, and hand-written wiring. Dynamic dispatch costs nothing measurable next to a database call.
 - Cargo rejects an import that `Cargo.toml` does not list. `cargo deny check bans` restricts who may depend on sqlx, axum, reqwest and redis.
 - `cargo xtask check-arch` fails on any dependency outside a crate's allowlist. Both run in `just check-arch`.
+- Pointer: only the kernel and the modules have an allowlist in `check-arch`; ADR-0024 lists what it checks for every layer, and ADR-0026 adds the row of `crates/bootstrap`.

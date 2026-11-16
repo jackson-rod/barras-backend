@@ -21,3 +21,4 @@ Date: 2026-11-15
 - Cost: a second, internal port to expose and protect.
 - clippy denies `println!` and `dbg!` outside tests (`just lint`).
 - No automated check of the log content is named in the spec: the rule on credentials and tokens is enforced by review.
+- Pointer: ADR-0029 sets the routes and answers of the internal port, and the fields of the request log, whose test proves it leaves out headers, the query string and the body.

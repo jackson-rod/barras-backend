@@ -23,3 +23,4 @@ Date: 2026-11-15
 - Cost: every change needs a ticket before it has a branch.
 - lefthook runs the checks: `commit-msg` checks the message and `pre-push` checks the branch name and runs `just verify`. Bypassing the hooks is not allowed.
 - CI repeats the branch name and commit message checks, and `xtask` implements them.
+- Pointer: the commit and pull request checks also refuse the markers that make GitHub start no CI run: `[skip ci]`, `[ci skip]`, `[no ci]`, `[skip actions]` and `[actions skip]`, in any case and with any spaces inside the brackets, and a `skip-checks: true` trailer wherever it stands (`crates/xtask/src/git_rules.rs`). Making `checks`, `test` and `build` required checks on `develop` and `main` is an open owner decision.
