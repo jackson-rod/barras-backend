@@ -83,7 +83,7 @@ test:
 test-doc:
     cargo test --workspace --doc --locked
 
-# The test targets named e2e_ or int_: they start the real binaries, and from BAR-4 containers
+# The test targets named e2e_ or int_: a whole binary, in process or as a real process; from BAR-4 also adapters against real systems
 test-int:
     cargo nextest run --workspace --locked -E 'binary(/^(e2e|int)_/)'
 
@@ -96,15 +96,29 @@ test-int:
 test-cov:
     mkdir -p target/coverage
     cargo llvm-cov nextest --workspace --locked --no-cfg-coverage --lcov --output-path target/coverage/lcov.info
+    just _no-stray-profiles
     cargo xtask check-coverage target/coverage/lcov.info
+
+# A process that lost LLVM_PROFILE_FILE writes its coverage profile into its working folder
+# instead of target/, and its lines then count as never run, while the thresholds can still
+# pass. Checked before them, so that a figure a lost profile lowered fails with its cause.
+_no-stray-profiles:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    stray="$(find . \( -path ./target -o -path ./.git \) -prune -o -name '*.profraw' -print)"
+    if [[ -n "$stray" ]]; then
+        printf 'coverage profiles outside target/, from a process that lost LLVM_PROFILE_FILE; delete them once that is fixed:\n%s\n' "$stray" >&2
+        exit 1
+    fi
 
 build:
     cargo build --workspace --release --locked
 
-# check-arch, check-structure and hakari-check read the workspace before anything compiles it, so
-# no build script of the change can rewrite what they read: cargo xtask builds only xtask, and
-# cargo metadata runs no build script. hakari-check comes after check-arch, whose --locked fails
-# on a stale Cargo.lock before cargo hakari's own cargo metadata could rewrite it.
+# In CI's order. check-arch, check-structure, hakari-check, fmt-check and deny compile no
+# member, so they read the workspace before any build script of the change runs: cargo xtask
+# builds only xtask, and cargo metadata runs no build script. hakari-check comes after
+# check-arch, whose --locked fails on a stale Cargo.lock before cargo hakari's own cargo
+# metadata could rewrite it.
 
-# What CI runs, apart from the branch, commit and pull request checks
-verify: fmt-check check-arch check-structure hakari-check lint deny openapi-check test-cov test-doc build
+# What CI runs, apart from the branch, commit and pull request checks and the tree check
+verify: check-arch check-structure hakari-check fmt-check deny lint openapi-check test-cov test-doc build
