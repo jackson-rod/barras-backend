@@ -10,6 +10,7 @@ use axum::routing::MethodRouter;
 use utoipa::openapi::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 
+use crate::metrics::Metrics;
 use crate::middleware;
 use crate::openapi::{canonical_json, document_base};
 use crate::router::ApiRouter;
@@ -32,9 +33,11 @@ pub struct HttpApp {
 }
 
 impl HttpApp {
-    pub fn builder(service: ServiceInfo) -> HttpAppBuilder {
+    /// An app that records every answer it gives in `metrics`.
+    pub fn builder(service: ServiceInfo, metrics: Metrics) -> HttpAppBuilder {
         HttpAppBuilder {
             service,
+            metrics,
             routes: ApiRouter::new(),
             #[cfg(any(test, feature = "testing"))]
             undocumented: Router::new(),
@@ -64,6 +67,7 @@ impl HttpApp {
 /// Gathers the routes of the app. Only [`ApiRouter`] adds one, so every route is documented.
 pub struct HttpAppBuilder {
     service: ServiceInfo,
+    metrics: Metrics,
     routes: ApiRouter,
     #[cfg(any(test, feature = "testing"))]
     undocumented: Router,
@@ -103,7 +107,7 @@ impl HttpAppBuilder {
         let router = router.merge(self.undocumented);
         Ok(HttpApp {
             service: self.service,
-            router: middleware::wrap(router),
+            router: middleware::wrap(router, self.metrics),
             document,
         })
     }

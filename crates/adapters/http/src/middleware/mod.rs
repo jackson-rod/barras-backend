@@ -1,13 +1,15 @@
 //! The middleware every public answer goes through, and the fallbacks it wraps.
 
 mod fallback;
+mod http_metrics;
 mod matched_route;
 mod request_id;
+mod request_log;
 mod safety_net;
 
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
-use axum::middleware::{from_fn, map_response};
+use axum::middleware::{from_fn_with_state, map_response};
 use tower::ServiceBuilder;
 use tower::util::MapRequestLayer;
 use tower_http::catch_panic::CatchPanicLayer;
@@ -17,14 +19,17 @@ use tower_http::request_id::{PropagateRequestIdLayer, SetRequestIdLayer};
 
 pub use matched_route::MatchedRoute;
 
+use crate::metrics::Metrics;
+
 /// The largest request body read, in bytes (spec §6.4).
 const BODY_LIMIT: usize = 1024 * 1024;
 
 /// The smallest response body compressed, in bytes (spec §6.4).
 const COMPRESS_FROM: u64 = 1024;
 
-/// `router` with its fallbacks, wrapped in the stack, outermost layer first.
-pub(crate) fn wrap(router: Router) -> Router {
+/// `router` with its fallbacks, wrapped in the stack, outermost layer first, its answers
+/// recorded in `metrics`.
+pub(crate) fn wrap(router: Router, metrics: Metrics) -> Router {
     router
         .fallback(fallback::route_not_found)
         // It patches only the routes registered before it, so it is the last routing call.
@@ -38,10 +43,18 @@ pub(crate) fn wrap(router: Router) -> Router {
                 .layer(SetRequestIdLayer::x_request_id(
                     request_id::MakeRequestUuidV7,
                 ))
+                // Inside the layer that sets the id, so that its span has it, and outside every
+                // layer that answers or changes a status, so that it logs the status sent.
+                .layer(request_log::request_log())
                 // Outside every layer that writes an answer of its own, so that each carries
                 // the id: the panic handler's, the safety net's.
                 .layer(PropagateRequestIdLayer::x_request_id())
-                .layer(from_fn(matched_route::record_matched_route))
+                // Outside every layer that answers or changes a status, so that it counts the
+                // status the caller gets.
+                .layer(from_fn_with_state(
+                    metrics,
+                    http_metrics::record_http_metrics,
+                ))
                 .layer(map_response(safety_net::envelope_safety_net))
                 // An `Accept-Encoding` that refuses every encoding, such as `identity;q=0`,
                 // still runs the handler: this layer then changes only the status of its answer

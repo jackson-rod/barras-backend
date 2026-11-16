@@ -23,6 +23,7 @@ form_urlencoded = { version = "1.2.2", default-features = false }
 garde = { version = "0.23.0", default-features = false }
 http-body-util = "0.1.5"
 proc-macro2 = { version = "1.0.107", default-features = false }
+prometheus = { version = "0.14.0", default-features = false }
 regex = "1.13.1"
 rust_decimal = { version = "1.43.0", default-features = false }
 serde = "1.0.229"

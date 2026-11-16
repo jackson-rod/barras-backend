@@ -10,12 +10,13 @@ axum = { workspace = true, features = ["matched-path"] }
 barras-kernel.workspace = true
 form_urlencoded = { workspace = true, features = ["alloc"] }
 garde.workspace = true
+prometheus.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 serde_path_to_error.workspace = true
 serde_urlencoded.workspace = true
 tower = { workspace = true, features = ["util"] }
-tower-http = { workspace = true, features = ["catch-panic", "compression-br", "compression-gzip", "request-id"] }
+tower-http = { workspace = true, features = ["catch-panic", "compression-br", "compression-gzip", "request-id", "trace"] }
 tracing.workspace = true
 utoipa = { workspace = true, features = ["macros"] }
 utoipa-axum.workspace = true
@@ -30,7 +31,7 @@ testing = []
 garde = { workspace = true, features = ["derive", "email"] }
 http-body-util.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
-tracing-subscriber = { workspace = true, features = ["fmt"] }
+tracing-subscriber = { workspace = true, features = ["fmt", "json"] }
 
 [lints]
 workspace = true

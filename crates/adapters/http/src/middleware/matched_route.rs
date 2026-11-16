@@ -2,7 +2,6 @@
 
 use axum::extract::{MatchedPath, Request};
 use axum::http::Method;
-use axum::middleware::Next;
 use axum::response::Response;
 
 use super::fallback::ServedByFallback;
@@ -17,23 +16,28 @@ pub struct MatchedRoute {
     pub template: String,
 }
 
-pub(crate) async fn record_matched_route(request: Request, next: Next) -> Response {
-    // `Router::layer` runs this inside each route, after routing, so the template is known.
-    let served = request
-        .extensions()
-        .get::<MatchedPath>()
-        .map(|template| MatchedRoute {
-            method: request.method().clone(),
-            template: template.as_str().to_owned(),
-        });
-    let mut response = next.run(request).await;
-    let extensions = response.extensions_mut();
-    // Only this layer says which route served a request, whatever a handler wrote.
-    extensions.remove::<MatchedRoute>();
-    if let Some(served) = served
-        && extensions.get::<ServedByFallback>().is_none()
-    {
-        extensions.insert(served);
+impl MatchedRoute {
+    /// The route whose path `request` matched, read before the request is handed on. Only a
+    /// layer that `Router::layer` runs inside each route, after routing, knows the template.
+    pub(super) fn of(request: &Request) -> Option<Self> {
+        request
+            .extensions()
+            .get::<MatchedPath>()
+            .map(|template| Self {
+                method: request.method().clone(),
+                template: template.as_str().to_owned(),
+            })
     }
-    response
+
+    /// Puts `served` on `response`, unless a fallback answered it. Only this says which route
+    /// served a request, whatever a handler wrote.
+    pub(super) fn record(served: Option<Self>, response: &mut Response) {
+        let extensions = response.extensions_mut();
+        extensions.remove::<Self>();
+        if let Some(served) = served
+            && extensions.get::<ServedByFallback>().is_none()
+        {
+            extensions.insert(served);
+        }
+    }
 }

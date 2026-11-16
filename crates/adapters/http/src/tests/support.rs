@@ -20,7 +20,7 @@ use utoipa_axum::routes;
 use crate::testing::{TestClient, TestRequest, TestResponse};
 use crate::{
     Access, ApiError, ApiResult, ApiRouter, ApiSuccess, ErrorEnvelope, FieldErrors, HttpApp,
-    NoData, ServiceInfo, SuccessEnvelope, ValidatedJson, ValidatedQuery,
+    Metrics, NoData, ServiceInfo, SuccessEnvelope, ValidatedJson, ValidatedQuery,
 };
 
 pub(super) const SERVICE: ServiceInfo = ServiceInfo {
@@ -265,8 +265,18 @@ pub(super) fn fixture_routes() -> ApiRouter {
         )
 }
 
+/// Metrics of their own, for one app.
+pub(super) fn fixture_metrics() -> Metrics {
+    Metrics::new(SERVICE).unwrap()
+}
+
 pub(super) fn fixture_app() -> HttpApp {
-    HttpApp::builder(SERVICE)
+    fixture_app_with(fixture_metrics())
+}
+
+/// The fixture app, recording what it answers in `metrics`.
+pub(super) fn fixture_app_with(metrics: Metrics) -> HttpApp {
+    HttpApp::builder(SERVICE, metrics)
         .routes(fixture_routes())
         .build()
         .unwrap()
@@ -292,6 +302,13 @@ pub(super) fn assert_error(response: &TestResponse, status: u16, code: &str) {
 /// Keeps what a subscriber writes, for the test that holds a clone.
 #[derive(Clone, Default)]
 struct Capture(Arc<Mutex<Vec<u8>>>);
+
+impl Capture {
+    fn text(&self) -> String {
+        let written = self.0.lock().unwrap().clone();
+        String::from_utf8(written).unwrap()
+    }
+}
 
 impl io::Write for Capture {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
@@ -329,7 +346,36 @@ pub(super) async fn send_logged(
             .set_default();
         client.send(request).await
     };
-    let written = capture.0.lock().unwrap().clone();
-    let text = String::from_utf8(written).unwrap();
-    (response, text.lines().map(str::to_owned).collect())
+    (
+        response,
+        capture.text().lines().map(str::to_owned).collect(),
+    )
+}
+
+/// The answer to `request`, and each line the app logged meanwhile, at any level, parsed: the
+/// JSON of every deployed environment (appendix A.5 of the plan), so that a test reads the
+/// fields as an operator queries them. As for `send_logged`, the subscriber is the default of
+/// this thread only.
+pub(super) async fn send_logged_json(
+    client: &TestClient,
+    request: TestRequest,
+) -> (TestResponse, Vec<Value>) {
+    let capture = Capture::default();
+    let response = {
+        let _default = tracing_subscriber::fmt()
+            .json()
+            .with_current_span(false)
+            .with_span_list(true)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(capture.clone())
+            .finish()
+            .set_default();
+        client.send(request).await
+    };
+    let lines = capture
+        .text()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap_or_else(|error| panic!("{error}: {line}")))
+        .collect();
+    (response, lines)
 }
