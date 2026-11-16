@@ -30,13 +30,39 @@ ignore = true
 # intended. When a third-party crate that wraps one of these arrives (for
 # example `utoipa-axum`), add it to its row with a comment that says why.
 [bans]
+# A `*` requirement takes whatever version is newest whenever the lock file
+# is refreshed. A path dependency between our own unpublished crates has no
+# version to give, so it does not count as one.
+wildcards = "deny"
+allow-wildcard-paths = true
 deny = [
     { crate = "sqlx", wrappers = ["barras-adapter-postgres", "barras-testkit"], reason = "database access lives in the postgres adapter" },
     # `utoipa-axum` depends on axum directly: it builds the axum router and the OpenAPI
     # document from the same handlers, for the HTTP adapter.
     { crate = "axum", wrappers = ["barras-adapter-http", "barras-adapter-realtime", "utoipa-axum"], reason = "web framework lives in the HTTP and realtime adapters" },
+    # The crates under axum: without these rows a crate could serve HTTP, or call
+    # out, past the axum ban. `axum` depends on all three directly, `hyper-util` on
+    # `hyper`, and the HTTP adapter on `hyper-util` for its test client.
+    { crate = "axum-core", wrappers = ["barras-adapter-http", "barras-adapter-realtime", "axum"], reason = "the core of the web framework lives in the HTTP and realtime adapters" },
+    { crate = "hyper", wrappers = ["barras-adapter-http", "barras-adapter-realtime", "axum", "hyper-util"], reason = "the HTTP server and client under axum live in the HTTP and realtime adapters" },
+    { crate = "hyper-util", wrappers = ["barras-adapter-http", "barras-adapter-realtime", "axum"], reason = "the HTTP server and client under axum live in the HTTP and realtime adapters" },
     { crate = "reqwest", wrappers = ["barras-adapter-providers"], reason = "outbound HTTP lives in the providers adapter" },
     { crate = "redis", wrappers = ["barras-adapter-redis", "barras-testkit"], reason = "Redis access lives in the redis adapter" },
+    # Alternatives to the crates the ADRs chose. No crate may use them, not even
+    # an adapter: each would be a second way to do what one adapter already owns.
+    { crate = "actix-web", reason = "a second web framework: HTTP is axum, in the HTTP adapter (ADR-0004)" },
+    { crate = "rocket", reason = "a second web framework: HTTP is axum, in the HTTP adapter (ADR-0004)" },
+    { crate = "warp", reason = "a second web framework: HTTP is axum, in the HTTP adapter (ADR-0004)" },
+    { crate = "poem", reason = "a second web framework: HTTP is axum, in the HTTP adapter (ADR-0004)" },
+    { crate = "salvo", reason = "a second web framework: HTTP is axum, in the HTTP adapter (ADR-0004)" },
+    { crate = "tide", reason = "a second web framework: HTTP is axum, in the HTTP adapter (ADR-0004)" },
+    { crate = "diesel", reason = "an ORM: data access is hand-written SQL with sqlx, in the postgres adapter (ADR-0007)" },
+    { crate = "sea-orm", reason = "an ORM: data access is hand-written SQL with sqlx, in the postgres adapter (ADR-0007)" },
+    { crate = "tokio-postgres", reason = "a second Postgres driver: data access is sqlx, in the postgres adapter (ADR-0007)" },
+    { crate = "ureq", reason = "a second HTTP client: outbound HTTP is reqwest, in the providers adapter (ADR-0024)" },
+    { crate = "surf", reason = "a second HTTP client: outbound HTTP is reqwest, in the providers adapter (ADR-0024)" },
+    { crate = "isahc", reason = "a second HTTP client: outbound HTTP is reqwest, in the providers adapter (ADR-0024)" },
+    { crate = "curl", reason = "a second HTTP client: outbound HTTP is reqwest, in the providers adapter (ADR-0024)" },
 ]
 
 [sources]
