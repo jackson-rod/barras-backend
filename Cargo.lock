@@ -214,9 +214,6 @@ dependencies = [
 [[package]]
 name = "barras-testkit"
 version = "0.1.0"
-dependencies = [
- "workspace-hack",
-]
 
 [[package]]
 name = "bitflags"
@@ -1546,6 +1543,7 @@ dependencies = [
  "serde",
  "serde_core",
  "syn 3.0.10",
+ "tracing-core",
  "uuid",
 ]
 

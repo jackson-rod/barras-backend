@@ -18,6 +18,7 @@ publish = false
 memchr = { version = "2" }
 serde = { version = "1", features = ["derive"] }
 serde_core = { version = "1", features = ["alloc"] }
+tracing-core = { version = "0.1" }
 uuid = { version = "1", features = ["v4", "v7"] }
 
 [build-dependencies]

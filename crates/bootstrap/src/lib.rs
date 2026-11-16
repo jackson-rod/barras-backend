@@ -2,7 +2,7 @@
 //! logs, the signal that stops them, and the text of a failure that stops them. Only the
 //! crates under `apps/` depend on it.
 
-// Taken for its features, not code; named so cargo's unused-dependency lint lets `just lint` pass.
+// Taken for its features, not code; named so that cargo never reports it as an unused dependency.
 use workspace_hack as _;
 
 mod environment;

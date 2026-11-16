@@ -1,6 +1,7 @@
 # Settings of `cargo hakari`, which generates `crates/workspace-hack` (ADR-0024).
 # The options: https://docs.rs/cargo-hakari/0.9.39/cargo_hakari/config/index.html
-# After a change here or to any dependency, run `just hakari`; `just hakari-check` fails until then.
+# Run `just hakari` after a change here or to any dependency: `just hakari-check` fails while the
+# generated crate or a member's line to it would change.
 
 hakari-package = "workspace-hack"
 
@@ -12,37 +13,44 @@ dep-format-version = "4"
 resolver = "3"
 
 # On top of the features every platform shares, hakari unifies those of the platforms we build
-# on: the developers' Macs and CI's Linux runners.
+# on: the developers' Macs and CI's Linux runners. `just hakari-check` compares the release
+# build with and without the generated crate on each of them.
 platforms = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]
 
 # Every dependency is declared once in `[workspace.dependencies]` of the root `Cargo.toml` and
 # taken with `.workspace = true`, the workspace-hack included.
 workspace-hack-line-style = "workspace-dotted"
 
-# hakari works out the generated crate as if these did not exist.
+# hakari works out the generated crate as if these did not exist. `[final-excludes]` would drop
+# only their lines: hakari would still unify the rest as if they were there, so a member's needs
+# would still shape the generated crate, and `cargo hakari verify` would fail on the third-party
+# crates reached through one (futures-core, tracing-core, syn and others).
 [traversal-excludes]
-# The repository tool depends on no workspace crate (`tool-isolation`), and what it needs
-# (syn, regex, cargo_metadata) must not shape what the other crates build. `[final-excludes]`
-# would still let its features in.
-workspace-members = ["xtask"]
-# Every member depends on the generated crate, so whatever it holds reaches the release build.
+workspace-members = [
+    # Test support that only dev-dependencies take. hakari counts a member's normal dependencies
+    # as production, so through the generated crate the testkit's would reach the binaries'
+    # release builds.
+    "barras-testkit",
+    # The repository tool depends on no workspace crate (`tool-isolation`), and what it needs
+    # (syn, regex, cargo_metadata) must not shape what the other crates build.
+    "xtask",
+]
+# Every member depends on the generated crate, so whatever it holds reaches its release build.
 # hakari unifies each member's builds with and without its dev-dependencies, and with all its
-# features (`testing` included), and has no option to leave either out. So a crate whose extra
-# features only tests ask for stays out, and cargo resolves it as it would without hakari.
-# `[final-excludes]` would drop only its line: hakari would still unify the rest as if it were
-# there, and `cargo hakari verify` would then fail on the crates it reaches (futures-core,
-# tracing-core, syn and others). After `just hakari`, a crate that gains such a feature in the
-# generated crate joins this list.
+# features (`testing` included), and has no option to leave either out. So a crate that only
+# tests ask more of stays out, and cargo resolves it as it would without hakari. `just
+# hakari-check` fails, naming the crate and the feature, when the generated crate changes a
+# release build.
 third-party = [
     # `derive` and `email`: only the HTTP adapter's test fixtures derive their rules.
     { name = "garde" },
-    # The HTTP client (`client`, `client-legacy`): only the HTTP adapter's dev-dependencies and
-    # its `testing` feature, which only dev-dependencies turn on, use it.
+    # Banned outside the HTTP and realtime adapters (`deny.toml`): left out so that the generated
+    # crate never takes it directly, which would make the generated crate one of its wrappers.
     { name = "hyper" },
+    # `client-legacy`, the test client's: only the HTTP adapter's dev-dependencies and its
+    # `testing` feature, which only dev-dependencies turn on, ask for it.
     { name = "hyper-util" },
     # `test-util`, which pauses the clock in the HTTP adapter's tests; tokio itself treats it in
     # a release build as an accident.
     { name = "tokio" },
-    # `std`: only the HTTP client above asks for it.
-    { name = "tracing" },
 ]

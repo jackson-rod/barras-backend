@@ -81,11 +81,18 @@ jobs:
       # From here to the pull request text, nothing compiles a member, so no build
       # script of the change runs before these have read the workspace: cargo xtask
       # builds only xtask, and cargo metadata, which cargo deny and cargo hakari
-      # read, runs no build script. hakari-check only reads: a command that
-      # rewrote the workspace-hack would fail the tree check below.
-      - name: Architecture, structure and the workspace-hack
+      # read, and cargo tree run no build script.
+      - name: Architecture and structure
         if: ${{ !cancelled() }}
-        run: just check-arch check-structure hakari-check
+        run: just check-arch check-structure
+      # Its own step, so that a failure above never hides it: it reads Cargo.lock
+      # with --locked before cargo hakari's plain cargo metadata could rewrite a
+      # stale one, and it compares the release build against a copy of the
+      # workspace in a temporary folder. It only reads: a command that rewrote the
+      # workspace-hack would fail the tree check below.
+      - name: The workspace-hack
+        if: ${{ !cancelled() }}
+        run: just hakari-check
       - name: Format
         if: ${{ !cancelled() }}
         run: just fmt-check
