@@ -17,6 +17,7 @@ publish = false
 
 [workspace.dependencies]
 cargo_metadata = "0.23.1"
+proc-macro2 = { version = "1.0.107", default-features = false }
 regex = "1.13.1"
 rust_decimal = { version = "1.43.0", default-features = false }
 serde_json = "1.0.154"

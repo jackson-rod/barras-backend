@@ -206,7 +206,10 @@ fn a_kernel_taken_from_another_folder_is_refused() {
     );
     assert_eq!(
         rules(&check_workspace(root.path()).unwrap()),
-        [("barras-identity", "barras-kernel", "module-allowlist")]
+        [
+            ("barras-identity", "barras-kernel", "module-allowlist"),
+            ("barras-identity", "barras-kernel", "path-outside-members"),
+        ]
     );
 }
 
@@ -235,7 +238,10 @@ fn a_kernel_taken_from_outside_the_workspace_is_refused() {
     );
     assert_eq!(
         rules(&check_workspace(&root).unwrap()),
-        [("barras-identity", "barras-kernel", "module-allowlist")]
+        [
+            ("barras-identity", "barras-kernel", "module-allowlist"),
+            ("barras-identity", "barras-kernel", "path-outside-members"),
+        ]
     );
 }
 
@@ -273,6 +279,278 @@ fn the_bootstrap_rules_hold_through_cargo_metadata() {
             ("barras-testkit", "barras-bootstrap", "bootstrap-apps-only"),
         ]
     );
+}
+
+/// A workspace of the members given as (folder, package name, extra manifest text), with
+/// `root_extra` added to the root manifest.
+fn workspace(members: &[(&str, &str, &str)], root_extra: &str) -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    let listed: Vec<String> = members
+        .iter()
+        .map(|(dir, _, _)| format!("\"{dir}\""))
+        .collect();
+    write(
+        root.path(),
+        "Cargo.toml",
+        &format!(
+            "[workspace]\nresolver = \"3\"\nmembers = [{}]\n{root_extra}",
+            listed.join(", ")
+        ),
+    );
+    for (dir, name, extra) in members {
+        stub_package(root.path(), dir, name, extra);
+    }
+    root
+}
+
+/// `[dependencies]` lines that take each (name, path) as a path dependency.
+fn by_path(dependencies: &[(&str, &str)]) -> String {
+    let lines: Vec<String> = dependencies
+        .iter()
+        .map(|(name, path)| format!("{name} = {{ path = \"{path}\" }}\n"))
+        .collect();
+    format!("\n[dependencies]\n{}", lines.concat())
+}
+
+#[test]
+fn a_renamed_bootstrap_is_still_known_by_its_folder() {
+    let root = workspace(
+        &[
+            ("crates/kernel", "barras-kernel", ""),
+            ("crates/bootstrap", "barras-startup", ""),
+            (
+                "crates/adapters/http",
+                "barras-adapter-http",
+                &by_path(&[("barras-startup", "../../bootstrap")]),
+            ),
+        ],
+        "",
+    );
+    assert_eq!(
+        sorted_rules(&check_workspace(root.path()).unwrap()),
+        [
+            (
+                "barras-adapter-http",
+                "barras-startup",
+                "bootstrap-apps-only"
+            ),
+            ("crates/bootstrap", "barras-startup", "package-name"),
+        ]
+    );
+}
+
+#[test]
+fn a_renamed_testkit_is_still_known_by_its_folder() {
+    let root = workspace(
+        &[
+            ("crates/kernel", "barras-kernel", ""),
+            ("crates/testkit", "barras-fixtures", ""),
+            (
+                "apps/api",
+                "barras-api",
+                &by_path(&[("barras-fixtures", "../../crates/testkit")]),
+            ),
+        ],
+        "",
+    );
+    assert_eq!(
+        sorted_rules(&check_workspace(root.path()).unwrap()),
+        [
+            ("barras-api", "barras-fixtures", "testkit-dev-only"),
+            ("crates/testkit", "barras-fixtures", "package-name"),
+        ]
+    );
+}
+
+#[test]
+fn a_crate_outside_the_members_cannot_pass_members_on() {
+    let shim = [("shim", "../../vendor/shim")];
+    let root = workspace(
+        &[
+            ("apps/api", "barras-api", &by_path(&shim)),
+            ("crates/kernel", "barras-kernel", ""),
+            ("crates/bootstrap", "barras-bootstrap", &by_path(&shim)),
+            (
+                "crates/adapters/http",
+                "barras-adapter-http",
+                &by_path(&[("shim", "../../../vendor/shim")]),
+            ),
+            ("crates/adapters/postgres", "barras-adapter-postgres", ""),
+            ("crates/testkit", "barras-testkit", ""),
+            ("crates/xtask", "xtask", &by_path(&shim)),
+        ],
+        "exclude = [\"vendor\"]\n",
+    );
+    // `exclude` keeps the shim out of the members, so cargo builds it as a plain path
+    // dependency, and what it re-exports reaches the four crates with no rule seeing it.
+    stub_package(
+        root.path(),
+        "vendor/shim",
+        "shim",
+        &by_path(&[
+            ("barras-kernel", "../../crates/kernel"),
+            ("barras-adapter-postgres", "../../crates/adapters/postgres"),
+            ("barras-testkit", "../../crates/testkit"),
+        ]),
+    );
+    write(
+        root.path(),
+        "vendor/shim/src/lib.rs",
+        "pub use barras_adapter_postgres;\npub use barras_kernel;\npub use barras_testkit;\n",
+    );
+    assert_eq!(
+        sorted_rules(&check_workspace(root.path()).unwrap()),
+        [
+            ("barras-adapter-http", "shim", "path-outside-members"),
+            ("barras-api", "shim", "path-outside-members"),
+            ("barras-bootstrap", "shim", "path-outside-members"),
+            ("xtask", "shim", "path-outside-members"),
+        ]
+    );
+}
+
+#[test]
+fn no_crate_may_depend_on_an_app() {
+    let root = workspace(
+        &[
+            ("apps/api", "barras-api", ""),
+            (
+                "apps/glue",
+                "barras-glue",
+                &by_path(&[
+                    ("barras-adapter-postgres", "../../crates/adapters/postgres"),
+                    ("barras-bootstrap", "../../crates/bootstrap"),
+                ]),
+            ),
+            ("crates/kernel", "barras-kernel", ""),
+            ("crates/bootstrap", "barras-bootstrap", ""),
+            (
+                "crates/adapters/http",
+                "barras-adapter-http",
+                &by_path(&[("barras-glue", "../../../apps/glue")]),
+            ),
+            ("crates/adapters/postgres", "barras-adapter-postgres", ""),
+        ],
+        "",
+    );
+    assert_eq!(
+        rules(&check_workspace(root.path()).unwrap()),
+        [("barras-adapter-http", "barras-glue", "apps-are-roots")]
+    );
+}
+
+/// The kernel, the HTTP adapter and a hack crate shaped as cargo-hakari writes it, with
+/// `hack_extra` after its `### END HAKARI SECTION` line and `hack_lib` as its `src/lib.rs`.
+fn workspace_with_a_hack(hack_extra: &str, hack_lib: &str) -> tempfile::TempDir {
+    let root = workspace(
+        &[
+            (
+                "crates/kernel",
+                "barras-kernel",
+                &by_path(&[("workspace-hack", "../workspace-hack")]),
+            ),
+            ("crates/adapters/http", "barras-adapter-http", ""),
+            (
+                "crates/workspace-hack",
+                "workspace-hack",
+                &format!(
+                    "description = \"workspace-hack package, managed by hakari\"\npublish = false\n\n### BEGIN HAKARI SECTION\n### END HAKARI SECTION\n{hack_extra}"
+                ),
+            ),
+        ],
+        "",
+    );
+    write(root.path(), "crates/workspace-hack/src/lib.rs", hack_lib);
+    write(
+        root.path(),
+        "crates/workspace-hack/build.rs",
+        "// A build script is required for cargo to consider build dependencies.\nfn main() {}\n",
+    );
+    root
+}
+
+const HAKARI_LIB: &str = "// This is a stub lib.rs.\n";
+
+#[test]
+fn the_hack_as_cargo_hakari_writes_it_is_clean() {
+    let root = workspace_with_a_hack("\n[dependencies]\nregex = \"1.13.1\"\n", HAKARI_LIB);
+    assert_eq!(check_workspace(root.path()).unwrap(), []);
+}
+
+#[test]
+fn the_hack_may_take_nothing_by_path_nor_carry_code() {
+    let root = workspace_with_a_hack(
+        "\n[dependencies]\nbarras-adapter-http = { path = \"../adapters/http\" }\n",
+        "// This is a stub lib.rs.\npub use barras_adapter_http;\n",
+    );
+    write(
+        root.path(),
+        "crates/kernel/src/lib.rs",
+        "pub use workspace_hack::barras_adapter_http;\n",
+    );
+    assert_eq!(
+        sorted_rules(&check_workspace(root.path()).unwrap()),
+        [
+            ("workspace-hack", "barras-adapter-http", "hack-isolation"),
+            (
+                "workspace-hack",
+                "crates/workspace-hack/src/lib.rs",
+                "hack-is-a-stub"
+            ),
+        ]
+    );
+}
+
+#[test]
+fn the_hack_may_not_pass_on_a_crate_from_crates_io() {
+    let root = workspace_with_a_hack(
+        "\n[dependencies]\nregex = \"1.13.1\"\n",
+        "// This is a stub lib.rs.\npub use regex;\n\npub fn business_rule(amount: u64) -> u64 {\n    amount / 100\n}\n",
+    );
+    assert_eq!(
+        rules(&check_workspace(root.path()).unwrap()),
+        [(
+            "workspace-hack",
+            "crates/workspace-hack/src/lib.rs",
+            "hack-is-a-stub"
+        )]
+    );
+}
+
+#[test]
+fn the_hack_has_only_its_library_at_src_lib_rs_and_an_empty_build_script() {
+    for (hack_extra, file, content, offender) in [
+        (
+            "\n[lib]\npath = \"src/other.rs\"\n",
+            "src/other.rs",
+            HAKARI_LIB,
+            "crates/workspace-hack/src/other.rs",
+        ),
+        (
+            "\n[[bin]]\nname = \"tool\"\npath = \"src/bin/tool.rs\"\n",
+            "src/bin/tool.rs",
+            "fn main() {}\n",
+            "crates/workspace-hack/src/bin/tool.rs",
+        ),
+        (
+            "",
+            "build.rs",
+            "fn main() {\n    println!(\"cargo::rustc-cfg=hacked\");\n}\n",
+            "crates/workspace-hack/build.rs",
+        ),
+    ] {
+        let root = workspace_with_a_hack(hack_extra, HAKARI_LIB);
+        write(
+            root.path(),
+            &format!("crates/workspace-hack/{file}"),
+            content,
+        );
+        assert_eq!(
+            rules(&check_workspace(root.path()).unwrap()),
+            [("workspace-hack", offender, "hack-is-a-stub")],
+            "{offender}"
+        );
+    }
 }
 
 #[test]

@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 regex.workspace = true
 cargo_metadata.workspace = true
+proc-macro2.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
