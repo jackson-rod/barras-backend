@@ -1,4 +1,6 @@
 [toolchain]
 channel = "1.100.0"
-components = ["rustfmt", "clippy"]
+# llvm-tools: cargo-llvm-cov reads the coverage with this toolchain's own llvm-profdata and
+# llvm-cov, which must match the compiler that instrumented the build.
+components = ["rustfmt", "clippy", "llvm-tools"]
 profile = "minimal"

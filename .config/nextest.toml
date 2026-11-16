@@ -1,0 +1,7 @@
+# The process tests start the real binaries, and nothing else stops a test that hangs: the
+# run would wait until CI's job timeout, without naming the test. Here a test still running
+# after 30 seconds is reported as slow, and after four such periods, two minutes, it is
+# killed and fails under its own name. The margin is wide on purpose: coverage
+# instrumentation and a busy CI runner both slow a test down.
+[profile.default]
+slow-timeout = { period = "30s", terminate-after = 4 }
