@@ -19,8 +19,9 @@ pub enum ErrorKind {
     Internal,
 }
 
-/// The contract of every `<Module>Error`. Its `Display` text is the message for developers,
-/// and never repeats a value the caller sent.
+/// The contract of every `<Module>Error`. Its `Display` text is the message for developers.
+/// The client receives it verbatim for every kind but `Internal` and `Unavailable`, so it
+/// never interpolates a source or a value the caller sent.
 pub trait AppError: std::error::Error + Send + Sync + 'static {
     /// The stable `SCREAMING_SNAKE_CASE` code of the failure. It is public API: the app
     /// chooses its text by it, so renaming one is a breaking change.

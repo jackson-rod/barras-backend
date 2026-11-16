@@ -5,16 +5,18 @@ use utoipa::openapi::extensions::ExtensionsBuilder;
 use utoipa::openapi::path::{Operation, PathItem};
 use utoipa::openapi::{Info, OpenApi, Paths, RefOr, Response};
 
+use crate::error::ApiError;
+
 /// The codes any route can return, whatever it does: listed once, at the top of the document,
 /// as `x-common-error-codes`, rather than on every operation. Sorted.
 pub const COMMON_ERROR_CODES: &[&str] = &[
-    "INTERNAL_ERROR",
-    "MALFORMED_REQUEST",
-    "METHOD_NOT_ALLOWED",
-    "NOT_ACCEPTABLE",
-    "PAYLOAD_TOO_LARGE",
-    "ROUTE_NOT_FOUND",
-    "UNSUPPORTED_MEDIA_TYPE",
+    ApiError::INTERNAL_ERROR,
+    ApiError::MALFORMED_REQUEST,
+    ApiError::METHOD_NOT_ALLOWED,
+    ApiError::NOT_ACCEPTABLE,
+    ApiError::PAYLOAD_TOO_LARGE,
+    ApiError::ROUTE_NOT_FOUND,
+    ApiError::UNSUPPORTED_MEDIA_TYPE,
 ];
 
 /// The keys `ApiRouter::route` writes on every operation, from typed values.
@@ -188,14 +190,27 @@ mod tests {
     use utoipa_axum::routes;
 
     use super::*;
-    use crate::envelope::{ApiResult, ApiSuccess, ErrorEnvelope, SuccessEnvelope};
-    use crate::error::ApiError;
+    use crate::envelope::{ApiResult, ApiSuccess, ErrorEnvelope, NoData, SuccessEnvelope};
     use crate::router::{Access, ApiRouter};
 
     /// What the fixture route answers.
     #[derive(Serialize, ToSchema)]
     struct Fixture {
         name: &'static str,
+    }
+
+    /// Save the settings, with nothing to return.
+    #[utoipa::path(
+        put,
+        path = "/settings",
+        tag = "settings",
+        responses(
+            (status = 200, description = "Saved", body = SuccessEnvelope<NoData>),
+            (status = 422, description = "Invalid settings", body = ErrorEnvelope),
+        ),
+    )]
+    async fn save_settings() -> ApiResult<NoData> {
+        Ok(ApiSuccess::ok("Settings saved", NoData))
     }
 
     /// Read the fixture.
@@ -357,6 +372,20 @@ mod tests {
     #[test]
     fn a_complete_document_has_no_problem() {
         assert_eq!(metadata_problems(&complete()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_route_with_nothing_to_return_can_be_complete() {
+        let routes = ApiRouter::new().route(
+            routes!(save_settings),
+            Access::public(),
+            &[ApiError::VALIDATION_FAILED],
+        );
+
+        assert_eq!(
+            metadata_problems(&document_of(routes)),
+            Vec::<String>::new()
+        );
     }
 
     #[test]

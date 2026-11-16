@@ -1,15 +1,23 @@
 //! The two shapes of every response body on the public port, and the success a handler
 //! returns.
 
+use std::borrow::Cow;
+
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
-use utoipa::ToSchema;
 use utoipa::openapi::schema::{ObjectBuilder, Type};
 use utoipa::openapi::{RefOr, Schema};
+use utoipa::{PartialSchema, ToSchema};
 
-use crate::error::{ApiError, FieldErrors};
+use crate::error::{ApiError, FieldErrors, log_server_failure};
+
+const APPLICATION_JSON: HeaderValue = HeaderValue::from_static("application/json");
+
+/// What `ApiError::internal` sends, written out so that the answer to a body serde_json
+/// refuses cannot fail in turn. A test holds it equal to that body.
+const INTERNAL_ERROR_BODY: &str = r#"{"success":false,"message":"Internal server error","data":null,"code":500,"error":{"code":"INTERNAL_ERROR"}}"#;
 
 /// The body of every successful response. `success` is always true and `code` is always the
 /// HTTP status of the response.
@@ -51,6 +59,24 @@ fn null_schema() -> RefOr<Schema> {
     ObjectBuilder::new().schema_type(Type::Null).into()
 }
 
+/// The `data` of a route with nothing to return, sent as `null`. A route documents its
+/// success as `SuccessEnvelope<NoData>`: `#[utoipa::path]` refuses `SuccessEnvelope<()>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct NoData;
+
+// Derived, the schema of a unit struct is `{"default": null}`, which accepts any value.
+impl PartialSchema for NoData {
+    fn schema() -> RefOr<Schema> {
+        null_schema()
+    }
+}
+
+impl ToSchema for NoData {
+    fn name() -> Cow<'static, str> {
+        Cow::Borrowed("NoData")
+    }
+}
+
 impl ErrorEnvelope {
     pub(crate) fn new(
         status: StatusCode,
@@ -68,8 +94,8 @@ impl ErrorEnvelope {
     }
 }
 
-/// A successful answer, sent as a [`SuccessEnvelope`] whose `code` is its status. `data`
-/// of `()` is sent as `null`: a route with nothing to return still answers 200, never 204.
+/// A successful answer, sent as a [`SuccessEnvelope`] whose `code` is its status. A route
+/// with nothing to return answers [`NoData`], sent as `null`, with 200: never 204.
 #[derive(Debug)]
 pub struct ApiSuccess<T> {
     status: StatusCode,
@@ -107,12 +133,7 @@ impl<T: Serialize> IntoResponse for ApiSuccess<T> {
             data: self.data,
             code: self.status.as_u16(),
         };
-        json_response(self.status, &envelope).unwrap_or_else(|error| {
-            ApiError::internal(format!(
-                "the response data could not be serialized: {error}"
-            ))
-            .into_response()
-        })
+        json_response(self.status, &envelope)
     }
 }
 
@@ -131,26 +152,98 @@ impl<T: Serialize> IntoResponse for ApiSuccess<T> {
 /// ```
 pub type ApiResult<T> = Result<ApiSuccess<T>, ApiError>;
 
-pub(crate) fn json_response(
-    status: StatusCode,
-    body: &impl Serialize,
-) -> Result<Response, serde_json::Error> {
-    let bytes = serde_json::to_vec(body)?;
-    let content_type = [(CONTENT_TYPE, HeaderValue::from_static("application/json"))];
-    Ok((status, content_type, bytes).into_response())
+/// `body` as a JSON response. A body serde_json refuses, which only the data of a success can
+/// be, answers the fixed `INTERNAL_ERROR` envelope instead, with the cause in the log only.
+pub(crate) fn json_response(status: StatusCode, body: &impl Serialize) -> Response {
+    let content_type = [(CONTENT_TYPE, APPLICATION_JSON)];
+    match serde_json::to_vec(body) {
+        Ok(bytes) => (status, content_type, bytes).into_response(),
+        Err(error) => {
+            let status = StatusCode::INTERNAL_SERVER_ERROR;
+            let detail = format!("the response body could not be serialized: {error}");
+            log_server_failure(ApiError::INTERNAL_ERROR, status, &detail);
+            (status, content_type, INTERNAL_ERROR_BODY).into_response()
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::io;
+    use std::sync::{Arc, Mutex};
+
     use http_body_util::BodyExt;
     use serde_json::{Value, json};
+    use tracing_subscriber::fmt::MakeWriter;
+    use tracing_subscriber::util::SubscriberInitExt;
     use utoipa::PartialSchema;
+    use utoipa_axum::router::UtoipaMethodRouter;
+    use utoipa_axum::routes;
 
     use super::*;
 
     #[derive(Serialize, ToSchema)]
     struct Readiness {
         status: &'static str,
+    }
+
+    /// Save the settings, with nothing to return.
+    #[utoipa::path(
+        put,
+        path = "/settings",
+        responses((status = 200, description = "Saved", body = SuccessEnvelope<NoData>)),
+    )]
+    async fn save_settings() -> ApiResult<NoData> {
+        Ok(ApiSuccess::ok("Settings saved", NoData))
+    }
+
+    /// Keeps what a subscriber writes, for the test that holds a clone.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> MakeWriter<'writer> for Capture {
+        type Writer = Self;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// The response `make` builds, and the lines logged meanwhile, each as
+    /// `LEVEL message field=value…`, on this thread only.
+    fn respond_logged(make: impl FnOnce() -> Response) -> (Response, Vec<String>) {
+        let capture = Capture::default();
+        let response = {
+            let _default = tracing_subscriber::fmt()
+                .with_writer(capture.clone())
+                .with_ansi(false)
+                .without_time()
+                .with_target(false)
+                .with_max_level(tracing::Level::TRACE)
+                .finish()
+                .set_default();
+            make()
+        };
+        let written = capture.0.lock().unwrap().clone();
+        let lines = String::from_utf8(written).unwrap();
+        (response, lines.lines().map(str::to_owned).collect())
+    }
+
+    async fn body_text(response: Response) -> String {
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8(bytes.to_vec()).unwrap()
     }
 
     /// Data that serde_json refuses, with a reason that must not reach the client.
@@ -219,7 +312,9 @@ mod tests {
 
     #[tokio::test]
     async fn nothing_to_return_is_200_with_data_null() {
-        let (status, _, body) = read(ApiSuccess::ok("Settings saved", ()).into_response()).await;
+        let success = ApiSuccess::ok("Settings saved", NoData);
+
+        let (status, _, body) = read(success.into_response()).await;
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
@@ -228,20 +323,55 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn data_that_cannot_be_serialized_answers_an_internal_error() {
-        let success = ApiSuccess::ok("Never sent", Unserializable);
+    #[test]
+    fn no_data_is_null_on_the_wire_and_in_its_schema() {
+        assert_eq!(serde_json::to_value(NoData).unwrap(), Value::Null);
+        assert_eq!(schema_of::<NoData>(), json!({ "type": "null" }));
+        assert_eq!(NoData::name(), "NoData");
+    }
 
-        let (status, content_type, body) = read(success.into_response()).await;
+    #[test]
+    fn a_route_with_nothing_to_return_documents_its_data_as_null() {
+        let (schemas, paths, _): UtoipaMethodRouter = routes!(save_settings);
 
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(content_type.as_deref(), Some("application/json"));
-        assert_eq!(body["code"], 500);
-        assert_eq!(body["error"]["code"], "INTERNAL_ERROR");
-        assert!(
-            !body.to_string().contains("unserializable-secret"),
-            "{body}"
+        let schemas: BTreeMap<String, Value> = schemas
+            .into_iter()
+            .map(|(name, schema)| (name, serde_json::to_value(schema).unwrap()))
+            .collect();
+        let names: Vec<&str> = schemas.keys().map(String::as_str).collect();
+        assert_eq!(names, ["NoData", "SuccessEnvelope_NoData"]);
+        assert_eq!(
+            schemas["SuccessEnvelope_NoData"]["properties"]["data"],
+            json!({ "type": "null" })
         );
+        let paths = serde_json::to_value(paths).unwrap();
+        assert_eq!(
+            paths["/settings"]["put"]["responses"]["200"]["content"]["application/json"]["schema"],
+            json!({ "$ref": "#/components/schemas/SuccessEnvelope_NoData" })
+        );
+    }
+
+    #[tokio::test]
+    async fn data_that_cannot_be_serialized_answers_the_fixed_internal_error() {
+        let (response, lines) =
+            respond_logged(|| ApiSuccess::ok("Never sent", Unserializable).into_response());
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let content_type = response.headers().get(CONTENT_TYPE).cloned();
+        assert_eq!(content_type, Some(APPLICATION_JSON));
+        assert_eq!(body_text(response).await, INTERNAL_ERROR_BODY);
+        assert_eq!(
+            lines,
+            ["ERROR request failed code=\"INTERNAL_ERROR\" status=500 \
+                 detail=the response body could not be serialized: unserializable-secret"]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_fixed_internal_error_is_the_body_an_internal_error_sends() {
+        let response = ApiError::internal("disk full".to_owned()).into_response();
+
+        assert_eq!(body_text(response).await, INTERNAL_ERROR_BODY);
     }
 
     #[test]

@@ -4,11 +4,14 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 
-use axum::http::StatusCode;
+use axum::http::header::WWW_AUTHENTICATE;
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use barras_kernel::{AppError, ErrorKind};
 
 use crate::envelope::{ErrorEnvelope, json_response};
+
+const BEARER: HeaderValue = HeaderValue::from_static("Bearer");
 
 /// Each field path that failed validation (`address.zip`, `items[2].amount`) with what is
 /// expected of it. A message never repeats the value that was sent.
@@ -32,13 +35,32 @@ pub struct ApiError {
 }
 
 impl ApiError {
+    /// The code of [`ApiError::validation`].
+    pub const VALIDATION_FAILED: &'static str = "VALIDATION_FAILED";
+    /// The code of [`ApiError::malformed_request`].
+    pub const MALFORMED_REQUEST: &'static str = "MALFORMED_REQUEST";
+    /// The code of [`ApiError::unsupported_media_type`].
+    pub const UNSUPPORTED_MEDIA_TYPE: &'static str = "UNSUPPORTED_MEDIA_TYPE";
+    /// The code of [`ApiError::payload_too_large`].
+    pub const PAYLOAD_TOO_LARGE: &'static str = "PAYLOAD_TOO_LARGE";
+    /// The code of [`ApiError::route_not_found`].
+    pub const ROUTE_NOT_FOUND: &'static str = "ROUTE_NOT_FOUND";
+    /// The code of [`ApiError::method_not_allowed`].
+    pub const METHOD_NOT_ALLOWED: &'static str = "METHOD_NOT_ALLOWED";
+    /// The code of [`ApiError::not_acceptable`].
+    pub const NOT_ACCEPTABLE: &'static str = "NOT_ACCEPTABLE";
+    /// The code of [`ApiError::service_unavailable`].
+    pub const SERVICE_UNAVAILABLE: &'static str = "SERVICE_UNAVAILABLE";
+    /// The code of [`ApiError::internal`].
+    pub const INTERNAL_ERROR: &'static str = "INTERNAL_ERROR";
+
     /// 422 `VALIDATION_FAILED`, with every field that failed in `error.fields`.
     pub fn validation(fields: FieldErrors) -> Self {
         Self {
             fields: Some(fields),
             ..Self::client(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                "VALIDATION_FAILED",
+                Self::VALIDATION_FAILED,
                 "Request validation failed",
             )
         }
@@ -47,14 +69,14 @@ impl ApiError {
     /// 400 `MALFORMED_REQUEST`: the body or the query string cannot be read. The message is
     /// fixed text, so it cannot repeat what was sent.
     pub fn malformed_request(message: &'static str) -> Self {
-        Self::client(StatusCode::BAD_REQUEST, "MALFORMED_REQUEST", message)
+        Self::client(StatusCode::BAD_REQUEST, Self::MALFORMED_REQUEST, message)
     }
 
     /// 415 `UNSUPPORTED_MEDIA_TYPE`: the body is not sent as JSON.
     pub fn unsupported_media_type() -> Self {
         Self::client(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "UNSUPPORTED_MEDIA_TYPE",
+            Self::UNSUPPORTED_MEDIA_TYPE,
             "Request body must be JSON",
         )
     }
@@ -63,21 +85,25 @@ impl ApiError {
     pub fn payload_too_large() -> Self {
         Self::client(
             StatusCode::PAYLOAD_TOO_LARGE,
-            "PAYLOAD_TOO_LARGE",
+            Self::PAYLOAD_TOO_LARGE,
             "Request body is too large",
         )
     }
 
     /// 404 `ROUTE_NOT_FOUND`: no route matches the path.
     pub fn route_not_found() -> Self {
-        Self::client(StatusCode::NOT_FOUND, "ROUTE_NOT_FOUND", "Route not found")
+        Self::client(
+            StatusCode::NOT_FOUND,
+            Self::ROUTE_NOT_FOUND,
+            "Route not found",
+        )
     }
 
     /// 405 `METHOD_NOT_ALLOWED`: the path exists, the method does not.
     pub fn method_not_allowed() -> Self {
         Self::client(
             StatusCode::METHOD_NOT_ALLOWED,
-            "METHOD_NOT_ALLOWED",
+            Self::METHOD_NOT_ALLOWED,
             "Method not allowed",
         )
     }
@@ -87,7 +113,7 @@ impl ApiError {
     pub fn not_acceptable() -> Self {
         Self::client(
             StatusCode::NOT_ACCEPTABLE,
-            "NOT_ACCEPTABLE",
+            Self::NOT_ACCEPTABLE,
             "No acceptable content encoding",
         )
     }
@@ -96,14 +122,18 @@ impl ApiError {
     pub fn service_unavailable(detail: String) -> Self {
         Self::server(
             StatusCode::SERVICE_UNAVAILABLE,
-            "SERVICE_UNAVAILABLE",
+            Self::SERVICE_UNAVAILABLE,
             detail,
         )
     }
 
     /// 500 `INTERNAL_ERROR`, with a generic message. `detail` goes only to the log.
     pub fn internal(detail: String) -> Self {
-        Self::server(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", detail)
+        Self::server(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Self::INTERNAL_ERROR,
+            detail,
+        )
     }
 
     /// The HTTP status, which is also the top-level `code` of the envelope.
@@ -147,6 +177,9 @@ impl ApiError {
 /// Each kind answers its status of spec §6.2, with the code of the variant. A 5xx
 /// (`Internal`, `Unavailable`) keeps the error's text and its chain of sources as the
 /// detail for the log; any other kind answers the error's `Display` as its message.
+///
+/// A 4xx body carries that `Display` verbatim, so the message of a module's error must never
+/// interpolate a source or a value the caller sent.
 impl<E: AppError> From<E> for ApiError {
     fn from(error: E) -> Self {
         let status = status_of(error.kind());
@@ -171,40 +204,47 @@ fn status_of(kind: ErrorKind) -> StatusCode {
     }
 }
 
-/// The error's text, then the text of each of its sources in turn, joined by `": "`.
+/// The error's text, then the text of each of its sources in turn, joined by `": "`: at most
+/// sixteen, because an error whose sources lead back to itself would never end.
 fn with_sources(error: &(dyn Error + 'static)) -> String {
     std::iter::successors(Some(error), |&error| error.source())
+        .take(16)
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(": ")
 }
 
-/// The detail of a 5xx goes to the log at `error` level, with its code, and the envelope
-/// goes out without it.
+/// The detail of a 5xx goes to the log at `error` level, with its code and its status, and
+/// the envelope goes out without it. A 401 also names the scheme to authenticate with, as RFC
+/// 9110 §15.5.2 requires.
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let (status, code) = (self.status, self.code);
         if let Some(detail) = &self.detail {
-            tracing::error!(code, detail = %detail, "request failed");
+            log_server_failure(self.code, self.status, detail);
         }
-        let envelope = ErrorEnvelope::new(status, self.message, code, self.fields);
-        json_response(status, &envelope).unwrap_or_else(|error| {
-            // Unreachable: an error envelope holds only strings, numbers, booleans, null and
-            // maps keyed by strings, which serde_json always writes. The status alone still
-            // tells the client what happened.
-            tracing::error!(code, %error, "the error envelope could not be serialized");
-            status.into_response()
-        })
+        let envelope = ErrorEnvelope::new(self.status, self.message, self.code, self.fields);
+        let mut response = json_response(self.status, &envelope);
+        if response.status() == StatusCode::UNAUTHORIZED {
+            response.headers_mut().insert(WWW_AUTHENTICATE, BEARER);
+        }
+        response
     }
+}
+
+/// The one log event of a failure on the server's side: what was answered, and the detail
+/// that no body carries.
+pub(crate) fn log_server_failure(code: &str, status: StatusCode, detail: &str) {
+    tracing::error!(code, status = status.as_u16(), detail = %detail, "request failed");
 }
 
 #[cfg(test)]
 mod tests {
     use std::fmt;
     use std::io;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use axum::http::header::CONTENT_TYPE;
+    use axum::http::header::{CONTENT_TYPE, WWW_AUTHENTICATE};
     use barras_kernel::{Currency, KernelError};
     use http_body_util::BodyExt;
     use serde_json::{Value, json};
@@ -298,6 +338,36 @@ mod tests {
         }
     }
 
+    /// An error that names itself as its own source, a thousand times, so that a test of the
+    /// walk along the sources ends even when the walk is not cut.
+    #[derive(Debug, Default)]
+    struct Looping {
+        calls: AtomicUsize,
+    }
+
+    impl fmt::Display for Looping {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("looping")
+        }
+    }
+
+    impl Error for Looping {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            let calls = self.calls.fetch_add(1, Ordering::Relaxed);
+            (calls < 1_000).then_some(self as &(dyn Error + 'static))
+        }
+    }
+
+    impl AppError for Looping {
+        fn code(&self) -> &'static str {
+            "LOOPING"
+        }
+
+        fn kind(&self) -> ErrorKind {
+            ErrorKind::Internal
+        }
+    }
+
     #[derive(Debug)]
     struct Cause {
         text: &'static str,
@@ -349,20 +419,24 @@ mod tests {
         }
     }
 
-    /// The response to `error`, and the lines logged while it was made. Each line starts
-    /// with its level. The subscriber is the default of this thread only, so tests running
-    /// side by side do not see each other's events.
-    fn respond_logged(error: ApiError) -> (Response, Vec<String>) {
+    /// Builds the error of one case of a test.
+    type MakeError = fn() -> ApiError;
+
+    /// The response to the error `make` builds, and the lines logged while it was built and
+    /// answered, each as `LEVEL message field=value…`. The subscriber is the default of this
+    /// thread only, so tests running side by side do not see each other's events.
+    fn respond_logged(make: impl FnOnce() -> ApiError) -> (Response, Vec<String>) {
         let capture = Capture::default();
         let response = {
             let _default = tracing_subscriber::fmt()
                 .with_writer(capture.clone())
                 .with_ansi(false)
                 .without_time()
+                .with_target(false)
                 .with_max_level(tracing::Level::TRACE)
                 .finish()
                 .set_default();
-            error.into_response()
+            make().into_response()
         };
         (response, capture.lines())
     }
@@ -454,64 +528,111 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_detail_of_a_server_error_and_its_sources_go_only_to_the_log() {
-        for (kind, _) in SERVER_KINDS {
-            let error = ApiError::from(SaveFailed::with_secret_cause(kind));
-
-            let (response, lines) = respond_logged(error);
+    async fn a_server_error_logs_its_code_its_status_and_its_sources_and_sends_none() {
+        for (kind, status) in [(ErrorKind::Internal, 500), (ErrorKind::Unavailable, 503)] {
+            let (response, lines) =
+                respond_logged(|| ApiError::from(SaveFailed::with_secret_cause(kind)));
             let (_, _, body) = read(response).await;
 
             let sent = body.to_string();
             assert!(!sent.contains("secret-sql-detail"), "{sent}");
             assert!(!sent.contains("connection lost"), "{sent}");
             assert!(!sent.contains("the goal could not be saved"), "{sent}");
-            assert_eq!(lines.len(), 1, "{kind:?}: {lines:?}");
-            let line = &lines[0];
-            assert!(line.starts_with("ERROR "), "{line}");
-            assert!(line.contains("GOAL_NOT_SAVED"), "{line}");
-            assert!(
-                line.contains("the goal could not be saved: connection lost: secret-sql-detail"),
-                "{line}"
+            assert_eq!(
+                lines,
+                [format!(
+                    "ERROR request failed code=\"GOAL_NOT_SAVED\" status={status} \
+                     detail=the goal could not be saved: connection lost: secret-sql-detail"
+                )]
             );
         }
     }
 
     #[tokio::test]
     async fn the_detail_given_to_a_server_failure_goes_only_to_the_log() {
-        for (error, code) in [
+        let cases: [(MakeError, &str); 2] = [
             (
-                ApiError::internal("secret-sql-detail".to_owned()),
-                "INTERNAL_ERROR",
+                || ApiError::internal("secret-sql-detail".to_owned()),
+                "ERROR request failed code=\"INTERNAL_ERROR\" status=500 detail=secret-sql-detail",
             ),
             (
-                ApiError::service_unavailable("secret-sql-detail".to_owned()),
-                "SERVICE_UNAVAILABLE",
+                || ApiError::service_unavailable("secret-sql-detail".to_owned()),
+                "ERROR request failed code=\"SERVICE_UNAVAILABLE\" status=503 \
+                 detail=secret-sql-detail",
             ),
-        ] {
-            let (response, lines) = respond_logged(error);
+        ];
+        for (make, logged) in cases {
+            let (response, lines) = respond_logged(make);
             let (_, _, body) = read(response).await;
 
             assert!(!body.to_string().contains("secret-sql-detail"), "{body}");
-            assert_eq!(lines.len(), 1, "{code}: {lines:?}");
-            assert!(lines[0].starts_with("ERROR "), "{}", lines[0]);
-            assert!(lines[0].contains(code), "{}", lines[0]);
-            assert!(lines[0].contains("secret-sql-detail"), "{}", lines[0]);
+            assert_eq!(lines, [logged]);
+        }
+    }
+
+    #[test]
+    fn a_chain_of_sources_is_cut_after_sixteen_errors() {
+        let (_, lines) = respond_logged(|| ApiError::from(Looping::default()));
+
+        let detail = ["looping"; 16].join(": ");
+        assert_eq!(
+            lines,
+            [format!(
+                "ERROR request failed code=\"LOOPING\" status=500 detail={detail}"
+            )]
+        );
+    }
+
+    #[test]
+    fn a_client_error_writes_no_log() {
+        let cases: [MakeError; 3] = [
+            || ApiError::from(SaveFailed::with_secret_cause(ErrorKind::Conflict)),
+            || {
+                let message = vec!["is required".to_owned()];
+                ApiError::validation(FieldErrors::from([("email".to_owned(), message)]))
+            },
+            ApiError::route_not_found,
+        ];
+        for make in cases {
+            let (response, lines) = respond_logged(make);
+
+            assert!(response.status().is_client_error(), "{}", response.status());
+            assert!(lines.is_empty(), "{lines:?}");
         }
     }
 
     #[tokio::test]
-    async fn a_client_error_writes_no_log() {
-        let fields = FieldErrors::from([("email".to_owned(), vec!["is required".to_owned()])]);
-        for error in [
-            ApiError::from(SaveFailed::with_secret_cause(ErrorKind::Conflict)),
-            ApiError::validation(fields),
-            ApiError::route_not_found(),
-        ] {
-            let code = error.code();
-            let (response, lines) = respond_logged(error);
-            assert!(response.status().is_client_error(), "{code}");
-            assert!(lines.is_empty(), "{code}: {lines:?}");
+    async fn a_client_error_sends_its_message_and_never_its_sources() {
+        let client_kinds = EVERY_KIND
+            .into_iter()
+            .filter(|kind| expected_status(*kind) < 500);
+        for kind in client_kinds {
+            let error = ApiError::from(SaveFailed::with_secret_cause(kind));
+
+            let (_, _, body) = read(error.into_response()).await;
+
+            let sent = body.to_string();
+            assert!(!sent.contains("secret-sql-detail"), "{kind:?}: {sent}");
+            assert!(!sent.contains("connection lost"), "{kind:?}: {sent}");
+            assert_eq!(body["message"], "the goal could not be saved", "{kind:?}");
         }
+    }
+
+    #[test]
+    fn only_an_unauthenticated_answer_asks_for_a_bearer_token() {
+        let challenged: Vec<(ErrorKind, String)> = EVERY_KIND
+            .into_iter()
+            .filter_map(|kind| {
+                let response = ApiError::from(SaveFailed::of(kind)).into_response();
+                let challenge = response.headers().get(WWW_AUTHENTICATE)?;
+                Some((kind, challenge.to_str().unwrap().to_owned()))
+            })
+            .collect();
+
+        assert_eq!(
+            challenged,
+            [(ErrorKind::Unauthenticated, "Bearer".to_owned())]
+        );
     }
 
     #[tokio::test]
@@ -587,6 +708,34 @@ mod tests {
                     "tags[1]": ["is too long", "is not valid"]
                 }
             })
+        );
+    }
+
+    #[test]
+    fn the_codes_of_the_adapter_are_public_and_never_change() {
+        assert_eq!(
+            [
+                ApiError::VALIDATION_FAILED,
+                ApiError::MALFORMED_REQUEST,
+                ApiError::UNSUPPORTED_MEDIA_TYPE,
+                ApiError::PAYLOAD_TOO_LARGE,
+                ApiError::ROUTE_NOT_FOUND,
+                ApiError::METHOD_NOT_ALLOWED,
+                ApiError::NOT_ACCEPTABLE,
+                ApiError::SERVICE_UNAVAILABLE,
+                ApiError::INTERNAL_ERROR,
+            ],
+            [
+                "VALIDATION_FAILED",
+                "MALFORMED_REQUEST",
+                "UNSUPPORTED_MEDIA_TYPE",
+                "PAYLOAD_TOO_LARGE",
+                "ROUTE_NOT_FOUND",
+                "METHOD_NOT_ALLOWED",
+                "NOT_ACCEPTABLE",
+                "SERVICE_UNAVAILABLE",
+                "INTERNAL_ERROR",
+            ]
         );
     }
 
