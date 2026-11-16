@@ -32,7 +32,8 @@ Date: 2026-11-16
 - `error.fields` comes only with `VALIDATION_FAILED`. A module error of kind `Validation`, such as the kernel's `INVALID_CURRENCY`, answers 422 with its own code and no `error.fields`.
 - A 4xx from a module error answers the error's `Display` as its message, verbatim. A 5xx answers a generic message, and the error's text with its chain of sources goes to the log at `error` level (ADR-0005).
 - A 401 carries `WWW-Authenticate: Bearer`, as RFC 9110 §15.5.2 requires.
-- Every answer the application produces on the public port is an envelope. A safety net replaces any 4xx or 5xx that a library layer answered without a JSON body, and every 406, with an envelope at the same status: 413, 415 and 406 get their codes above, any other 4xx `MALFORMED_REQUEST` and any 5xx `INTERNAL_ERROR`. A bare 429 from a future rate-limit layer is mapped to a code of its own when that layer lands. Bytes that are not HTTP at all are answered by the server library with a bare 400, before any of our code runs.
+- Every answer the application produces on the public port is an envelope. A safety net replaces any 4xx or 5xx that a library layer answered without a JSON body, and every 406, with an envelope at the same status: 413, 415 and 406 get their codes above, any other 4xx `MALFORMED_REQUEST` and any 5xx `INTERNAL_ERROR`. A bare 429 from a future rate-limit layer is mapped to a code of its own when that layer lands.
+- hyper, the server library, answers a request whose head it cannot read itself, before any of our code runs: 400 for a head that is not HTTP, 414 for a URI longer than 65,534 bytes, and 431 for more than 100 headers or a head larger than its buffer of 408 KiB. That answer has an empty body, so no envelope and no request id, and it is neither logged nor counted. "Every answer is an envelope" covers what the application produces.
 
 ### Shape
 
@@ -42,7 +43,7 @@ Date: 2026-11-16
 
 ### Request id, compression and limits
 
-- `x-request-id`: the caller's value is kept when exactly one is sent and it is 1 to 64 characters of `A-Z a-z 0-9 . _ -`; otherwise the server makes a UUID v7. It is on every answer of the public port, a 404, a 405, a 413 and a panic included, and in the span of every log event of the request.
+- `x-request-id`: the caller's value is kept when exactly one is sent and it is 1 to 64 characters of `A-Z a-z 0-9 . _ -`; otherwise the server makes a UUID v7. It is on every answer the application gives on the public port, a 404, a 405, a 413 and a panic included, though not on hyper's own (above), and in the span of every log event of the request.
 - An answer of 1 KiB or more, or of unknown length, is compressed with gzip or brotli as `Accept-Encoding` chooses; never for gRPC, images or server-sent events. An `Accept-Encoding` that refuses every encoding still runs the handler before the answer becomes 406.
 - A request body is limited to 1 MiB.
 
@@ -52,13 +53,13 @@ Date: 2026-11-16
 - A route that takes either lists `VALIDATION_FAILED` among its codes and documents a 422.
 - Whether a body is JSON is decided by a strict parse of the whole of it, which must also be UTF-8 throughout (RFC 8259 §8.1). A body that is not JSON answers 400 even when a field before the fault was wrong. A lone surrogate escape, nesting deeper than serde_json reads, or a number past `f64` (`1e400`) is accepted in a member the DTO does not read; in a field it reads, it answers 422 at that field, or 400 for the nesting.
 - serde stops at the first value it refuses; garde reports every broken rule. Each key of `error.fields` is the JSON path of its field (`address.zip`, `tags[1]`): serde's paths already are, and garde's are converted to camelCase segment by segment.
-- A missing field is keyed at its own path. A field that an object does not accept (`deny_unknown_fields`) is keyed at that object, never under its own name, which is the caller's text; at the root it answers 400. A query that gives a parameter twice, or one the DTO does not accept, answers 400.
+- A missing field is keyed at its own path; in a body, once a tree of the body confirms that it is missing (below). A field that an object does not accept (`deny_unknown_fields`) is keyed at that object, never under its own name, which is the caller's text; at the root it answers 400. A query that gives a parameter twice, or one the DTO does not accept, answers 400.
 - A field's message comes from a fixed set, never from serde's text: `is required`; `expected <type>` for the primitive types serde names in fixed words, `has the wrong type` for any other; `is not one of the accepted values`; `has a field it does not accept`; `is not valid`. A broken garde rule answers garde's message, which names what the rule expects, never the value it refused.
 - Every DTO, body and query alike, takes `#[serde(rename_all = "camelCase")]` and never renames a field one by one: garde 0.23 parses `#[garde(rename(…))]` but never applies it, so a field renamed by hand would be reported under its Rust name.
 - A DTO holds no map keyed by caller data, such as a `HashMap<String, _>`: a key would come back as a key of `error.fields`. A list of objects, each with its key as a field, takes its place.
 - Nothing the caller sent comes back. A DTO type's own `Deserialize` or `TryFrom` error, the message of a garde `custom` rule and the `Display` of a module error never quote their input, because each reaches the client as written.
 - A handler that validates a JSON body itself keys its errors by paths in that body, JSON names in camelCase. `TestClient` fails a test whose 422 `VALIDATION_FAILED` has a key with `_` in a name or, answering a JSON body, a key that names no member of the body, no query parameter and no field missing from an object of the body.
-- To confirm a missing field, the extractor builds a tree of the body: a copy that the 1 MiB limit bounds.
+- To confirm a missing field, the extractor builds a tree of the body, and a tree takes many times the size of its text: a body of 1 MiB peaked at about 24 MiB. So it builds one only for a body of at most 64 KiB. In a larger body the field is not confirmed: the key is the path of the object that lacks it, with `is not valid`, and at the root, where no field is left to name, the body answers 400.
 
 ### Logs and metrics
 
@@ -76,7 +77,7 @@ Date: 2026-11-16
 ### Shutdown and the runtime
 
 - After SIGTERM or Ctrl-C a binary stops accepting connections and gives the requests in flight at most 10 seconds. Then it stops waiting, logs a `warn`, and exits 0. A header-read timeout against slow clients belongs to the deployment's proxy (BAR-12).
-- The binaries give tokio its worker count themselves, one per processor, so tokio never reads `TOKIO_WORKER_THREADS` (ADR-0016).
+- The binaries build their runtime with `build_runtime` of `barras-bootstrap`, which gives tokio its worker count, one per processor, so tokio never reads `TOKIO_WORKER_THREADS` (ADR-0016, ADR-0026).
 
 ## Consequences
 

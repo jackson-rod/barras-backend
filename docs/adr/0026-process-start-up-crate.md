@@ -13,11 +13,13 @@ Date: 2026-11-16
 ## Decision
 
 - `crates/bootstrap`, the package `barras-bootstrap`, holds the start-up the binaries share:
-  - `Environment`. `from_process` is the one reader of the process environment; `from_pairs` gives a test, or the check of `.env.example`, its own pairs, so no test touches the process environment. `required::<T>(name)` reads one variable and records every problem instead of stopping at the first; `finish` returns the configuration, or every problem at once.
+  - `Environment`. `from_process` is the one reader of the process environment in a binary; `from_pairs` gives a test, or the check of `.env.example`, its own pairs, so no test needs the process environment for a configuration. The test-support exception is the testkit's process helper, which reads `LLVM_PROFILE_FILE` to pass it to each binary a test starts (ADR-0027). `required::<T>(name)` reads one variable and records every problem instead of stopping at the first; `finish` returns the configuration, or every problem at once.
   - `init_logging`: readable lines when `APP_ENV` is `local`, one JSON object per line otherwise (ADR-0029).
   - `install_panic_hook`: a panic is logged as an `error` event, inside the spans current where it happened, rather than as the default hook's raw line on standard error.
+  - `build_runtime`: tokio's multi-thread runtime with one worker per processor, given explicitly so that tokio never reads `TOKIO_WORKER_THREADS` (ADR-0029).
   - `ShutdownSignal`: `install()` listens for SIGTERM and SIGINT, and `recv()` waits for the next one.
   - `with_sources`: an error's text followed by that of each of its sources, which a binary prints when it stops on a failure.
+  - `report_failure` and `report_usage`: a line on standard error, for what no log can take, and the exit status 1 or 2; a closed standard error is no panic.
 - It depends on no workspace member but `workspace-hack` (`bootstrap-isolation`).
 - Only the crates under `apps/` depend on it, in any kind of dependency (`bootstrap-apps-only`).
 - Barras builds and runs only on Unix: the binaries stop on SIGTERM and SIGINT, so `ShutdownSignal` and the testkit's process helper exist only on Unix.

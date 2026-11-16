@@ -85,9 +85,9 @@ pub struct Environment {
 
 impl Environment {
     /// The process environment, read one name at a time as [`required`](Self::required)
-    /// asks for it, so nothing else in it is copied. The only reader of the process
-    /// environment (ADR-0016).
-    #[allow(clippy::disallowed_methods)] // ADR-0016: the one reader of the process environment
+    /// asks for it, so nothing else in it is copied. The only reader of a binary's
+    /// environment (ADR-0016); the testkit's process helper is the test-support exception.
+    #[allow(clippy::disallowed_methods)] // ADR-0016: the one reader of a binary's environment
     pub fn from_process() -> Self {
         Self::with_lookup(|name| std::env::var_os(name))
     }

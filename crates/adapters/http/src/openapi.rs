@@ -10,8 +10,8 @@ use utoipa::openapi::{Info, OpenApi, Paths, RefOr, Response};
 
 use crate::error::ApiError;
 
-/// The title and the version of the public document: written here, never taken from a
-/// crate's metadata.
+/// The title of the public document, written by hand, and its version: the workspace version,
+/// which this crate inherits as its own (`version.workspace = true`).
 const TITLE: &str = "Barras API";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -198,8 +198,9 @@ fn body_component<'a>(document: &'a OpenApi, response: &'a RefOr<Response>) -> O
     schemas.contains_key(name).then_some(name)
 }
 
-/// The root of the public document. Its `info` is written here, so that nothing comes from
-/// a crate's metadata (utoipa would write an empty licence for a crate that has none).
+/// The root of the public document. Its `info` is set here, the title by hand and the version
+/// the workspace's, so that nothing else comes from a crate's metadata (utoipa would write an
+/// empty licence for a crate that has none).
 pub(crate) fn document_base() -> OpenApi {
     let info = Info::new(TITLE, VERSION);
     let mut document = OpenApi::new(info, Paths::new());
