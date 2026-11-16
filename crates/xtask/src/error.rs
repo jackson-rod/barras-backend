@@ -22,13 +22,107 @@ pub enum XtaskError {
     Metadata(String),
     #[error("invalid pattern {pattern:?}: {message}")]
     Pattern { pattern: String, message: String },
-    #[error("the coverage report is malformed at line {line}: {problem}")]
-    Lcov { line: usize, problem: &'static str },
     #[error(
-        "the coverage report is older than {}: it measures line {line}, which the file does not have",
+        "the coverage report {} is malformed at line {line}: {problem}",
+        escaped(report)
+    )]
+    Lcov {
+        report: PathBuf,
+        line: usize,
+        problem: &'static str,
+    },
+    #[error(
+        "the coverage report measures line {line} of {}, past the end of the file, which has {length} lines",
         escaped(path)
     )]
-    StaleReport { path: PathBuf, line: usize },
+    StaleReport {
+        path: PathBuf,
+        line: usize,
+        length: usize,
+    },
+    #[error(
+        "the coverage report measures {}, inside the workspace but outside the src/ of every crate and outside target/: code included from there would escape every bar",
+        escaped(path)
+    )]
+    StrayFile { path: PathBuf },
+    #[error(
+        "the coverage report measures {}, a file under src/ that check-coverage does not read: it reads the .rs files, hidden ones aside, of crates that hold a Cargo.toml",
+        escaped(path)
+    )]
+    NotRead { path: PathBuf },
+    #[error("{}: {problem}", escaped(path))]
+    Layout {
+        path: PathBuf,
+        problem: LayoutProblem,
+    },
+    #[error("{}:{line}: {problem}", escaped(path))]
+    Source {
+        path: PathBuf,
+        line: usize,
+        problem: SourceProblem,
+    },
+}
+
+/// A file or a folder under a measured `src/` that would hide code from the measure, or
+/// that check-coverage does not read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum LayoutProblem {
+    #[error(
+        "a file named `*_tests.rs` or `*-tests.rs`, which cargo-llvm-cov leaves out of the report"
+    )]
+    DroppedFileName,
+    #[error(
+        "a folder named `examples` or `benches`, which cargo-llvm-cov leaves out of the report"
+    )]
+    DroppedFolder,
+    #[error("a symlink, which check-coverage does not follow")]
+    Symlink,
+    #[error("a FIFO, a socket or a device, which check-coverage does not read")]
+    SpecialFile,
+    #[error("a name that is not UTF-8")]
+    NotUtf8Name,
+}
+
+/// A shape in a measured source that check-coverage refuses, because it would hide code
+/// from the measure or count test code as production.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum SourceProblem {
+    #[error("the file does not parse as Rust")]
+    Unparsable,
+    #[error(
+        "`#[cfg(test)]` stands on something that is not an item, so its lines cannot be left out"
+    )]
+    CfgTestNotOnItem,
+    #[error(
+        "a `cfg` predicate names `test` in a form other than `test` or `any(test, feature = \"…\")`"
+    )]
+    TestInOtherForm,
+    #[error("a `cfg` predicate names `coverage`, which could take code out of the measured build")]
+    NamesCoverage,
+    #[error("a `coverage(…)` attribute, which takes code out of the measure")]
+    CoverageAttribute,
+    #[error("a `cfg_attr` that applies `cfg`, which could take code out of the measured build")]
+    CfgInCfgAttr,
+    #[error(
+        "an out-of-line `#[cfg(test)]` module must be named `tests`, the file name cargo-llvm-cov leaves out"
+    )]
+    OutOfLineTestModule,
+    #[error(
+        "a module named `tests` or `*_tests` without `#[cfg(test)]`: cargo-llvm-cov leaves such files out, so production code in them would escape"
+    )]
+    UnmarkedTestsModule,
+    #[error(
+        "an out-of-line module in test code must be named `tests` or sit in a module named `tests`, or its file is measured as production"
+    )]
+    StrayTestModuleFile,
+    #[error("a `#[path]` attribute, which can point a module at any file")]
+    PathAttribute,
+    #[error(
+        "an `include!` of a file by its path, which can bring in code from a file the measure leaves out: write it as a module"
+    )]
+    IncludeByPath,
+    #[error("a test function outside a `#[cfg(test)]` item, whose lines would count as production")]
+    TestOutsideTestCode,
 }
 
 impl XtaskError {
@@ -94,9 +188,26 @@ mod tests {
                 path: path.clone(),
                 limit: 1,
             },
+            XtaskError::Lcov {
+                report: path.clone(),
+                line: 1,
+                problem: "a record starts inside another",
+            },
             XtaskError::StaleReport {
                 path: path.clone(),
                 line: 2,
+                length: 1,
+            },
+            XtaskError::StrayFile { path: path.clone() },
+            XtaskError::NotRead { path: path.clone() },
+            XtaskError::Layout {
+                path: path.clone(),
+                problem: LayoutProblem::Symlink,
+            },
+            XtaskError::Source {
+                path: path.clone(),
+                line: 3,
+                problem: SourceProblem::PathAttribute,
             },
         ] {
             let message = error.to_string();

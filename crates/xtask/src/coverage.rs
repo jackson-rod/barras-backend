@@ -1,18 +1,30 @@
-//! The coverage bars: reads an LCOV report and holds each crate to its share of tested lines.
+//! The coverage bars: reads an LCOV report and measures, crate by crate, the share of
+//! production lines that the tests ran. `judge` holds each figure to its bar.
 
-use std::collections::BTreeMap;
+mod attributes;
+mod bars;
+mod lcov;
+mod source;
+mod sources;
+
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
-use std::ops::{AddAssign, RangeInclusive};
-use std::path::{Component, Path, PathBuf};
+use std::ops::AddAssign;
+use std::path::{Path, PathBuf};
+
+pub use bars::{BarFailure, judge};
+use lcov::{FileLines, parse_lcov, record};
+use source::Source;
+use sources::{measured_crates, read_sources};
 
 use crate::arch::{Layer, layer_of};
-use crate::error::XtaskError;
+use crate::error::{XtaskError, escaped};
+use crate::regular_file::read_regular_file;
 
-/// Percent of lines, for `crates/kernel` and for each crate under `crates/modules/`.
-const CRATE_BAR: u64 = 95;
-/// Percent of lines, for the measured crates together.
-const TOTAL_BAR: u64 = 85;
+/// A report of this workspace is a few megabytes; anything past this is refused unread.
+const REPORT_LIMIT: u64 = 64 * 1024 * 1024;
+const KERNEL_DIR: &str = "crates/kernel";
 
 /// Production lines the tests ran, out of those the report measured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -51,6 +63,9 @@ impl fmt::Display for Lines {
 pub struct CoverageReport {
     /// Each measured crate that has a counted line, by its folder.
     pub crates: BTreeMap<PathBuf, Lines>,
+    /// The folders that must have a figure: `crates/kernel`, and each `crates/modules/<m>`
+    /// that holds a `Cargo.toml`.
+    pub required: BTreeSet<PathBuf>,
 }
 
 impl CoverageReport {
@@ -67,176 +82,179 @@ impl CoverageReport {
         let mut summary: Vec<String> = self
             .crates
             .iter()
-            .map(|(folder, lines)| format!("{}: {lines}", folder.display()))
+            .map(|(folder, lines)| format!("{}: {lines}", escaped(folder)))
             .collect();
         summary.push(format!("total: {}", self.total()));
         summary
     }
 }
 
-/// `check_coverage` over the report in `file`.
-pub fn check_coverage_file(root: &Path, file: &Path) -> Result<CoverageReport, XtaskError> {
-    let lcov = fs::read_to_string(file).map_err(XtaskError::io(file))?;
-    check_coverage(root, &lcov)
+/// `measure_coverage` over the report at `report`.
+pub fn measure_coverage_file(root: &Path, report: &Path) -> Result<CoverageReport, XtaskError> {
+    let lcov = read_regular_file(report, REPORT_LIMIT)?;
+    measure_coverage(root, report, &lcov)
 }
 
-/// Counts, crate by crate, the production lines that the LCOV text `lcov` measured in the
-/// workspace at `root`.
-pub fn check_coverage(root: &Path, lcov: &str) -> Result<CoverageReport, XtaskError> {
+/// Counts, crate by crate, the production lines that the LCOV text `lcov`, read from
+/// `report`, measured in the workspace at `root`.
+pub fn measure_coverage(
+    root: &Path,
+    report: &Path,
+    lcov: &str,
+) -> Result<CoverageReport, XtaskError> {
     // The report names files by their real path, and `root` may be written with `..` or
     // through a symlink.
     let root = fs::canonicalize(root).map_err(XtaskError::io(root))?;
-    let mut files: BTreeMap<PathBuf, FileLines> = BTreeMap::new();
-    for (file, lines) in parse_lcov(lcov)? {
-        if let Some(relative) = inside(&root, &file) {
-            let merged = files.entry(relative).or_default();
-            for (line, hit) in lines {
-                record(merged, line, hit);
-            }
-        }
-    }
-    let mut crates: BTreeMap<PathBuf, Lines> = BTreeMap::new();
-    for (file, lines) in &files {
-        let Some(folder) = measured_crate(file) else {
+    let records = parse_lcov(report, lcov)?;
+    let crates = measured_crates(&root)?;
+    let sources = read_sources(&root, &crates)?;
+    let mut measured: BTreeMap<PathBuf, FileLines> = BTreeMap::new();
+    for (file, lines) in records {
+        let Some(relative) = inside(&root, &file) else {
             continue;
         };
-        let counted = production_lines(&root.join(file), lines)?;
-        if counted.found > 0 {
-            *crates.entry(folder.to_path_buf()).or_default() += counted;
+        let path = root.join(&relative);
+        let kind = fs::symlink_metadata(&path)
+            .map_err(XtaskError::io(&path))?
+            .file_type();
+        if !kind.is_file() {
+            return Err(XtaskError::NotARegularFile { path });
         }
-    }
-    Ok(CoverageReport { crates })
-}
-
-/// What is under its bar, one message each; empty when the report passes.
-pub fn under_the_bars(report: &CoverageReport) -> Vec<String> {
-    let mut problems: Vec<String> = report
-        .crates
-        .iter()
-        .filter(|(folder, lines)| has_its_own_bar(folder) && !lines.meets(CRATE_BAR))
-        .map(|(folder, lines)| {
-            format!(
-                "{}: {lines} is under its bar of {CRATE_BAR}%",
-                folder.display()
-            )
-        })
-        .collect();
-    let total = report.total();
-    if total.found == 0 {
-        // Nothing out of nothing meets any bar in whole numbers. A report that measured
-        // no line is a run that went wrong, not a pass.
-        problems.push(format!("total: {total}"));
-    } else if !total.meets(TOTAL_BAR) {
-        problems.push(format!("total: {total} is under its bar of {TOTAL_BAR}%"));
-    }
-    problems
-}
-
-fn has_its_own_bar(folder: &Path) -> bool {
-    matches!(layer_of(folder), Some(Layer::Kernel | Layer::Module))
-}
-
-/// Line number to "a test ran it".
-type FileLines = BTreeMap<usize, bool>;
-
-/// A line counts once, and as run if any record ran it.
-fn record(lines: &mut FileLines, line: usize, hit: bool) {
-    *lines.entry(line).or_insert(false) |= hit;
-}
-
-/// The `DA` records of an LCOV text, by the source file their `SF` record names. Every
-/// other record repeats or sums these, or describes functions and branches.
-fn parse_lcov(lcov: &str) -> Result<BTreeMap<PathBuf, FileLines>, XtaskError> {
-    let mut files: BTreeMap<PathBuf, FileLines> = BTreeMap::new();
-    let mut open: Option<PathBuf> = None;
-    let mut last = 0;
-    for (index, text) in lcov.lines().enumerate() {
-        last = index + 1;
-        let malformed = |problem| XtaskError::Lcov {
-            line: last,
-            problem,
-        };
-        if let Some(path) = text.strip_prefix("SF:") {
-            if open.is_some() {
-                return Err(malformed("a record starts inside another"));
+        match place_of(&relative) {
+            Place::Unmeasured => {}
+            Place::Stray => return Err(XtaskError::StrayFile { path: relative }),
+            Place::Source if sources.contains_key(&relative) => {
+                let merged = measured.entry(relative).or_default();
+                for (line, hit) in lines {
+                    record(merged, line, hit);
+                }
             }
-            open = Some(source_path(path).ok_or_else(|| {
-                malformed("the path of a source file must be absolute and without `..`")
-            })?);
-        } else if let Some(data) = text.strip_prefix("DA:") {
-            let file = open
-                .as_ref()
-                .ok_or_else(|| malformed("a line record outside a file record"))?;
-            let (line, hits) = line_record(data)
-                .ok_or_else(|| malformed("a line record must be `DA:<line>,<hits>`"))?;
-            record(files.entry(file.clone()).or_default(), line, hits > 0);
-        } else if text == "end_of_record" && open.take().is_none() {
-            return Err(malformed("a record ends that never started"));
+            // cargo-llvm-cov leaves test modules out; a report that names one anyway still
+            // measures test code there.
+            Place::Source if is_test_module_file(&relative) => {}
+            Place::Source => return Err(XtaskError::NotRead { path: relative }),
         }
     }
-    if open.is_some() {
-        // A report cut short would otherwise pass with the lines it still has.
-        return Err(XtaskError::Lcov {
-            line: last,
-            problem: "the last record never ends",
-        });
+    let mut figures: BTreeMap<PathBuf, Lines> = BTreeMap::new();
+    for (file, lines) in &measured {
+        let (Some(source), Some(folder)) = (sources.get(file), crate_folder(file)) else {
+            continue;
+        };
+        let counted = production_lines(file, source, lines)?;
+        if counted.found > 0 {
+            *figures.entry(folder.to_path_buf()).or_default() += counted;
+        }
     }
-    Ok(files)
-}
-
-fn source_path(path: &str) -> Option<PathBuf> {
-    let path = Path::new(path);
-    let plain = path.is_absolute() && !path.components().any(|part| part == Component::ParentDir);
-    plain.then(|| path.to_path_buf())
-}
-
-/// `<line>,<hits>` with an optional `,<checksum>`. Lines are numbered from 1.
-fn line_record(data: &str) -> Option<(usize, u64)> {
-    let mut fields = data.split(',');
-    let line: usize = fields.next()?.parse().ok()?;
-    let hits: u64 = fields.next()?.parse().ok()?;
-    (line > 0).then_some((line, hits))
-}
-
-/// `file` relative to `root`, which is canonical, or `None` when it is outside. A report
-/// may spell the workspace through a symlink (`/tmp` on macOS), so a path that does not
-/// start with `root` is tried again by its real path. One that does not resolve is not
-/// in the workspace either.
-fn inside(root: &Path, file: &Path) -> Option<PathBuf> {
-    if let Ok(relative) = file.strip_prefix(root) {
-        return Some(relative.to_path_buf());
-    }
-    let real = fs::canonicalize(file).ok()?;
-    real.strip_prefix(root).ok().map(Path::to_path_buf)
-}
-
-/// The folder of the crate that `file` is in, when that crate is measured:
-/// `crates/testkit` is test code and `crates/workspace-hack` is generated.
-fn measured_crate(file: &Path) -> Option<&Path> {
-    file.ancestors().skip(1).find(|folder| {
-        layer_of(folder)
-            .is_some_and(|layer| !matches!(layer, Layer::Testkit | Layer::WorkspaceHack))
+    let required = crates
+        .into_iter()
+        .filter(|folder| layer_of(folder) == Some(Layer::Module))
+        .chain([PathBuf::from(KERNEL_DIR)])
+        .collect();
+    Ok(CoverageReport {
+        crates: figures,
+        required,
     })
 }
 
-/// The lines of the report for the source at `path`, without those of its test modules.
-fn production_lines(path: &Path, lines: &FileLines) -> Result<Lines, XtaskError> {
-    let source = fs::read_to_string(path).map_err(XtaskError::io(path))?;
-    let length = source.lines().count();
-    if let Some(line) = lines.keys().next_back().filter(|line| **line > length) {
-        // The test modules are found in the file as it is now, so their lines would be
-        // the wrong ones.
-        return Err(XtaskError::StaleReport {
-            path: path.to_path_buf(),
-            line: *line,
-        });
+/// Where a file of the report sits, as far as the measure is concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Place {
+    /// Under `target/`, `crates/testkit` or `crates/workspace-hack`, or the tests, benches,
+    /// examples or build script of a crate.
+    Unmeasured,
+    /// Under the `src/` of a measured crate.
+    Source,
+    /// Anywhere else in the workspace: code included from there would escape every bar.
+    Stray,
+}
+
+fn place_of(file: &Path) -> Place {
+    if file.starts_with("target") {
+        return Place::Unmeasured;
     }
-    let tests = test_module_lines(&source);
+    let Some(folder) = crate_folder(file) else {
+        return Place::Stray;
+    };
+    if matches!(
+        layer_of(folder),
+        Some(Layer::Testkit | Layer::WorkspaceHack)
+    ) {
+        return Place::Unmeasured;
+    }
+    let inner = file.strip_prefix(folder).unwrap_or(file);
+    if inner.starts_with("src") {
+        Place::Source
+    } else if ["tests", "benches", "examples"]
+        .iter()
+        .any(|folder| inner.starts_with(folder))
+        || inner == Path::new("build.rs")
+    {
+        Place::Unmeasured
+    } else {
+        Place::Stray
+    }
+}
+
+/// The folder of the crate that `file` is in, if any.
+fn crate_folder(file: &Path) -> Option<&Path> {
+    file.ancestors()
+        .skip(1)
+        .find(|folder| layer_of(folder).is_some())
+}
+
+/// A `tests.rs` file or a file under a `tests` folder, inside a crate's `src/`.
+fn is_test_module_file(file: &Path) -> bool {
+    let Some(inner) =
+        crate_folder(file).and_then(|folder| file.strip_prefix(folder.join("src")).ok())
+    else {
+        return false;
+    };
+    inner.file_name().is_some_and(|name| name == "tests.rs")
+        || inner
+            .parent()
+            .is_some_and(|folders| folders.iter().any(|folder| folder == "tests"))
+}
+
+/// `file` relative to `root`, which is canonical, or `None` when it is outside under both
+/// its real spelling and the one the report gives. A report may reach the workspace
+/// through a symlink (`/tmp` on macOS), so the folders are resolved; the file itself is not,
+/// so that a symlink the report names is still seen as one.
+fn inside(root: &Path, file: &Path) -> Option<PathBuf> {
+    let real = resolved_folders(file);
+    real.strip_prefix(root)
+        .or_else(|_| file.strip_prefix(root))
+        .ok()
+        .map(Path::to_path_buf)
+}
+
+/// `file` with its nearest folder that exists resolved to its real path. A file that does
+/// not exist keeps its place in the workspace, and is then an error, not a file outside.
+fn resolved_folders(file: &Path) -> PathBuf {
+    file.ancestors()
+        .skip(1)
+        .find_map(|folder| {
+            let real = fs::canonicalize(folder).ok()?;
+            Some(real.join(file.strip_prefix(folder).ok()?))
+        })
+        .unwrap_or_else(|| file.to_path_buf())
+}
+
+/// The lines of the report for the source `file` that are production lines.
+fn production_lines(file: &Path, source: &Source, lines: &FileLines) -> Result<Lines, XtaskError> {
     let mut counted = Lines::default();
-    for (line, hit) in lines {
-        if !tests.iter().any(|module| module.contains(line)) {
+    for (&line, &hit) in lines {
+        if line > source.line_count {
+            // The test items are found in the file as it is now, so the lines of a report
+            // older than it would be the wrong ones.
+            return Err(XtaskError::StaleReport {
+                path: file.to_path_buf(),
+                line,
+                length: source.line_count,
+            });
+        }
+        if !source.test_lines.contains(&line) {
             counted += Lines {
-                hit: u64::from(*hit),
+                hit: u64::from(hit),
                 found: 1,
             };
         }
@@ -244,85 +262,35 @@ fn production_lines(path: &Path, lines: &FileLines) -> Result<Lines, XtaskError>
     Ok(counted)
 }
 
-/// The lines, numbered from 1, of each inline test module of a source file. cargo-llvm-cov
-/// counts them as covered lines, which would lift every figure.
-fn test_module_lines(source: &str) -> Vec<RangeInclusive<usize>> {
-    let lines: Vec<&str> = source.lines().collect();
-    let mut modules = Vec::new();
-    let mut at = 0;
-    while let Some(rest) = lines.get(at..).filter(|rest| !rest.is_empty()) {
-        match test_module_length(rest) {
-            Some(length) => {
-                modules.push(at + 1..=at + length);
-                at += length;
-            }
-            None => at += 1,
-        }
-    }
-    modules
-}
-
-/// How many lines the test module takes that starts on the first of `lines`, if one does.
-/// It is the one shape rustfmt gives it, every line below at column 0:
-///
-/// ```text
-/// #[cfg(test)]
-/// #[allow(clippy::too_many_lines)] // any number of other attribute lines
-/// mod tests {
-///     …
-/// }
-/// ```
-///
-/// Anything else leaves nothing out, so no production line is dropped on a guess.
-fn test_module_length(lines: &[&str]) -> Option<usize> {
-    let (first, rest) = lines.split_first()?;
-    if *first != "#[cfg(test)]" {
-        return None;
-    }
-    let attributes = rest
-        .iter()
-        .take_while(|line| line.starts_with("#["))
-        .count();
-    let (opening, body) = rest.get(attributes..)?.split_first()?;
-    if !(opening.starts_with("mod ") && opening.ends_with('{')) {
-        return None;
-    }
-    let closing = body.iter().position(|line| *line == "}")?;
-    // The `#[cfg(test)]` line, the attributes, the `mod` line, the body and its `}`.
-    Some(1 + attributes + 1 + closing + 1)
-}
-
 #[cfg(test)]
 mod tests {
-    use std::fs;
-
     use super::*;
 
-    // A fixture is written as a list of lines, never as one literal that spans lines: a
-    // `}` at column 0 inside this module would end it for `test_module_lines` itself.
-    fn text(lines: &[&str]) -> String {
-        let mut text = lines.join("\n");
-        text.push('\n');
-        text
-    }
-
-    /// The first and the last line of each test module.
-    fn test_modules(source: &str) -> Vec<(usize, usize)> {
-        test_module_lines(source)
-            .iter()
-            .map(|module| (*module.start(), *module.end()))
-            .collect()
-    }
+    const REPORT: &str = "lcov.info";
 
     fn write(root: &Path, relative: &str, lines: &[&str]) -> PathBuf {
         let path = root.join(relative);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, text(lines)).unwrap();
+        fs::write(&path, lines.join("\n") + "\n").unwrap();
         path
     }
 
+    /// A workspace whose crates each hold a `Cargo.toml`.
+    fn workspace(crates: &[&str]) -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        for folder in crates {
+            write(root.path(), &format!("{folder}/Cargo.toml"), &["[package]"]);
+        }
+        root
+    }
+
+    /// A source of `count` production lines.
+    fn plain_source(root: &Path, relative: &str, count: usize) -> PathBuf {
+        write(root, relative, &vec!["pub fn production() {}"; count])
+    }
+
     /// One LCOV record: `lines` are (line number, hits).
-    fn record(file: &Path, lines: &[(usize, u64)]) -> String {
+    fn record_of(file: &Path, lines: &[(usize, u64)]) -> String {
         let mut record = format!("SF:{}\n", file.display());
         for (line, hits) in lines {
             record.push_str(&format!("DA:{line},{hits}\n"));
@@ -338,512 +306,235 @@ mod tests {
             .collect()
     }
 
-    /// A source file of `count` lines with no test module.
-    fn plain_source(root: &Path, relative: &str, count: usize) -> PathBuf {
-        let lines = vec!["// production"; count];
-        write(root, relative, &lines)
+    fn measure(root: &Path, lcov: &str) -> Result<CoverageReport, XtaskError> {
+        measure_coverage(root, Path::new(REPORT), lcov)
     }
 
-    fn report(crates: &[(&str, u64, u64)]) -> CoverageReport {
-        CoverageReport {
-            crates: crates
-                .iter()
-                .map(|(folder, hit, found)| {
-                    (
-                        PathBuf::from(folder),
-                        Lines {
-                            hit: *hit,
-                            found: *found,
-                        },
-                    )
-                })
-                .collect(),
+    fn figures(crates: &[(&str, u64, u64)]) -> BTreeMap<PathBuf, Lines> {
+        crates
+            .iter()
+            .map(|(folder, hit, found)| {
+                (
+                    PathBuf::from(folder),
+                    Lines {
+                        hit: *hit,
+                        found: *found,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_file_is_placed_by_the_crate_folder_and_the_part_of_it_it_is_in() {
+        for (file, place) in [
+            ("crates/kernel/src/money.rs", Place::Source),
+            ("crates/modules/goals/src/domain/goal.rs", Place::Source),
+            ("crates/adapters/http/src/envelope.rs", Place::Source),
+            ("crates/bootstrap/src/logging.rs", Place::Source),
+            ("crates/xtask/src/main.rs", Place::Source),
+            ("apps/api/src/main.rs", Place::Source),
+            ("crates/kernel/tests/x.rs", Place::Unmeasured),
+            ("crates/kernel/benches/x.rs", Place::Unmeasured),
+            ("apps/api/examples/demo.rs", Place::Unmeasured),
+            ("apps/ingest/build.rs", Place::Unmeasured),
+            ("crates/testkit/src/process.rs", Place::Unmeasured),
+            ("crates/workspace-hack/src/lib.rs", Place::Unmeasured),
+            ("target/debug/build/x/out/generated.rs", Place::Unmeasured),
+            ("shared/logic.rs", Place::Stray),
+            ("crates/misc/src/lib.rs", Place::Stray),
+            ("crates/kernel/generated/x.rs", Place::Stray),
+            ("crates/kernel/gen.rs", Place::Stray),
+            ("targets/x.rs", Place::Stray),
+            ("build.rs", Place::Stray),
+        ] {
+            assert_eq!(place_of(Path::new(file)), place, "{file}");
         }
     }
 
-    const PRODUCTION_THEN_TESTS: &[&str] = &[
-        "pub fn double(n: u32) -> u32 {",
-        "    n * 2",
-        "}",
-        "",
-        "#[cfg(test)]",
-        "mod tests {",
-        "    use super::*;",
-        "",
-        "    #[test]",
-        "    fn doubles() {",
-        "        assert_eq!(double(2), 4);",
-        "    }",
-        "}",
-    ];
-
-    // --- the test-module filter
-
     #[test]
-    fn a_test_module_at_the_end_is_left_out() {
-        assert_eq!(test_modules(&text(PRODUCTION_THEN_TESTS)), [(5, 13)]);
+    fn a_test_module_file_is_known_by_its_name_or_its_folder() {
+        for file in [
+            "crates/kernel/src/tests.rs",
+            "crates/kernel/src/money/tests.rs",
+            "crates/kernel/src/tests/helpers.rs",
+            "crates/kernel/src/money/tests/deep/x.rs",
+        ] {
+            assert!(is_test_module_file(Path::new(file)), "{file}");
+        }
+        for file in [
+            "crates/kernel/src/money.rs",
+            "crates/kernel/src/contests.rs",
+            "crates/kernel/src/ab_tests.rs",
+            "crates/kernel/tests/x.rs",
+        ] {
+            assert!(!is_test_module_file(Path::new(file)), "{file}");
+        }
     }
 
     #[test]
-    fn a_test_module_in_the_middle_is_left_out_and_the_code_after_it_is_kept() {
-        let source = text(&[
-            "fn before() {}",
-            "",
-            "#[cfg(test)]",
-            "mod tests {",
-            "    #[test]",
-            "    fn works() {}",
-            "}",
-            "",
-            "fn after() {",
-            "    before();",
-            "}",
-        ]);
-        assert_eq!(test_modules(&source), [(3, 7)]);
-    }
-
-    #[test]
-    fn every_test_module_of_a_file_is_left_out() {
-        let source = text(&[
-            "#[cfg(test)]",
-            "mod tests {",
-            "    #[test]",
-            "    fn one() {}",
-            "}",
-            "",
-            "fn between() {}",
-            "",
-            "#[cfg(test)]",
-            "mod more_tests {",
-            "    #[test]",
-            "    fn two() {}",
-            "}",
-        ]);
-        assert_eq!(test_modules(&source), [(1, 5), (9, 13)]);
-    }
-
-    #[test]
-    fn attribute_lines_may_sit_between_the_two_lines() {
-        let source = text(&[
-            "fn production() {}",
-            "",
-            "#[cfg(test)]",
-            "#[allow(clippy::too_many_lines)] // one long table",
-            "#[rustfmt::skip]",
-            "mod tests {",
-            "    #[test]",
-            "    fn works() {}",
-            "}",
-        ]);
-        assert_eq!(test_modules(&source), [(3, 9)]);
-    }
-
-    #[test]
-    fn nested_braces_inside_the_module_do_not_end_it() {
-        let source = text(&[
-            "#[cfg(test)]",
-            "mod tests {",
-            "    struct Fixture {",
-            "        id: u32,",
-            "    }",
-            "",
-            "    mod inner {",
-            "        #[test]",
-            "        fn works() {",
-            "            if true {",
-            "            }",
-            "        }",
-            "    }",
-            "}",
-            "",
-            "fn after() {}",
-        ]);
-        assert_eq!(test_modules(&source), [(1, 14)]);
-    }
-
-    #[test]
-    fn cfg_test_on_anything_but_an_inline_module_leaves_nothing_out() {
-        // Each is followed by production code that a wrong match would swallow.
-        for item in [
-            &["#[cfg(test)]", "use std::fs;"][..],
-            &["#[cfg(test)]", "fn helper() {", "}"],
-            &["#[cfg(test)]", "impl Clock {", "    fn set(&self) {}", "}"],
-            &["#[cfg(test)]", "mod tests;"],
-            &["#[cfg(test)]", "pub mod fixtures {", "}"],
-            &["#[cfg(test)]", "pub(crate) mod fixtures {", "}"],
-            &["#[cfg(test)]", "mod tests {}"],
-            &["#[cfg(test)]", "mod tests { // why", "}"],
-            &["#[cfg(test)] // why", "mod tests {", "}"],
+    fn production_lines_are_counted_crate_by_crate_and_test_lines_are_left_out() {
+        let root = workspace(&["crates/kernel", "crates/modules/goals", "apps/api"]);
+        let lib = write(
+            root.path(),
+            "crates/kernel/src/lib.rs",
             &[
-                "#[cfg(any(test, feature = \"testing\"))]",
-                "mod fixed {",
+                "pub fn double(n: u32) -> u32 {",
+                "    n * 2",
+                "}",
+                "#[cfg(test)]",
+                "mod tests {",
+                "    fn doubles() {}",
                 "}",
             ],
-            &["#[cfg(not(test))]", "mod real {", "}"],
-            &["#![cfg(test)]", "mod tests {", "}"],
-            &["    #[cfg(test)]", "mod tests {", "}"],
-            &["mod tests {", "}"],
-        ] {
-            let source = [item, &["", "fn production() {", "    work();", "}"]].concat();
-            assert_eq!(test_modules(&text(&source)), [], "{item:?}");
-        }
-    }
-
-    #[test]
-    fn only_attribute_lines_may_sit_between_so_production_code_is_never_swallowed() {
-        let source = text(&[
-            "#[cfg(test)]",
-            "use std::fs;",
-            "",
-            "mod parser {",
-            "    pub fn parse() {}",
-            "}",
-        ]);
-        assert_eq!(test_modules(&source), []);
-        let source = text(&[
-            "#[cfg(test)]",
-            "// a note about the module",
-            "mod tests {",
-            "}",
-        ]);
-        assert_eq!(test_modules(&source), []);
-        let source = text(&["#[cfg(test)]", "", "mod tests {", "}"]);
-        assert_eq!(test_modules(&source), []);
-    }
-
-    #[test]
-    fn an_indented_module_is_not_a_test_module_of_the_file() {
-        let source = text(&[
-            "mod outer {",
-            "    #[cfg(test)]",
-            "    mod tests {",
-            "        #[test]",
-            "        fn works() {}",
-            "    }",
-            "}",
-        ]);
-        assert_eq!(test_modules(&source), []);
-    }
-
-    #[test]
-    fn a_module_that_never_closes_leaves_nothing_out() {
-        let source = text(&["fn f() {}", "#[cfg(test)]", "mod tests {", "    fn t() {}"]);
-        assert_eq!(test_modules(&source), []);
-        assert_eq!(test_modules("#[cfg(test)]\n#[allow(dead_code)]"), []);
-        assert_eq!(test_modules("#[cfg(test)]"), []);
-        assert_eq!(test_modules(""), []);
-    }
-
-    #[test]
-    fn windows_line_endings_change_nothing() {
-        let source = text(PRODUCTION_THEN_TESTS).replace('\n', "\r\n");
-        assert_eq!(test_modules(&source), [(5, 13)]);
-    }
-
-    // --- parsing
-
-    #[test]
-    fn the_line_records_are_read_and_every_other_record_is_ignored() {
-        let lcov = text(&[
-            "TN:",
-            "SF:/work/crates/kernel/src/money.rs",
-            "FN:3,_RNvCs_6kernel5money",
-            "FNDA:7,_RNvCs_6kernel5money",
-            "FNF:1",
-            "FNH:1",
-            "DA:3,7",
-            "DA:4,0",
-            "DA:5,18446744073709551615",
-            "BRDA:4,0,0,-",
-            "BRF:1",
-            "BRH:0",
-            "LF:3",
-            "LH:2",
-            "end_of_record",
-            "SF:/work/apps/api/src/main.rs",
-            "DA:1,0",
-            "end_of_record",
-        ]);
-        let files = parse_lcov(&lcov).unwrap();
-        assert_eq!(
-            files,
-            BTreeMap::from([
-                (
-                    PathBuf::from("/work/apps/api/src/main.rs"),
-                    BTreeMap::from([(1, false)])
-                ),
-                (
-                    PathBuf::from("/work/crates/kernel/src/money.rs"),
-                    BTreeMap::from([(3, true), (4, false), (5, true)])
-                ),
-            ])
         );
-    }
-
-    #[test]
-    fn a_file_in_several_records_counts_each_line_once_and_as_run_if_any_record_ran_it() {
-        let file = Path::new("/work/crates/kernel/src/id.rs");
         let lcov = [
-            record(file, &[(1, 0), (2, 3), (3, 0)]),
-            record(Path::new("/work/apps/api/src/main.rs"), &[(1, 1)]),
-            record(file, &[(1, 2), (2, 0), (3, 0), (4, 0)]),
-        ]
-        .concat();
-        assert_eq!(
-            parse_lcov(&lcov).unwrap()[file],
-            BTreeMap::from([(1, true), (2, true), (3, false), (4, false)])
-        );
-    }
-
-    #[test]
-    fn a_line_record_may_carry_a_checksum() {
-        let lcov = text(&[
-            "SF:/work/a.rs",
-            "DA:9,1,PF4Rz2r7RTliO9u6bZ7h6g",
-            "end_of_record",
-        ]);
-        assert_eq!(
-            parse_lcov(&lcov).unwrap()[Path::new("/work/a.rs")],
-            BTreeMap::from([(9, true)])
-        );
-    }
-
-    #[test]
-    fn a_malformed_record_is_an_error_that_names_its_line() {
-        // Each report is whole but for one line, so nothing else can be what fails it.
-        for (lcov, line) in [
-            (&["DA:1,1", "SF:/work/a.rs", "end_of_record"][..], 1),
-            (&["SF:/work/a.rs", "end_of_record", "DA:1,1", "TN:"], 3),
-            (&["end_of_record", "SF:/work/a.rs", "end_of_record"], 1),
-            (&["SF:/work/a.rs", "SF:/work/b.rs", "end_of_record"], 2),
-            (&["SF:/work/a.rs", "DA:1", "end_of_record"], 2),
-            (&["SF:/work/a.rs", "DA:,1", "end_of_record"], 2),
-            (&["SF:/work/a.rs", "DA:one,1", "end_of_record"], 2),
-            (&["SF:/work/a.rs", "DA:0,1", "end_of_record"], 2),
-            (&["SF:/work/a.rs", "DA:-1,1", "end_of_record"], 2),
-            (&["SF:/work/a.rs", "DA:1,-1", "end_of_record"], 2),
-            (&["SF:/work/a.rs", "DA:1,1.5", "end_of_record"], 2),
-            (&["SF:/work/a.rs", "DA:1,", "end_of_record"], 2),
-            (&["SF:/work/a.rs", "DA:1, 1", "end_of_record"], 2),
-            (&["SF:", "end_of_record"], 1),
-            (&["SF:crates/kernel/src/money.rs", "end_of_record"], 1),
-            (
-                &[
-                    "SF:/work/crates/kernel/../../../etc/passwd",
-                    "end_of_record",
-                ],
-                1,
-            ),
-        ] {
-            let error = parse_lcov(&text(lcov)).unwrap_err();
-            assert!(
-                matches!(error, XtaskError::Lcov { line: found, .. } if found == line),
-                "{lcov:?}: {error}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_report_cut_short_is_an_error() {
-        for (lcov, line) in [
-            (&["SF:/work/a.rs"][..], 1),
-            (&["SF:/work/a.rs", "DA:1,1"], 2),
-            (
-                &["SF:/work/a.rs", "DA:1,1", "end_of_record", "SF:/work/b.rs"],
-                4,
-            ),
-            (&["SF:/work/a.rs", "DA:1,1", "end_of_recor"], 3),
-        ] {
-            let error = parse_lcov(&text(lcov)).unwrap_err();
-            assert!(
-                matches!(error, XtaskError::Lcov { line: found, .. } if found == line),
-                "{lcov:?}: {error}"
-            );
-        }
-    }
-
-    #[test]
-    fn an_empty_text_holds_no_record() {
-        assert_eq!(parse_lcov("").unwrap(), BTreeMap::new());
-        assert_eq!(parse_lcov("TN:\n\n").unwrap(), BTreeMap::new());
-    }
-
-    // --- grouping
-
-    #[test]
-    fn a_file_belongs_to_the_crate_folder_it_is_in() {
-        for (file, folder) in [
-            ("crates/kernel/src/money.rs", "crates/kernel"),
-            (
-                "crates/modules/identity/src/domain/user.rs",
-                "crates/modules/identity",
-            ),
-            (
-                "crates/adapters/http/src/envelope.rs",
-                "crates/adapters/http",
-            ),
-            ("crates/bootstrap/src/logging.rs", "crates/bootstrap"),
-            ("crates/xtask/src/main.rs", "crates/xtask"),
-            ("apps/api/src/main.rs", "apps/api"),
-            ("apps/ingest/build.rs", "apps/ingest"),
-        ] {
-            assert_eq!(
-                measured_crate(Path::new(file)),
-                Some(Path::new(folder)),
-                "{file}"
-            );
-        }
-    }
-
-    #[test]
-    fn the_testkit_the_hack_and_any_other_folder_are_not_measured() {
-        for file in [
-            "crates/testkit/src/process.rs",
-            "crates/workspace-hack/src/lib.rs",
-            "crates/misc/src/lib.rs",
-            "vendor/uuid/src/lib.rs",
-            "target/debug/build/out/generated.rs",
-            "build.rs",
-            "crates/kernel",
-            "apps/api",
-            "crates/modules/identity",
-            "",
-        ] {
-            assert_eq!(measured_crate(Path::new(file)), None, "{file}");
-        }
-    }
-
-    // --- counting
-
-    #[test]
-    fn only_production_lines_are_counted() {
-        let root = tempfile::tempdir().unwrap();
-        let file = write(
-            root.path(),
-            "crates/kernel/src/double.rs",
-            PRODUCTION_THEN_TESTS,
-        );
-        let lcov = record(
-            &file,
-            &[(1, 4), (2, 0), (3, 4), (10, 1), (11, 1), (12, 1), (13, 1)],
-        );
-        assert_eq!(
-            check_coverage(root.path(), &lcov).unwrap(),
-            report(&[("crates/kernel", 2, 3)])
-        );
-    }
-
-    #[test]
-    fn each_crate_is_measured_on_its_own_and_the_total_adds_them_up() {
-        let root = tempfile::tempdir().unwrap();
-        let lcov = [
-            record(
-                &plain_source(root.path(), "crates/kernel/src/money.rs", 4),
-                &lines_run(4, 4),
-            ),
-            record(
+            record_of(&lib, &[(1, 4), (2, 0), (3, 4), (6, 1)]),
+            record_of(
                 &plain_source(root.path(), "crates/kernel/src/id.rs", 6),
                 &lines_run(5, 6),
             ),
-            record(
+            record_of(
                 &plain_source(root.path(), "crates/modules/goals/src/lib.rs", 2),
                 &lines_run(1, 2),
             ),
-            record(
+            record_of(
                 &plain_source(root.path(), "apps/api/src/main.rs", 3),
                 &lines_run(0, 3),
             ),
         ]
         .concat();
-        let found = check_coverage(root.path(), &lcov).unwrap();
+        let measured = measure(root.path(), &lcov).unwrap();
         assert_eq!(
-            found,
-            report(&[
+            measured.crates,
+            figures(&[
                 ("apps/api", 0, 3),
-                ("crates/kernel", 9, 10),
+                ("crates/kernel", 7, 9),
                 ("crates/modules/goals", 1, 2),
             ])
         );
-        assert_eq!(found.total(), Lines { hit: 10, found: 15 });
+        assert_eq!(
+            measured.required,
+            ["crates/kernel", "crates/modules/goals"]
+                .map(PathBuf::from)
+                .into()
+        );
+        assert_eq!(measured.total(), Lines { hit: 8, found: 14 });
     }
 
     #[test]
-    fn what_is_outside_the_workspace_or_outside_the_measured_crates_is_ignored() {
+    fn what_is_outside_the_workspace_or_not_measured_is_ignored() {
         let outside = tempfile::tempdir().unwrap();
-        let root = tempfile::tempdir().unwrap();
+        let root = workspace(&["crates/kernel", "crates/testkit"]);
         let lcov = [
-            record(
+            record_of(
                 &plain_source(root.path(), "crates/kernel/src/id.rs", 2),
                 &lines_run(2, 2),
             ),
-            record(
+            record_of(
                 &plain_source(outside.path(), "crates/kernel/src/id.rs", 9),
                 &lines_run(0, 9),
             ),
-            record(
+            record_of(
                 Path::new("/rustc/0123abcd/library/core/src/option.rs"),
                 &lines_run(0, 9),
             ),
-            record(
+            record_of(
                 &plain_source(root.path(), "crates/testkit/src/process.rs", 9),
                 &lines_run(9, 9),
             ),
-            record(
-                &plain_source(root.path(), "crates/workspace-hack/src/lib.rs", 9),
+            record_of(
+                &plain_source(root.path(), "target/debug/build/out/generated.rs", 9),
+                &lines_run(0, 9),
+            ),
+            record_of(
+                &plain_source(root.path(), "crates/kernel/tests/x.rs", 9),
                 &lines_run(9, 9),
             ),
-            record(
-                &plain_source(root.path(), "target/debug/build/out/generated.rs", 9),
+            record_of(
+                &plain_source(root.path(), "crates/kernel/benches/x.rs", 9),
                 &lines_run(9, 9),
             ),
         ]
         .concat();
         assert_eq!(
-            check_coverage(root.path(), &lcov).unwrap(),
-            report(&[("crates/kernel", 2, 2)])
+            measure(root.path(), &lcov).unwrap().crates,
+            figures(&[("crates/kernel", 2, 2)])
         );
     }
 
     #[test]
-    fn a_crate_whose_every_line_is_a_test_has_no_figure() {
-        let root = tempfile::tempdir().unwrap();
-        let file = write(
-            root.path(),
-            "crates/kernel/src/lib.rs",
-            &["#[cfg(test)]", "mod tests {", "    fn works() {}", "}"],
-        );
+    fn a_file_inside_the_workspace_but_outside_every_crate_src_is_an_error() {
+        for stray in [
+            "shared/logic.rs",
+            "crates/kernel/generated/logic.rs",
+            "crates/misc/src/lib.rs",
+        ] {
+            let root = workspace(&["crates/kernel"]);
+            let file = plain_source(root.path(), stray, 1);
+            let error = measure(root.path(), &record_of(&file, &[(1, 0)])).unwrap_err();
+            assert!(
+                matches!(&error, XtaskError::StrayFile { path } if path == Path::new(stray)),
+                "{stray}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_under_src_that_was_not_read_is_an_error() {
+        let root = workspace(&["crates/kernel"]);
+        for not_read in [
+            "crates/kernel/src/generated.inc",
+            "crates/kernel/src/.hidden.rs",
+            "crates/modules/ghost/src/lib.rs",
+        ] {
+            let file = plain_source(root.path(), not_read, 1);
+            let error = measure(root.path(), &record_of(&file, &[(1, 0)])).unwrap_err();
+            assert!(
+                matches!(&error, XtaskError::NotRead { path } if path == Path::new(not_read)),
+                "{not_read}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_test_module_file_the_report_names_anyway_is_not_measured() {
+        let root = workspace(&["crates/kernel"]);
         let lcov = [
-            record(&file, &[(3, 1)]),
-            record(
-                &plain_source(root.path(), "apps/api/src/main.rs", 1),
+            record_of(
+                &plain_source(root.path(), "crates/kernel/src/lib.rs", 1),
                 &lines_run(1, 1),
+            ),
+            record_of(
+                &plain_source(root.path(), "crates/kernel/src/tests.rs", 9),
+                &lines_run(9, 9),
             ),
         ]
         .concat();
         assert_eq!(
-            check_coverage(root.path(), &lcov).unwrap(),
-            report(&[("apps/api", 1, 1)])
+            measure(root.path(), &lcov).unwrap().crates,
+            figures(&[("crates/kernel", 1, 1)])
         );
     }
 
     #[cfg(unix)]
     #[test]
     fn the_root_and_the_report_may_spell_the_workspace_through_a_symlink() {
-        let real = tempfile::tempdir().unwrap();
+        let real = workspace(&["crates/kernel"]);
         let links = tempfile::tempdir().unwrap();
         let link = links.path().join("workspace");
         std::os::unix::fs::symlink(real.path(), &link).unwrap();
         plain_source(real.path(), "crates/kernel/src/id.rs", 2);
-        let through_the_link = record(&link.join("crates/kernel/src/id.rs"), &lines_run(1, 2));
-        let expected = report(&[("crates/kernel", 1, 2)]);
+        let through_the_link = record_of(&link.join("crates/kernel/src/id.rs"), &lines_run(1, 2));
+        let expected = figures(&[("crates/kernel", 1, 2)]);
         assert_eq!(
-            check_coverage(real.path(), &through_the_link).unwrap(),
+            measure(real.path(), &through_the_link).unwrap().crates,
             expected
         );
-        assert_eq!(check_coverage(&link, &through_the_link).unwrap(), expected);
+        assert_eq!(measure(&link, &through_the_link).unwrap().crates, expected);
         let root_with_dots = link.join("crates/kernel/../..");
         assert_eq!(
-            check_coverage(&root_with_dots, &through_the_link).unwrap(),
+            measure(&root_with_dots, &through_the_link).unwrap().crates,
             expected
         );
     }
@@ -851,49 +542,80 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn one_file_under_two_spellings_is_still_counted_once() {
-        let real = tempfile::tempdir().unwrap();
+        let real = workspace(&["crates/kernel"]);
         let links = tempfile::tempdir().unwrap();
         let link = links.path().join("workspace");
         std::os::unix::fs::symlink(real.path(), &link).unwrap();
         let file = plain_source(real.path(), "crates/kernel/src/id.rs", 3);
         let lcov = [
-            record(&file.canonicalize().unwrap(), &[(1, 0), (2, 1), (3, 0)]),
-            record(&link.join("crates/kernel/src/id.rs"), &[(1, 1), (2, 0)]),
+            record_of(&file.canonicalize().unwrap(), &[(1, 0), (2, 1), (3, 0)]),
+            record_of(&link.join("crates/kernel/src/id.rs"), &[(1, 1), (2, 0)]),
         ]
         .concat();
         assert_eq!(
-            check_coverage(real.path(), &lcov).unwrap(),
-            report(&[("crates/kernel", 2, 3)])
+            measure(real.path(), &lcov).unwrap().crates,
+            figures(&[("crates/kernel", 2, 3)])
         );
     }
 
+    #[cfg(unix)]
     #[test]
-    fn a_source_file_that_is_gone_is_an_error() {
-        let root = tempfile::tempdir().unwrap();
-        fs::create_dir_all(root.path().join("crates/kernel/src")).unwrap();
-        let lcov = record(
-            &root
-                .path()
+    fn a_missing_source_file_is_an_error_under_either_spelling() {
+        let real = workspace(&["crates/kernel"]);
+        plain_source(real.path(), "crates/kernel/src/lib.rs", 1);
+        let links = tempfile::tempdir().unwrap();
+        let link = links.path().join("workspace");
+        std::os::unix::fs::symlink(real.path(), &link).unwrap();
+        for gone in [
+            real.path()
                 .canonicalize()
                 .unwrap()
                 .join("crates/kernel/src/gone.rs"),
-            &lines_run(1, 1),
-        );
-        let error = check_coverage(root.path(), &lcov).unwrap_err();
-        assert!(
-            matches!(&error, XtaskError::Io { path, .. } if path.ends_with("gone.rs")),
-            "{error}"
-        );
+            link.join("crates/kernel/src/gone.rs"),
+            link.join("crates/kernel/src/gone/deeper.rs"),
+        ] {
+            let error = measure(real.path(), &record_of(&gone, &lines_run(1, 1))).unwrap_err();
+            assert!(
+                matches!(&error, XtaskError::Io { path, .. } if path.file_name() == gone.file_name()),
+                "{}: {error}",
+                gone.display()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_a_fifo_or_a_folder_the_report_names_is_an_error() {
+        let root = workspace(&["crates/kernel"]);
+        plain_source(root.path(), "crates/kernel/src/lib.rs", 1);
+        let real = root.path().canonicalize().unwrap();
+        let link = real.join("crates/kernel/tests/link.rs");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink("/etc/hosts", &link).unwrap();
+        let fifo = real.join("crates/kernel/tests/fifo.rs");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        for named in [link, fifo, real.join("crates/kernel/src")] {
+            let error = measure(root.path(), &record_of(&named, &[(1, 1)])).unwrap_err();
+            assert!(
+                matches!(&error, XtaskError::NotARegularFile { path } if *path == named),
+                "{}: {error}",
+                named.display()
+            );
+        }
     }
 
     #[test]
-    fn a_report_older_than_the_source_is_an_error() {
-        let root = tempfile::tempdir().unwrap();
+    fn a_line_past_the_end_of_its_file_is_an_error_that_says_so() {
+        let root = workspace(&["crates/kernel"]);
         let file = plain_source(root.path(), "crates/kernel/src/id.rs", 3);
-        let lcov = record(&file, &[(3, 1), (4, 1)]);
-        let error = check_coverage(root.path(), &lcov).unwrap_err();
+        let error = measure(root.path(), &record_of(&file, &[(3, 1), (4, 1)])).unwrap_err();
         assert!(
-            matches!(error, XtaskError::StaleReport { line: 4, .. }),
+            matches!(&error, XtaskError::StaleReport { path, line: 4, length: 3 }
+                if path == Path::new("crates/kernel/src/id.rs")),
             "{error}"
         );
     }
@@ -901,151 +623,91 @@ mod tests {
     #[test]
     fn a_root_that_does_not_exist_is_an_error() {
         let root = tempfile::tempdir().unwrap();
-        let error = check_coverage(&root.path().join("missing"), "").unwrap_err();
+        let error = measure(&root.path().join("missing"), "").unwrap_err();
         assert!(matches!(error, XtaskError::Io { .. }), "{error}");
     }
 
     #[test]
-    fn a_report_file_that_cannot_be_read_is_an_error() {
-        let root = tempfile::tempdir().unwrap();
-        let missing = root.path().join("lcov.info");
-        let error = check_coverage_file(root.path(), &missing).unwrap_err();
+    fn a_report_file_is_read_with_its_limits_and_measured() {
+        let root = workspace(&["crates/kernel"]);
+        let report = root.path().join(REPORT);
+        let error = measure_coverage_file(root.path(), &report).unwrap_err();
         assert!(
-            matches!(&error, XtaskError::Io { path, .. } if *path == missing),
+            matches!(&error, XtaskError::Io { path, .. } if *path == report),
             "{error}"
         );
-        fs::write(&missing, [0xff, 0xfe]).unwrap();
-        let error = check_coverage_file(root.path(), &missing).unwrap_err();
-        assert!(matches!(error, XtaskError::Io { .. }), "{error}");
-    }
-
-    #[test]
-    fn a_report_file_is_read_and_measured() {
-        let root = tempfile::tempdir().unwrap();
+        fs::File::create(&report)
+            .unwrap()
+            .set_len(REPORT_LIMIT + 1)
+            .unwrap();
+        let error = measure_coverage_file(root.path(), &report).unwrap_err();
+        assert!(
+            matches!(&error, XtaskError::TooLarge { path, .. } if *path == report),
+            "{error}"
+        );
         let file = plain_source(root.path(), "crates/kernel/src/id.rs", 2);
-        let lcov = root.path().join("lcov.info");
-        fs::write(&lcov, record(&file, &lines_run(2, 2))).unwrap();
+        fs::write(&report, record_of(&file, &lines_run(2, 2))).unwrap();
         assert_eq!(
-            check_coverage_file(root.path(), &lcov).unwrap(),
-            report(&[("crates/kernel", 2, 2)])
-        );
-    }
-
-    // --- the bars
-
-    #[test]
-    fn the_kernel_passes_at_exactly_its_bar_and_fails_one_line_under() {
-        let rest = ("apps/api", 1000, 1000);
-        assert_eq!(
-            under_the_bars(&report(&[("crates/kernel", 950, 1000), rest])),
-            Vec::<String>::new()
-        );
-        assert_eq!(
-            under_the_bars(&report(&[("crates/kernel", 949, 1000), rest])),
-            ["crates/kernel: 94.9% (949/1000) is under its bar of 95%"]
+            measure_coverage_file(root.path(), &report).unwrap().crates,
+            figures(&[("crates/kernel", 2, 2)])
         );
     }
 
     #[test]
-    fn each_module_is_held_to_the_bar_on_its_own() {
-        let found = report(&[
-            ("crates/kernel", 100, 100),
-            ("crates/modules/capital", 19, 20),
-            ("crates/modules/goals", 94, 100),
-            ("crates/modules/identity", 18, 20),
-        ]);
+    fn a_figure_is_cut_and_never_rounded() {
+        let lines = |hit, found| Lines { hit, found }.to_string();
+        assert_eq!(lines(94_999, 100_000), "94.9% (94999/100000)");
+        assert_eq!(lines(220, 226), "97.3% (220/226)");
+        assert_eq!(lines(0, 0), "no line was measured");
         assert_eq!(
-            under_the_bars(&found),
-            [
-                "crates/modules/goals: 94.0% (94/100) is under its bar of 95%",
-                "crates/modules/identity: 90.0% (18/20) is under its bar of 95%",
-            ]
-        );
-    }
-
-    #[test]
-    fn the_total_passes_at_exactly_its_bar_and_fails_one_line_under() {
-        assert_eq!(
-            under_the_bars(&report(&[
-                ("apps/api", 700, 1000),
-                ("crates/kernel", 1000, 1000)
-            ])),
-            Vec::<String>::new()
-        );
-        assert_eq!(
-            under_the_bars(&report(&[
-                ("apps/api", 699, 1000),
-                ("crates/kernel", 1000, 1000)
-            ])),
-            ["total: 84.9% (1699/2000) is under its bar of 85%"]
-        );
-    }
-
-    #[test]
-    fn a_crate_outside_the_kernel_and_the_modules_has_no_bar_of_its_own() {
-        let found = report(&[
-            ("apps/api", 0, 10),
-            ("crates/adapters/http", 0, 10),
-            ("crates/bootstrap", 0, 10),
-            ("crates/xtask", 0, 10),
-            ("crates/kernel", 1000, 1000),
-        ]);
-        assert_eq!(under_the_bars(&found), Vec::<String>::new());
-    }
-
-    #[test]
-    fn both_bars_can_fail_at_once() {
-        let found = report(&[("apps/api", 0, 100), ("crates/kernel", 94, 100)]);
-        assert_eq!(under_the_bars(&found).len(), 2);
-    }
-
-    #[test]
-    fn an_empty_report_fails() {
-        assert_eq!(
-            under_the_bars(&CoverageReport::default()),
-            ["total: no line was measured"]
-        );
-        let root = tempfile::tempdir().unwrap();
-        let measured = check_coverage(root.path(), "").unwrap();
-        assert_eq!(under_the_bars(&measured).len(), 1);
-        let nothing_of_ours = record(Path::new("/elsewhere/src/lib.rs"), &lines_run(9, 9));
-        let measured = check_coverage(root.path(), &nothing_of_ours).unwrap();
-        assert_eq!(under_the_bars(&measured).len(), 1);
-    }
-
-    #[test]
-    fn a_crate_without_a_counted_line_passes() {
-        let found = report(&[("crates/kernel", 0, 0), ("apps/api", 9, 10)]);
-        assert_eq!(under_the_bars(&found), Vec::<String>::new());
-    }
-
-    #[test]
-    fn the_bars_are_compared_without_rounding() {
-        // 94.99…% must neither pass nor print as 95.0%.
-        let found = report(&[("crates/kernel", 94_999, 100_000)]);
-        assert_eq!(
-            under_the_bars(&found),
-            ["crates/kernel: 94.9% (94999/100000) is under its bar of 95%"]
-        );
-        let huge = Lines {
-            hit: u64::MAX - 1,
-            found: u64::MAX,
-        };
-        assert_eq!(
-            huge.to_string(),
+            lines(u64::MAX - 1, u64::MAX),
             format!("99.9% ({}/{})", u64::MAX - 1, u64::MAX)
         );
     }
 
     #[test]
+    fn a_crate_folder_is_printed_escaped_in_the_summary_and_the_failures() {
+        let folder = "crates/modules/\u{1b}[2Jgoals";
+        let root = workspace(&["crates/kernel", folder]);
+        let lcov = [
+            record_of(
+                &plain_source(root.path(), "crates/kernel/src/lib.rs", 1),
+                &lines_run(1, 1),
+            ),
+            record_of(
+                &plain_source(root.path(), &format!("{folder}/src/lib.rs"), 2),
+                &lines_run(1, 2),
+            ),
+        ]
+        .concat();
+        let measured = measure(root.path(), &lcov).unwrap();
+        let printed = [
+            measured.summary(),
+            judge(&measured).iter().map(ToString::to_string).collect(),
+        ]
+        .concat();
+        assert!(
+            printed.iter().any(|line| line.contains("\\u{1b}[2Jgoals")),
+            "{printed:?}"
+        );
+        assert!(
+            !printed.iter().any(|line| line.contains('\u{1b}')),
+            "{printed:?}"
+        );
+    }
+
+    #[test]
     fn the_summary_has_one_line_per_crate_and_the_total() {
-        let found = report(&[
-            ("crates/kernel", 220, 226),
-            ("apps/api", 0, 3),
-            ("crates/xtask", 3, 3),
-        ]);
+        let report = CoverageReport {
+            crates: figures(&[
+                ("crates/kernel", 220, 226),
+                ("apps/api", 0, 3),
+                ("crates/xtask", 3, 3),
+            ]),
+            required: BTreeSet::new(),
+        };
         assert_eq!(
-            found.summary(),
+            report.summary(),
             [
                 "apps/api: 0.0% (0/3)",
                 "crates/kernel: 97.3% (220/226)",

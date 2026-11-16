@@ -1,0 +1,353 @@
+//! The sources the measure reads: every `.rs` file under the `src/` of each measured
+//! crate, whether the report names it or not.
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use super::source::Source;
+use crate::error::{LayoutProblem, XtaskError};
+use crate::regular_file::read_regular_file;
+
+/// A hand-written source is far smaller; anything larger is refused unread.
+const SOURCE_LIMIT: u64 = 1024 * 1024;
+
+/// The folders, relative to `root`, of the measured crates: those of `crates/kernel`,
+/// `crates/modules/<m>`, `crates/adapters/<a>`, `crates/bootstrap`, `crates/xtask` and
+/// `apps/<a>` that hold a `Cargo.toml`.
+pub fn measured_crates(root: &Path) -> Result<Vec<PathBuf>, XtaskError> {
+    let mut candidates: Vec<PathBuf> = ["crates/bootstrap", "crates/kernel", "crates/xtask"]
+        .map(PathBuf::from)
+        .into();
+    for parent in ["apps", "crates/modules", "crates/adapters"] {
+        if !is_folder(root, Path::new(parent))? {
+            continue;
+        }
+        let dir = root.join(parent);
+        for entry in fs::read_dir(&dir).map_err(XtaskError::io(&dir))? {
+            let path = entry.map_err(XtaskError::io(&dir))?.path();
+            let name = utf8_name(&path)?;
+            // Hidden entries are never members: check-arch ignores them as well.
+            if !name.starts_with('.') {
+                candidates.push(Path::new(parent).join(name));
+            }
+        }
+    }
+    let mut crates = Vec::new();
+    for folder in candidates {
+        if is_folder(root, &folder)? && root.join(&folder).join("Cargo.toml").is_file() {
+            crates.push(folder);
+        }
+    }
+    crates.sort();
+    Ok(crates)
+}
+
+/// Every source under the `src/` of each of `crates`, by its path relative to `root`.
+/// A `tests.rs` file or a `tests` folder is a test module: cargo-llvm-cov leaves it out
+/// of the report, and it is not read. A hidden entry is not read either: no module can
+/// name it, and a report that measures one is refused as a file that was not read.
+pub fn read_sources(
+    root: &Path,
+    crates: &[PathBuf],
+) -> Result<BTreeMap<PathBuf, Source>, XtaskError> {
+    let mut sources = BTreeMap::new();
+    let mut pending: Vec<PathBuf> = Vec::new();
+    for folder in crates {
+        let src = folder.join("src");
+        if is_folder(root, &src)? {
+            pending.push(src);
+        }
+    }
+    while let Some(dir) = pending.pop() {
+        let absolute = root.join(&dir);
+        let mut entries = Vec::new();
+        for entry in fs::read_dir(&absolute).map_err(XtaskError::io(&absolute))? {
+            let entry = entry.map_err(XtaskError::io(&absolute))?;
+            let kind = entry.file_type().map_err(XtaskError::io(&entry.path()))?;
+            entries.push((dir.join(entry.file_name()), kind));
+        }
+        entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+        for (path, kind) in entries {
+            let name = utf8_name(&path)?;
+            let layout = |problem| XtaskError::Layout {
+                path: path.clone(),
+                problem,
+            };
+            if name.starts_with('.') {
+                continue;
+            }
+            if kind.is_symlink() {
+                return Err(layout(LayoutProblem::Symlink));
+            }
+            if kind.is_dir() {
+                match name {
+                    "tests" => {}
+                    "examples" | "benches" => return Err(layout(LayoutProblem::DroppedFolder)),
+                    _ => pending.push(path),
+                }
+                continue;
+            }
+            if !kind.is_file() {
+                return Err(layout(LayoutProblem::SpecialFile));
+            }
+            if !name.ends_with(".rs") || name == "tests.rs" {
+                continue;
+            }
+            if name.ends_with("_tests.rs") || name.ends_with("-tests.rs") {
+                return Err(layout(LayoutProblem::DroppedFileName));
+            }
+            let text = read_regular_file(&root.join(&path), SOURCE_LIMIT)?;
+            let source = Source::read(&text).map_err(|finding| XtaskError::Source {
+                path: path.clone(),
+                line: finding.line,
+                problem: finding.problem,
+            })?;
+            sources.insert(path, source);
+        }
+    }
+    Ok(sources)
+}
+
+/// Whether `relative` is a folder under `root`. A symlink where a crate or its sources
+/// should be is refused: it could put any code there, or move the crate's own code out.
+fn is_folder(root: &Path, relative: &Path) -> Result<bool, XtaskError> {
+    let absolute = root.join(relative);
+    match fs::symlink_metadata(&absolute) {
+        Ok(found) if found.file_type().is_symlink() => Err(XtaskError::Layout {
+            path: relative.to_path_buf(),
+            problem: LayoutProblem::Symlink,
+        }),
+        Ok(found) => Ok(found.is_dir()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(XtaskError::io(&absolute)(error)),
+    }
+}
+
+fn utf8_name(path: &Path) -> Result<&str, XtaskError> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| XtaskError::Layout {
+            path: path.to_path_buf(),
+            problem: LayoutProblem::NotUtf8Name,
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::SourceProblem;
+
+    fn write(root: &Path, relative: &str, text: &str) {
+        let path = root.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+
+    fn workspace(files: &[&str]) -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        for file in files {
+            write(root.path(), file, "pub fn production() {}\n");
+        }
+        root
+    }
+
+    fn read_all(root: &Path) -> Result<BTreeMap<PathBuf, Source>, XtaskError> {
+        read_sources(root, &measured_crates(root)?)
+    }
+
+    #[test]
+    fn the_measured_crates_are_the_known_folders_that_hold_a_manifest() {
+        let root = workspace(&[
+            "apps/api/Cargo.toml",
+            "apps/notes/README.md",
+            "apps/.scratch/Cargo.toml",
+            "crates/kernel/Cargo.toml",
+            "crates/modules/goals/Cargo.toml",
+            "crates/adapters/http/Cargo.toml",
+            "crates/bootstrap/Cargo.toml",
+            "crates/xtask/Cargo.toml",
+            "crates/testkit/Cargo.toml",
+            "crates/workspace-hack/Cargo.toml",
+            "crates/misc/Cargo.toml",
+        ]);
+        assert_eq!(
+            measured_crates(root.path()).unwrap(),
+            [
+                "apps/api",
+                "crates/adapters/http",
+                "crates/bootstrap",
+                "crates/kernel",
+                "crates/modules/goals",
+                "crates/xtask",
+            ]
+            .map(PathBuf::from)
+        );
+    }
+
+    #[test]
+    fn every_rs_file_under_src_is_read_but_test_modules_and_hidden_entries() {
+        let root = workspace(&[
+            "crates/kernel/Cargo.toml",
+            "crates/kernel/src/lib.rs",
+            "crates/kernel/src/money/mod.rs",
+            "crates/kernel/src/money/parse.rs",
+            "crates/kernel/src/README.md",
+            "crates/kernel/build.rs",
+            "crates/kernel/tests/it.rs",
+            "apps/api/Cargo.toml",
+            "apps/api/src/main.rs",
+        ]);
+        for not_rust in [
+            "crates/kernel/src/tests.rs",
+            "crates/kernel/src/money/tests/helpers.rs",
+            "crates/kernel/src/.hidden.rs",
+            "crates/kernel/src/.cache/x.rs",
+        ] {
+            write(root.path(), not_rust, "fn not_parsed( {\n");
+        }
+        let read: Vec<PathBuf> = read_all(root.path()).unwrap().into_keys().collect();
+        assert_eq!(
+            read,
+            [
+                "apps/api/src/main.rs",
+                "crates/kernel/src/lib.rs",
+                "crates/kernel/src/money/mod.rs",
+                "crates/kernel/src/money/parse.rs",
+            ]
+            .map(PathBuf::from)
+        );
+    }
+
+    #[test]
+    fn a_file_or_a_folder_that_cargo_llvm_cov_leaves_out_is_refused() {
+        for (file, offender, problem) in [
+            (
+                "crates/kernel/src/ab_tests.rs",
+                "crates/kernel/src/ab_tests.rs",
+                LayoutProblem::DroppedFileName,
+            ),
+            (
+                "crates/kernel/src/money/x-tests.rs",
+                "crates/kernel/src/money/x-tests.rs",
+                LayoutProblem::DroppedFileName,
+            ),
+            (
+                "crates/kernel/src/examples/mod.rs",
+                "crates/kernel/src/examples",
+                LayoutProblem::DroppedFolder,
+            ),
+            (
+                "crates/kernel/src/money/benches/x.rs",
+                "crates/kernel/src/money/benches",
+                LayoutProblem::DroppedFolder,
+            ),
+        ] {
+            let root = workspace(&["crates/kernel/Cargo.toml", "crates/kernel/src/lib.rs", file]);
+            let error = read_all(root.path()).unwrap_err();
+            assert!(
+                matches!(&error, XtaskError::Layout { path, problem: found }
+                    if path == Path::new(offender) && *found == problem),
+                "{file}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_source_that_breaks_a_rule_is_refused_at_its_line() {
+        let root = workspace(&["crates/kernel/Cargo.toml"]);
+        write(
+            root.path(),
+            "crates/kernel/src/lib.rs",
+            "pub fn f() {}\n#[cfg(not(coverage))]\npub fn g() {}\n",
+        );
+        let error = read_all(root.path()).unwrap_err();
+        assert!(
+            matches!(&error, XtaskError::Source { path, line: 2, problem: SourceProblem::NamesCoverage }
+                if path == Path::new("crates/kernel/src/lib.rs")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_source_over_1_mib_is_refused_unread() {
+        let root = workspace(&["crates/kernel/Cargo.toml", "crates/kernel/src/lib.rs"]);
+        let big = root.path().join("crates/kernel/src/big.rs");
+        fs::File::create(&big)
+            .unwrap()
+            .set_len(SOURCE_LIMIT + 1)
+            .unwrap();
+        let error = read_all(root.path()).unwrap_err();
+        assert!(
+            matches!(&error, XtaskError::TooLarge { path, .. } if *path == big),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_or_a_fifo_under_a_measured_src_is_refused() {
+        use std::os::unix::fs::symlink;
+        let link_to_a_file = |root: &Path| {
+            symlink("/etc/hosts", root.join("crates/kernel/src/link.rs")).unwrap();
+            "crates/kernel/src/link.rs"
+        };
+        let link_to_a_folder = |root: &Path| {
+            symlink("/etc", root.join("crates/kernel/src/linked")).unwrap();
+            "crates/kernel/src/linked"
+        };
+        let fifo = |root: &Path| {
+            let made = std::process::Command::new("mkfifo")
+                .arg(root.join("crates/kernel/src/fifo.rs"))
+                .status()
+                .unwrap();
+            assert!(made.success());
+            "crates/kernel/src/fifo.rs"
+        };
+        for (make, problem) in [
+            (
+                &link_to_a_file as &dyn Fn(&Path) -> &'static str,
+                LayoutProblem::Symlink,
+            ),
+            (&link_to_a_folder, LayoutProblem::Symlink),
+            (&fifo, LayoutProblem::SpecialFile),
+        ] {
+            let root = workspace(&["crates/kernel/Cargo.toml", "crates/kernel/src/lib.rs"]);
+            let offender = make(root.path());
+            let error = read_all(root.path()).unwrap_err();
+            assert!(
+                matches!(&error, XtaskError::Layout { path, problem: found }
+                    if path == Path::new(offender) && *found == problem),
+                "{offender}: {error}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_crate_folder_or_its_src_that_is_a_symlink_is_refused() {
+        use std::os::unix::fs::symlink;
+        let elsewhere = workspace(&["Cargo.toml", "src/lib.rs"]);
+        let root = workspace(&["crates/kernel/Cargo.toml"]);
+        fs::create_dir_all(root.path().join("crates/modules")).unwrap();
+        symlink(elsewhere.path(), root.path().join("crates/modules/goals")).unwrap();
+        let error = measured_crates(root.path()).unwrap_err();
+        assert!(
+            matches!(&error, XtaskError::Layout { path, problem: LayoutProblem::Symlink }
+                if path == Path::new("crates/modules/goals")),
+            "{error}"
+        );
+        let root = workspace(&["crates/kernel/Cargo.toml"]);
+        symlink(
+            elsewhere.path().join("src"),
+            root.path().join("crates/kernel/src"),
+        )
+        .unwrap();
+        let error = read_all(root.path()).unwrap_err();
+        assert!(
+            matches!(&error, XtaskError::Layout { path, problem: LayoutProblem::Symlink }
+                if path == Path::new("crates/kernel/src")),
+            "{error}"
+        );
+    }
+}

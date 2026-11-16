@@ -900,6 +900,7 @@ dependencies = [
  "cargo_metadata",
  "proc-macro2",
  "regex",
+ "syn 3.0.10",
  "tempfile",
  "thiserror",
 ]

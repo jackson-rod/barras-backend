@@ -123,15 +123,15 @@ fn check_repository_structure() -> Problems {
 
 /// Prints every figure before failing, so a failed run still shows where each crate stands.
 fn check_coverage_report(report: &str, root: &Path) -> Problems {
-    let measured =
-        coverage::check_coverage_file(root, Path::new(report)).map_err(|e| vec![e.to_string()])?;
+    let measured = coverage::measure_coverage_file(root, Path::new(report))
+        .map_err(|e| vec![e.to_string()])?;
     for line in measured.summary() {
         println!("{line}");
     }
-    let problems = coverage::under_the_bars(&measured);
-    if problems.is_empty() {
+    let failures = coverage::judge(&measured);
+    if failures.is_empty() {
         Ok(())
     } else {
-        Err(problems)
+        Err(failures.iter().map(ToString::to_string).collect())
     }
 }
