@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  pull_request:
+    # `edited` too: a new title or description is checked again.
+    types: [opened, synchronize, reopened, edited]
+  push:
+    branches: [develop, main]
+
+# One run per ref. On a pull request, a newer run cancels the older one.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # On develop and main, a run in progress is not cancelled by a newer one.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: sccache
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # Full history: check-commits needs the commits of the branch and the base ref.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # Toolchain comes from rust-toolchain.toml. The action's own cargo cache is
+      # off because sccache is the cache here.
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+        with:
+          cache: false
+          # Its default sets CARGO_BUILD_WARNINGS=deny for every cargo command of the job. Locally only `just lint` denies cargo warnings, through its own flag; CI must compile exactly like `just verify`.
+          build-warnings: ""
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        with:
+          tool: just@1.59.0,cargo-deny@0.20.2
+      # A branch name is chosen by whoever opens the pull request, so it reaches
+      # the shell only through env, never through an expression inside run.
+      - name: Check the branch name
+        if: github.event_name == 'pull_request'
+        env:
+          BRANCH_NAME: ${{ github.head_ref }}
+        run: cargo xtask check-branch "$BRANCH_NAME"
+      - name: Check the commit messages
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: cargo xtask check-commits "origin/$BASE_REF..HEAD"
+      # A squash merge makes the title the subject of the commit on develop and may
+      # take the description as its body. Both are written by whoever opens the pull
+      # request, so they reach the shell only through env.
+      - name: Check the pull request title and description
+        if: github.event_name == 'pull_request'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          printf '%s\n\n%s\n' "$PR_TITLE" "$PR_BODY" > "$RUNNER_TEMP/pull-request.txt"
+          cargo xtask check-pr "$RUNNER_TEMP/pull-request.txt"
+      - name: Format, lint, deny, architecture and structure
+        run: just fmt-check lint deny check-arch check-structure
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+        with:
+          cache: false
+          # Its default sets CARGO_BUILD_WARNINGS=deny for every cargo command of the job. Locally only `just lint` denies cargo warnings, through its own flag; CI must compile exactly like `just verify`.
+          build-warnings: ""
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        with:
+          tool: just@1.59.0,cargo-nextest@0.9.152
+      - run: just test
+
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+        with:
+          cache: false
+          # Its default sets CARGO_BUILD_WARNINGS=deny for every cargo command of the job. Locally only `just lint` denies cargo warnings, through its own flag; CI must compile exactly like `just verify`.
+          build-warnings: ""
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        with:
+          tool: just@1.59.0
+      - run: just build
