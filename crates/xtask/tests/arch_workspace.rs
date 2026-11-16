@@ -4,6 +4,7 @@ use std::fs;
 use std::path::Path;
 
 use xtask::arch::{Violation, check_arch, check_workspace, load_workspace, workspace_root};
+use xtask::error::{LayoutProblem, XtaskError};
 
 fn write(root: &Path, relative: &str, content: &str) {
     let path = root.join(relative);
@@ -538,6 +539,12 @@ fn the_hack_has_only_its_library_at_src_lib_rs_and_an_empty_build_script() {
             "fn main() {\n    println!(\"cargo::rustc-cfg=hacked\");\n}\n",
             "crates/workspace-hack/build.rs",
         ),
+        (
+            "",
+            "src/extra.rs",
+            HAKARI_LIB,
+            "crates/workspace-hack/src/extra.rs",
+        ),
     ] {
         let root = workspace_with_a_hack(hack_extra, HAKARI_LIB);
         write(
@@ -564,5 +571,121 @@ fn bootstrap_and_the_hack_must_be_members_when_they_hold_a_manifest() {
             ("crates/bootstrap", "", "not-a-member"),
             ("crates/workspace-hack", "", "not-a-member"),
         ]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_in_the_hack_folder_is_refused_wherever_it_points() {
+    // The hack's `src` points at a folder outside the crate, so cargo builds the library
+    // from there and no check reads it through the crate folder.
+    let root = workspace_with_a_hack("\n[dependencies]\nregex = \"1.13.1\"\n", HAKARI_LIB);
+    fs::remove_dir_all(root.path().join("crates/workspace-hack/src")).unwrap();
+    write(
+        root.path(),
+        "vendor/hack-src/lib.rs",
+        "// This is a stub lib.rs.\npub use regex;\n\npub fn smuggled() {}\n",
+    );
+    std::os::unix::fs::symlink(
+        "../../vendor/hack-src",
+        root.path().join("crates/workspace-hack/src"),
+    )
+    .unwrap();
+    assert_eq!(
+        rules(&check_workspace(root.path()).unwrap()),
+        [(
+            "workspace-hack",
+            "crates/workspace-hack/src",
+            "hack-is-a-stub"
+        )]
+    );
+
+    let root = workspace_with_a_hack("", HAKARI_LIB);
+    std::os::unix::fs::symlink(
+        "/etc/hosts",
+        root.path().join("crates/workspace-hack/NOTES"),
+    )
+    .unwrap();
+    assert_eq!(
+        rules(&check_workspace(root.path()).unwrap()),
+        [(
+            "workspace-hack",
+            "crates/workspace-hack/NOTES",
+            "hack-is-a-stub"
+        )]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_fifo_in_the_hack_folder_is_refused_without_waiting() {
+    let root = workspace_with_a_hack("", HAKARI_LIB);
+    let made = std::process::Command::new("mkfifo")
+        .arg(root.path().join("crates/workspace-hack/src/pipe"))
+        .status()
+        .unwrap();
+    assert!(made.success());
+    assert_eq!(
+        rules(&check_workspace(root.path()).unwrap()),
+        [(
+            "workspace-hack",
+            "crates/workspace-hack/src/pipe",
+            "hack-is-a-stub"
+        )]
+    );
+}
+
+#[test]
+fn the_kernel_and_the_modules_have_no_build_script() {
+    let root = workspace(
+        &[
+            ("crates/kernel", "barras-kernel", ""),
+            ("crates/modules/pricing", "barras-pricing", ""),
+            ("crates/bootstrap", "barras-bootstrap", ""),
+            ("crates/adapters/http", "barras-adapter-http", ""),
+            ("apps/api", "barras-api", ""),
+        ],
+        "",
+    );
+    let script = "fn main() {\n    if !cfg!(debug_assertions) {\n        println!(\"cargo::rustc-cfg=shipping\");\n    }\n}\n";
+    for folder in [
+        "crates/kernel",
+        "crates/modules/pricing",
+        "crates/bootstrap",
+        "crates/adapters/http",
+        "apps/api",
+    ] {
+        write(root.path(), &format!("{folder}/build.rs"), script);
+    }
+    assert_eq!(
+        sorted_rules(&check_workspace(root.path()).unwrap()),
+        [
+            ("barras-kernel", "crates/kernel/build.rs", "no-build-script"),
+            (
+                "barras-pricing",
+                "crates/modules/pricing/build.rs",
+                "no-build-script"
+            ),
+        ]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_crate_folder_that_is_a_symlink_is_refused() {
+    let root = workspace(&[("crates/kernel", "barras-kernel", "")], "");
+    stub_package(root.path(), "hidden/sym", "barras-sym", "");
+    fs::create_dir_all(root.path().join("crates/modules")).unwrap();
+    std::os::unix::fs::symlink("../../hidden/sym", root.path().join("crates/modules/sym")).unwrap();
+    write(
+        root.path(),
+        "Cargo.toml",
+        "[workspace]\nresolver = \"3\"\nmembers = [\"crates/kernel\", \"crates/modules/sym\"]\n",
+    );
+    let error = check_workspace(root.path()).unwrap_err();
+    assert!(
+        matches!(&error, XtaskError::Layout { path, problem: LayoutProblem::Symlink }
+            if path == Path::new("crates/modules/sym")),
+        "{error}"
     );
 }

@@ -9,7 +9,7 @@ use super::{CrateInfo, TargetRole, Violation, violation};
 use crate::error::{XtaskError, escaped};
 use crate::layout::{Layer, layer_of};
 use crate::regular_file::read_regular_file;
-use crate::walk::{EntryKind, walk};
+use crate::walk::{EntryKind, kind_at, walk};
 
 /// The hack's files are read only to refuse them when they hold code: a stub is tiny.
 const HACK_FILE_LIMIT: u64 = 1024 * 1024;
@@ -17,7 +17,7 @@ const HACK_FILE_LIMIT: u64 = 1024 * 1024;
 /// `hack-is-a-stub`. The kernel's and the modules' lists accept `workspace-hack` only
 /// because it cannot carry code: one library, at `src/lib.rs`, that holds doc comments
 /// at most; at most one build script, at `build.rs`, that holds `fn main() {}` only; and no
-/// other `.rs` file in its folder.
+/// other `.rs` file, no symlink and no special entry in its folder.
 pub(super) fn check_hack(root: &Path, crates: &[CrateInfo]) -> Result<Vec<Violation>, XtaskError> {
     let Some(hack) = crates
         .iter()
@@ -26,19 +26,12 @@ pub(super) fn check_hack(root: &Path, crates: &[CrateInfo]) -> Result<Vec<Violat
         return Ok(Vec::new());
     };
     let mut offenders: BTreeSet<PathBuf> = misplaced_targets(hack).into_iter().collect();
-    let folder = root.join(&hack.dir);
-    for file in rust_files(&folder)? {
-        let read = || read_regular_file(&folder.join(&file), HACK_FILE_LIMIT);
-        let fits = if file == Path::new("src/lib.rs") {
-            holds_only_doc_comments(&read()?)
-        } else if file == Path::new("build.rs") {
-            is_an_empty_main(&read()?)
-        } else {
-            false
-        };
-        if !fits {
-            offenders.insert(hack.dir.join(file));
+    match kind_at(root, &hack.dir)? {
+        Some(EntryKind::Folder) => offenders.extend(stray_entries(root, &hack.dir)?),
+        Some(_) => {
+            offenders.insert(hack.dir.clone());
         }
+        None => {}
     }
     Ok(offenders
         .iter()
@@ -71,21 +64,28 @@ fn misplaced_targets(hack: &CrateInfo) -> Vec<PathBuf> {
     misplaced
 }
 
-/// Every entry under `folder` whose name ends in `.rs`, relative to it. A symlink is listed
-/// and never followed, so it cannot lead the walk out of the folder.
-fn rust_files(folder: &Path) -> Result<Vec<PathBuf>, XtaskError> {
-    let entries = walk(folder, Path::new(""), |_| true)?;
-    Ok(entries
-        .into_iter()
-        .filter(|entry| entry.kind != EntryKind::Folder)
-        .filter(|entry| {
-            entry
-                .path
-                .file_name()
-                .is_some_and(|name| name.to_string_lossy().ends_with(".rs"))
-        })
-        .map(|entry| entry.path)
-        .collect())
+/// The entries under `root/folder`, the hack's folder, that a stub does not hold. A symlink
+/// could make any file part of the crate behind the check's back, wherever it points, and
+/// a FIFO would stop the read.
+fn stray_entries(root: &Path, folder: &Path) -> Result<Vec<PathBuf>, XtaskError> {
+    let mut stray = Vec::new();
+    for entry in walk(root, folder, |_| true)? {
+        let inside = entry.path.strip_prefix(folder).unwrap_or(&entry.path);
+        let read = || read_regular_file(&root.join(&entry.path), HACK_FILE_LIMIT);
+        let fits = match entry.kind {
+            EntryKind::Folder => true,
+            EntryKind::Symlink | EntryKind::Special => false,
+            EntryKind::File if inside == Path::new("src/lib.rs") => {
+                holds_only_doc_comments(&read()?)
+            }
+            EntryKind::File if inside == Path::new("build.rs") => is_an_empty_main(&read()?),
+            EntryKind::File => !inside.to_string_lossy().ends_with(".rs"),
+        };
+        if !fits {
+            stray.push(entry.path);
+        }
+    }
+    Ok(stray)
 }
 
 /// Doc comments at most. proc-macro2 hands each one over as `#[doc = "…"]` or
@@ -258,45 +258,64 @@ mod tests {
     }
 
     #[test]
-    fn every_rs_file_of_the_hack_folder_is_found_and_a_symlink_is_not_followed() {
-        let folder = tempfile::tempdir().unwrap();
-        for file in [
-            "build.rs",
-            "src/lib.rs",
-            "src/deep/er/extra.rs",
-            ".hidden.rs",
+    fn every_other_rs_file_symlink_and_special_entry_of_the_hack_folder_is_stray() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = Path::new("crates/workspace-hack");
+        for (file, text) in [
+            ("build.rs", "fn main() {}\n"),
+            ("src/lib.rs", "// This is a stub lib.rs.\n"),
+            ("Cargo.toml", ""),
+            ("NOTES.md", "not code\n"),
+            ("src/deep/er/extra.rs", ""),
+            (".hidden.rs", ""),
         ] {
-            let path = folder.path().join(file);
+            let path = root.path().join(folder).join(file);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(path, "").unwrap();
+            fs::write(path, text).unwrap();
         }
-        fs::write(folder.path().join("Cargo.toml"), "").unwrap();
-        let elsewhere = tempfile::tempdir().unwrap();
-        fs::write(elsewhere.path().join("never.rs"), "").unwrap();
+        let mut expected = vec![".hidden.rs", "src/deep/er/extra.rs"];
         #[cfg(unix)]
         {
-            std::os::unix::fs::symlink(elsewhere.path(), folder.path().join("src/linked")).unwrap();
-            std::os::unix::fs::symlink(
-                elsewhere.path().join("never.rs"),
-                folder.path().join("src/link.rs"),
-            )
-            .unwrap();
+            let src = root.path().join(folder).join("src");
+            let elsewhere = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(elsewhere.path(), src.join("linked")).unwrap();
+            std::os::unix::fs::symlink("/etc/hosts", src.join("link.rs")).unwrap();
+            let made = std::process::Command::new("mkfifo")
+                .arg(src.join("pipe"))
+                .status()
+                .unwrap();
+            assert!(made.success());
+            expected.extend(["src/link.rs", "src/linked", "src/pipe"]);
         }
-        let mut found = rust_files(folder.path()).unwrap();
+        let mut found = stray_entries(root.path(), folder).unwrap();
         found.sort();
-        let mut expected = vec![
-            ".hidden.rs",
-            "build.rs",
-            "src/deep/er/extra.rs",
-            "src/lib.rs",
-        ];
-        if cfg!(unix) {
-            expected.push("src/link.rs");
-        }
         expected.sort_unstable();
         assert_eq!(
             found,
-            expected.iter().map(PathBuf::from).collect::<Vec<_>>()
+            expected
+                .iter()
+                .map(|file| folder.join(file))
+                .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn the_library_and_the_build_script_are_stray_when_they_hold_code() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = Path::new("crates/workspace-hack");
+        for (file, text) in [
+            (
+                "build.rs",
+                "fn main() { println!(\"cargo::rustc-cfg=hacked\"); }\n",
+            ),
+            ("src/lib.rs", "pub use regex;\n"),
+        ] {
+            let path = root.path().join(folder).join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        }
+        let mut found = stray_entries(root.path(), folder).unwrap();
+        found.sort();
+        assert_eq!(found, [folder.join("build.rs"), folder.join("src/lib.rs")]);
     }
 }

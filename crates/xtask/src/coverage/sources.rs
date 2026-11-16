@@ -2,14 +2,13 @@
 //! crate, whether the report names it or not.
 
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::source::Source;
 use crate::error::{LayoutProblem, XtaskError};
-use crate::layout::{Layer, PARENTS, crate_folders, layer_of};
+use crate::layout::{Layer, crate_folders, layer_of};
 use crate::regular_file::read_regular_file;
-use crate::walk::{EntryKind, walk};
+use crate::walk::{EntryKind, is_folder, walk};
 
 /// A hand-written source is far smaller; anything larger is refused unread.
 const SOURCE_LIMIT: u64 = 1024 * 1024;
@@ -18,28 +17,16 @@ const SOURCE_LIMIT: u64 = 1024 * 1024;
 /// `crates/modules/<m>`, `crates/adapters/<a>`, `crates/bootstrap`, `crates/xtask` and
 /// `apps/<a>` that hold a `Cargo.toml`.
 pub fn measured_crates(root: &Path) -> Result<Vec<PathBuf>, XtaskError> {
-    for (parent, _) in PARENTS {
-        is_folder(root, Path::new(parent))?;
-    }
-    let mut crates = Vec::new();
-    for (folder, kind) in crate_folders(root)? {
-        if matches!(
-            layer_of(&folder),
-            Some(Layer::Testkit | Layer::WorkspaceHack)
-        ) {
-            continue;
-        }
-        utf8_name(&folder)?;
-        if kind == EntryKind::Symlink {
-            return Err(XtaskError::Layout {
-                path: folder,
-                problem: LayoutProblem::Symlink,
-            });
-        }
-        if kind == EntryKind::Folder && root.join(&folder).join("Cargo.toml").is_file() {
-            crates.push(folder);
-        }
-    }
+    let mut crates: Vec<PathBuf> = crate_folders(root)?
+        .into_iter()
+        .filter(|folder| {
+            !matches!(
+                layer_of(folder),
+                Some(Layer::Testkit | Layer::WorkspaceHack)
+            )
+        })
+        .filter(|folder| root.join(folder).join("Cargo.toml").is_file())
+        .collect();
     crates.sort();
     Ok(crates)
 }
@@ -100,21 +87,6 @@ pub fn read_sources(
     Ok(sources)
 }
 
-/// Whether `relative` is a folder under `root`. A symlink where a crate or its sources
-/// should be is refused: it could put any code there, or move the crate's own code out.
-fn is_folder(root: &Path, relative: &Path) -> Result<bool, XtaskError> {
-    let absolute = root.join(relative);
-    match fs::symlink_metadata(&absolute) {
-        Ok(found) if found.file_type().is_symlink() => Err(XtaskError::Layout {
-            path: relative.to_path_buf(),
-            problem: LayoutProblem::Symlink,
-        }),
-        Ok(found) => Ok(found.is_dir()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(XtaskError::io(&absolute)(error)),
-    }
-}
-
 fn utf8_name(path: &Path) -> Result<&str, XtaskError> {
     path.file_name()
         .and_then(|name| name.to_str())
@@ -126,6 +98,8 @@ fn utf8_name(path: &Path) -> Result<&str, XtaskError> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
     use crate::error::SourceProblem;
 

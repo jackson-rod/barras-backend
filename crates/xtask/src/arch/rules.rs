@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use super::{CrateInfo, Dep, DepKind, Origin, Violation, violation};
+use super::{CrateInfo, Dep, DepKind, Origin, TargetRole, Violation, violation};
 use crate::error::escaped;
 use crate::layout::{HACK_DIR, KERNEL_DIR, Layer, layer_of};
 
@@ -46,6 +46,21 @@ pub fn check_arch(crates: &[CrateInfo]) -> Vec<Violation> {
             Some(_) => {}
         }
         let layer = layer_of(&krate.dir);
+        // Code a build script generates escapes the coverage measure, and pure domain code
+        // needs none.
+        if matches!(layer, Some(Layer::Kernel | Layer::Module)) {
+            for script in krate
+                .targets
+                .iter()
+                .filter(|target| target.role == TargetRole::BuildScript)
+            {
+                violations.push(violation(
+                    krate,
+                    &escaped(&script.src_path),
+                    "no-build-script",
+                ));
+            }
+        }
         for dep in &krate.deps {
             for rule in broken_rules(crates, layer, dep) {
                 violations.push(violation(krate, &dep.name, rule));
@@ -146,6 +161,7 @@ mod tests {
 
     use super::*;
     use crate::arch::DepKind::{Build, Dev, Normal};
+    use crate::arch::Target;
 
     const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
     const GIT: &str = "git+https://github.com/example/fork?branch=main#0123456789abcdef";
@@ -342,6 +358,43 @@ mod tests {
                 ("barras-api", "barras-testkit", "testkit-dev-only"),
                 ("xtask", "barras-kernel", "tool-isolation"),
                 ("barras-misc", "", "unknown-location"),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_kernel_and_the_modules_have_no_build_script() {
+        let with_a_build_script = |name: &str, dir: &str| {
+            let mut krate = krate(name, dir, &[]);
+            krate.targets = vec![
+                Target {
+                    role: TargetRole::Library,
+                    src_path: Path::new(dir).join("src/lib.rs"),
+                },
+                Target {
+                    role: TargetRole::BuildScript,
+                    src_path: Path::new(dir).join("build.rs"),
+                },
+            ];
+            krate
+        };
+        let crates = [
+            with_a_build_script("barras-kernel", "crates/kernel"),
+            with_a_build_script("barras-pricing", "crates/modules/pricing"),
+            with_a_build_script("barras-adapter-http", "crates/adapters/http"),
+            with_a_build_script("barras-bootstrap", "crates/bootstrap"),
+            with_a_build_script("barras-api", "apps/api"),
+            with_a_build_script("xtask", "crates/xtask"),
+        ];
+        assert_eq!(
+            rules(&check_arch(&crates)),
+            [
+                ("barras-kernel", "crates/kernel/build.rs", "no-build-script"),
+                (
+                    "barras-pricing",
+                    "crates/modules/pricing/build.rs",
+                    "no-build-script"
+                ),
             ]
         );
     }

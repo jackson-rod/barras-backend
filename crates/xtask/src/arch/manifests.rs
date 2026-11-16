@@ -6,32 +6,26 @@ use std::path::Path;
 
 use super::{CrateInfo, Violation};
 use crate::error::{XtaskError, escaped};
-use crate::layout::{crate_folders, is_fixed_folder};
-use crate::walk::EntryKind;
+use crate::layout::crate_folders;
 
 /// A crate folder that `members` does not list is never built and never checked.
 pub(super) fn check_members(
     root: &Path,
     crates: &[CrateInfo],
 ) -> Result<Vec<Violation>, XtaskError> {
-    let mut violations = Vec::new();
-    for (folder, kind) in crate_folders(root)? {
-        if !(is_fixed_folder(&folder) || kind == EntryKind::Folder) || folder.to_str().is_none() {
-            continue;
-        }
-        if root.join(&folder).join("Cargo.toml").is_file()
-            && !crates.iter().any(|c| c.dir == folder)
-        {
-            violations.push(Violation {
-                krate: escaped(&folder),
-                dependency: String::new(),
-                rule: "not-a-member",
-            });
-        }
-    }
-    Ok(violations)
+    Ok(crate_folders(root)?
+        .into_iter()
+        .filter(|folder| root.join(folder).join("Cargo.toml").is_file())
+        .filter(|folder| !crates.iter().any(|c| c.dir == *folder))
+        .map(|folder| Violation {
+            krate: escaped(&folder),
+            dependency: String::new(),
+            rule: "not-a-member",
+        })
+        .collect())
 }
 
+/// `[patch]` and `[replace]` swap a crate for other code without touching any dependency
 /// line, so the allowlists cannot see them. Needing one is a decision for an ADR.
 pub(super) fn check_patches(root: &Path) -> Result<Vec<Violation>, XtaskError> {
     let mut violations = Vec::new();

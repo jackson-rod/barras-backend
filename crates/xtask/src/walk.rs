@@ -4,7 +4,7 @@
 use std::fs::{self, FileType};
 use std::path::{Path, PathBuf};
 
-use crate::error::XtaskError;
+use crate::error::{LayoutProblem, XtaskError};
 
 /// What an entry is on disk, a symlink never followed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -75,6 +75,21 @@ pub fn walk(
         found.extend(listed);
     }
     Ok(found)
+}
+
+/// Whether `root/relative` is a folder. A symlink or a special entry in its place is
+/// refused: a link could put any code where a check expects the workspace's own.
+pub fn is_folder(root: &Path, relative: &Path) -> Result<bool, XtaskError> {
+    let refused = |problem| XtaskError::Layout {
+        path: relative.to_path_buf(),
+        problem,
+    };
+    match kind_at(root, relative)? {
+        Some(EntryKind::Folder) => Ok(true),
+        Some(EntryKind::Symlink) => Err(refused(LayoutProblem::Symlink)),
+        Some(EntryKind::Special) => Err(refused(LayoutProblem::SpecialFile)),
+        Some(EntryKind::File) | None => Ok(false),
+    }
 }
 
 /// What `root/relative` is on disk, a symlink never followed; `None` when it does not exist.

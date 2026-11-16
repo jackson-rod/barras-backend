@@ -1,11 +1,10 @@
 //! Where the crates of this workspace sit: the one list of crate folders that every check
 //! reads, so that no check can learn of a folder another one misses.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::error::XtaskError;
-use crate::walk::{EntryKind, kind_at};
+use crate::error::{LayoutProblem, XtaskError};
+use crate::walk::{EntryKind, is_folder, walk};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Layer {
@@ -33,7 +32,7 @@ const FOLDERS: [(&str, Layer); 5] = [
 ];
 
 /// The folders whose every subfolder holds a crate.
-pub const PARENTS: [(&str, Layer); 3] = [
+const PARENTS: [(&str, Layer); 3] = [
     ("apps", Layer::App),
     ("crates/modules", Layer::Module),
     ("crates/adapters", Layer::Adapter),
@@ -52,45 +51,49 @@ pub fn layer_of(dir: &Path) -> Option<Layer> {
         .map(|(_, layer)| *layer)
 }
 
-/// Every place where a crate could sit in the workspace at `root`, whether it holds one
-/// or not, with what it is on disk: each entry directly inside a folder of `PARENTS`, in
-/// name order, then each folder of `FOLDERS` that exists. Hidden entries are left out:
-/// Finder and editors drop them into any folder on their own.
-pub fn crate_folders(root: &Path) -> Result<Vec<(PathBuf, EntryKind)>, XtaskError> {
+/// Every folder of the workspace at `root` where a crate could sit, whether it holds one
+/// or not: each folder directly inside a folder of `PARENTS`, in name order, then each
+/// folder of `FOLDERS` that exists. A symlink or a special entry in any of these places is
+/// refused, so a crate's code always lies inside the workspace. Hidden entries are left
+/// out: Finder and editors drop them into any folder on their own, and check-arch finds a
+/// crate there through `members` anyway.
+pub fn crate_folders(root: &Path) -> Result<Vec<PathBuf>, XtaskError> {
     let mut found = Vec::new();
     for (parent, _) in PARENTS {
-        let dir = root.join(parent);
-        if !dir.is_dir() {
+        if !is_folder(root, Path::new(parent))? {
             continue;
         }
-        let mut children = Vec::new();
-        for entry in fs::read_dir(&dir).map_err(XtaskError::io(&dir))? {
-            let entry = entry.map_err(XtaskError::io(&dir))?;
-            if entry.file_name().to_string_lossy().starts_with('.') {
+        for entry in walk(root, Path::new(parent), |_| false)? {
+            let refused = |problem| XtaskError::Layout {
+                path: entry.path.clone(),
+                problem,
+            };
+            let name = entry
+                .name()
+                .ok_or_else(|| refused(LayoutProblem::NotUtf8Name))?;
+            if name.starts_with('.') {
                 continue;
             }
-            let kind = EntryKind::of(entry.file_type().map_err(XtaskError::io(&entry.path()))?);
-            children.push((Path::new(parent).join(entry.file_name()), kind));
+            match entry.kind {
+                EntryKind::Folder => found.push(entry.path),
+                EntryKind::File => {}
+                EntryKind::Symlink => return Err(refused(LayoutProblem::Symlink)),
+                EntryKind::Special => return Err(refused(LayoutProblem::SpecialFile)),
+            }
         }
-        children.sort_by(|(left, _), (right, _)| left.cmp(right));
-        found.extend(children);
     }
     for (folder, _) in FOLDERS {
-        if let Some(kind) = kind_at(root, Path::new(folder))? {
-            found.push((PathBuf::from(folder), kind));
+        if is_folder(root, Path::new(folder))? {
+            found.push(PathBuf::from(folder));
         }
     }
     Ok(found)
 }
 
-/// Whether `dir` is one of the folders that hold one crate each, rather than a folder
-/// inside one of the parents.
-pub fn is_fixed_folder(dir: &Path) -> bool {
-    FOLDERS.iter().any(|(folder, _)| dir == Path::new(folder))
-}
-
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
 
     #[test]
@@ -128,7 +131,7 @@ mod tests {
     }
 
     #[test]
-    fn the_crate_folders_are_the_known_places_that_exist_hidden_entries_aside() {
+    fn the_crate_folders_are_the_known_folders_that_exist_hidden_entries_aside() {
         let root = tempfile::tempdir().unwrap();
         for folder in [
             "crates/kernel",
@@ -141,13 +144,41 @@ mod tests {
         fs::write(root.path().join("apps/README.md"), "").unwrap();
         assert_eq!(
             crate_folders(root.path()).unwrap(),
-            [
-                ("apps/README.md", EntryKind::File),
-                ("apps/api", EntryKind::Folder),
-                ("crates/modules/goals", EntryKind::Folder),
-                ("crates/kernel", EntryKind::Folder),
-            ]
-            .map(|(folder, kind)| (PathBuf::from(folder), kind))
+            ["apps/api", "crates/modules/goals", "crates/kernel"].map(PathBuf::from)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_or_a_special_entry_where_a_crate_could_sit_is_refused() {
+        use std::os::unix::fs::symlink;
+        let elsewhere = tempfile::tempdir().unwrap();
+        for (place, make_a_fifo) in [
+            ("crates/modules/goals", false),
+            ("crates/kernel", false),
+            ("apps", false),
+            ("crates/adapters/pipe", true),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join(place);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let problem = if make_a_fifo {
+                let made = std::process::Command::new("mkfifo")
+                    .arg(&path)
+                    .status()
+                    .unwrap();
+                assert!(made.success());
+                LayoutProblem::SpecialFile
+            } else {
+                symlink(elsewhere.path(), &path).unwrap();
+                LayoutProblem::Symlink
+            };
+            let error = crate_folders(root.path()).unwrap_err();
+            assert!(
+                matches!(&error, XtaskError::Layout { path, problem: found }
+                    if path == Path::new(place) && *found == problem),
+                "{place}: {error}"
+            );
+        }
     }
 }
