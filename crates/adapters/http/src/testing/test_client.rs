@@ -1,7 +1,7 @@
-//! An in-process client for the public app, the route guard of spec §9.3, and a guard on the
-//! keys of a validation failure.
+//! An in-process client for the public app, the route guard of spec §9.3, a guard on the error
+//! answers of a route, and a guard on the keys of a validation failure.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use axum::Router;
 use axum::body::{Body, Bytes, to_bytes};
@@ -10,39 +10,47 @@ use axum::http::response::Parts;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request};
 use serde_json::Value;
 use tower::ServiceExt;
+use utoipa::openapi::OpenApi;
+use utoipa::openapi::extensions::Extensions;
 
 use crate::app::HttpApp;
 use crate::error::ApiError;
 use crate::extract::{camel_case, is_json};
 use crate::internal::InternalApp;
 use crate::middleware::MatchedRoute;
-use crate::openapi::operations;
+use crate::openapi::{X_COMMON_ERROR_CODES, X_ERROR_CODES, operations};
+
+/// The statuses of the codes of `x-common-error-codes`, which any route can answer, so that no
+/// operation documents them: 400, 404, 405, 406, 413, 415 and 500. Sorted.
+const COMMON_STATUSES: [u16; 7] = [400, 404, 405, 406, 413, 415, 500];
 
 /// Sends requests to an app in-process, through the whole stack of middleware, and fails the
 /// test when a route the OpenAPI document does not have served one: so any test that reaches
 /// a route registered around `ApiRouter::route` fails, naming it.
 ///
-/// It also fails the test when a validation failure has a key in `error.fields` with a name
+/// It also fails the test when a route the document has answers an error envelope whose
+/// `error.code` neither the operation's `x-error-codes` nor the document's
+/// `x-common-error-codes` lists, or whose status the operation documents neither as itself,
+/// nor as its range such as `4XX`, nor with `default`, unless a common code has that status:
+/// the document would otherwise hide from the app an answer it must handle.
+///
+/// And it fails the test when a validation failure has a key in `error.fields` with a name
 /// that holds `_`, a Rust name where every JSON name is camelCase (spec §4.2), or, answered to
 /// a JSON body, a key that names neither a member of that body, nor a parameter of the query
 /// string, nor a field missing from an object of the body: the app finds the field to flag by
 /// that key, so a key spelled otherwise flags nothing.
 pub struct TestClient {
     router: Router,
-    /// Each operation of the document, as its method and its path template; `None` for the
-    /// internal app, whose routes the document does not have.
-    documented: Option<BTreeSet<(String, String)>>,
+    /// What the OpenAPI document says of the app; `None` for the internal app, whose routes
+    /// the document does not have, by design.
+    document: Option<Documented>,
 }
 
 impl TestClient {
     pub fn new(app: &HttpApp) -> Self {
-        let documented = operations(app.openapi())
-            .into_iter()
-            .map(|(path, method, _)| (method.to_owned(), path.to_owned()))
-            .collect();
         Self {
             router: app.router(),
-            documented: Some(documented),
+            document: Some(Documented::of(app.openapi())),
         }
     }
 
@@ -51,7 +59,7 @@ impl TestClient {
     pub fn internal(app: &InternalApp) -> Self {
         Self {
             router: app.router(),
-            documented: None,
+            document: None,
         }
     }
 
@@ -66,25 +74,118 @@ impl TestClient {
         let (parts, body) = response.into_parts();
         let body = to_bytes(body, usize::MAX).await.unwrap();
         let response = TestResponse::new(parts, body);
-        if let (Some(served), Some(documented)) = (response.matched_route(), &self.documented) {
-            hold_to_the_document(documented, served);
+        if let (Some(served), Some(document)) = (response.matched_route(), &self.document) {
+            let operation = document.operation(served);
+            document.hold_the_error(served, operation, &response);
         }
         hold_the_keys(&response, sent.as_ref(), &parameters);
         response
     }
 }
 
-fn hold_to_the_document(documented: &BTreeSet<(String, String)>, served: &MatchedRoute) {
-    let has = |method: &str| documented.contains(&(method.to_owned(), served.template.clone()));
-    // axum serves `HEAD` with the `GET` handler of a path that has no `HEAD` of its own.
-    let documented = has(served.method.as_str()) || (served.method == Method::HEAD && has("GET"));
-    if !documented {
-        panic!(
-            "{} {} served the request, and the OpenAPI document has no such operation: \
-             register the route with ApiRouter::route",
-            served.method, served.template
-        );
+/// What the OpenAPI document of an app says of the routes that can serve a request.
+struct Documented {
+    /// Each operation, by its method and its path template.
+    operations: BTreeMap<(String, String), DocumentedErrors>,
+    /// `x-common-error-codes`: the codes any route can answer.
+    common_codes: BTreeSet<String>,
+}
+
+/// What an operation documents of its error answers.
+struct DocumentedErrors {
+    /// `x-error-codes`: the codes of its own.
+    codes: BTreeSet<String>,
+    /// The keys of its responses: statuses, ranges such as `4XX`, and `default`.
+    statuses: BTreeSet<String>,
+}
+
+impl Documented {
+    fn of(document: &OpenApi) -> Self {
+        let operations = operations(document)
+            .into_iter()
+            .map(|(path, method, operation)| {
+                let errors = DocumentedErrors {
+                    codes: codes_at(operation.extensions.as_ref(), X_ERROR_CODES),
+                    statuses: operation.responses.responses.keys().cloned().collect(),
+                };
+                ((method.to_owned(), path.to_owned()), errors)
+            })
+            .collect();
+        Self {
+            operations,
+            common_codes: codes_at(document.extensions.as_ref(), X_COMMON_ERROR_CODES),
+        }
     }
+
+    /// The operation that documents the route that `served` the request; the test fails when
+    /// the document has none.
+    fn operation(&self, served: &MatchedRoute) -> &DocumentedErrors {
+        let find = |method: &str| {
+            let key = (method.to_owned(), served.template.clone());
+            self.operations.get(&key)
+        };
+        find(served.method.as_str())
+            // axum serves `HEAD` with the `GET` handler of a path that has no `HEAD` of its own.
+            .or_else(|| find("GET").filter(|_| served.method == Method::HEAD))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{} {} served the request, and the OpenAPI document has no such operation: \
+                     register the route with ApiRouter::route",
+                    served.method, served.template
+                )
+            })
+    }
+
+    /// When `response` is an error envelope, its code is one that `operation` or the document
+    /// lists, and its status one that `operation` documents or any route can answer.
+    fn hold_the_error(
+        &self,
+        served: &MatchedRoute,
+        operation: &DocumentedErrors,
+        response: &TestResponse,
+    ) {
+        let Some(code) = response.error_code() else {
+            return;
+        };
+        let route = format!("{} {}", served.method, served.template);
+        let status = response.status;
+        if !operation.codes.contains(&code) && !self.common_codes.contains(&code) {
+            panic!(
+                "{route} answered {status} {code}, a code that neither its {X_ERROR_CODES} nor \
+                 {X_COMMON_ERROR_CODES} lists: give it to ApiRouter::route among the codes of \
+                 the route"
+            );
+        }
+        if !documents(&operation.statuses, status) && !COMMON_STATUSES.contains(&status) {
+            panic!(
+                "{route} answered {status} {code}, a status that its operation does not \
+                 document: give the handler's #[utoipa::path] a {status} response with the \
+                 ErrorEnvelope body"
+            );
+        }
+    }
+}
+
+/// The codes listed at `key` of `extensions`; none when there is no such list.
+fn codes_at(extensions: Option<&Extensions>, key: &str) -> BTreeSet<String> {
+    extensions
+        .and_then(|extensions| extensions.get(key))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Whether `statuses`, the keys of an operation's responses, document `status`: as itself, as
+/// its range (`4XX` for 409), or with `default`, which stands for every status the others do not
+/// name (OpenAPI 3.1, the Responses Object).
+fn documents(statuses: &BTreeSet<String>, status: u16) -> bool {
+    let range = format!("{}XX", status / 100);
+    [status.to_string(), range, "default".to_owned()]
+        .iter()
+        .any(|key| statuses.contains(key))
 }
 
 /// On a 422 `VALIDATION_FAILED`, no name in a key of `error.fields` may hold `_`. To a JSON
@@ -280,5 +381,43 @@ impl TestResponse {
     /// that came over a socket.
     pub fn matched_route(&self) -> Option<&MatchedRoute> {
         self.matched_route.as_ref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::openapi::COMMON_ERROR_CODES;
+
+    fn keys(keys: &[&str]) -> BTreeSet<String> {
+        keys.iter().map(|&key| key.to_owned()).collect()
+    }
+
+    #[test]
+    fn the_common_statuses_are_those_of_the_common_codes() {
+        let common = [
+            ApiError::route_not_found(),
+            ApiError::method_not_allowed(),
+            ApiError::malformed_request("Request body is not valid JSON"),
+            ApiError::unsupported_media_type(),
+            ApiError::payload_too_large(),
+            ApiError::not_acceptable(),
+            ApiError::internal("a handler panicked".to_owned()),
+        ];
+        let mut codes: Vec<&str> = common.iter().map(ApiError::code).collect();
+        codes.sort_unstable();
+        let mut statuses: Vec<u16> = common.iter().map(|error| error.status().as_u16()).collect();
+        statuses.sort_unstable();
+
+        assert_eq!(codes, COMMON_ERROR_CODES);
+        assert_eq!(statuses, COMMON_STATUSES);
+    }
+
+    #[test]
+    fn a_status_is_documented_as_itself_by_its_range_or_by_default() {
+        assert!(documents(&keys(&["200", "409"]), 409));
+        assert!(documents(&keys(&["200", "4XX"]), 409));
+        assert!(documents(&keys(&["200", "default"]), 503));
+        assert!(!documents(&keys(&["200", "404", "5XX"]), 409));
     }
 }

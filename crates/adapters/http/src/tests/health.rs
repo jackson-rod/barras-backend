@@ -55,7 +55,7 @@ fn panic_when_called() -> std::future::Ready<Result<(), String>> {
 }
 
 fn app_with(probes: Vec<HealthProbe>) -> HttpApp {
-    let builder = HttpApp::builder(SERVICE, fixture_metrics());
+    let builder = HttpApp::builder(fixture_metrics());
     let builder = probes
         .into_iter()
         .fold(builder, |builder, probe| builder.probe(probe));
@@ -434,7 +434,7 @@ async fn a_probe_whose_check_panics_is_down_and_the_others_still_answer() {
 #[tokio::test]
 async fn the_internal_metrics_are_the_text_of_the_registry() {
     let metrics = fixture_metrics();
-    let app = HttpApp::builder(SERVICE, metrics.clone()).build().unwrap();
+    let app = HttpApp::builder(metrics.clone()).build().unwrap();
     let client = TestClient::internal(app.internal());
 
     let response = client.get("/metrics").await;
@@ -454,7 +454,7 @@ async fn the_internal_metrics_are_the_text_of_the_registry() {
 #[tokio::test]
 async fn a_request_to_the_internal_port_is_not_counted() {
     let metrics = fixture_metrics();
-    let app = HttpApp::builder(SERVICE, metrics.clone()).build().unwrap();
+    let app = HttpApp::builder(metrics.clone()).build().unwrap();
     let internal = TestClient::internal(app.internal());
 
     for path in ["/health", "/metrics", "/nowhere"] {
@@ -473,7 +473,7 @@ async fn a_request_to_the_internal_port_is_not_counted() {
 #[tokio::test]
 async fn an_internal_app_built_alone_serves_both_routes() {
     let probes = vec![up("database", Criticality::Critical)];
-    let internal = InternalApp::new(SERVICE, fixture_metrics(), probes);
+    let internal = InternalApp::new(fixture_metrics(), probes);
     let client = TestClient::internal(&internal);
 
     let health = client.get("/health").await;
@@ -487,7 +487,7 @@ async fn an_internal_app_built_alone_serves_both_routes() {
 #[tokio::test]
 async fn metrics_that_cannot_be_rendered_answer_500_and_log_the_whole_chain() {
     let metrics = Metrics::unrenderable(SERVICE).unwrap();
-    let client = TestClient::internal(&InternalApp::new(SERVICE, metrics, vec![]));
+    let client = TestClient::internal(&InternalApp::new(metrics, vec![]));
 
     let (response, lines) = send_logged_json(&client, TestRequest::new("GET", "/metrics")).await;
 

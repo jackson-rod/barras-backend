@@ -17,6 +17,7 @@ use tower_http::compression::CompressionLayer;
 use tower_http::compression::predicate::{NotForContentType, Predicate, SizeAbove};
 use tower_http::request_id::{PropagateRequestIdLayer, SetRequestIdLayer};
 
+#[cfg(any(test, feature = "testing"))]
 pub use matched_route::MatchedRoute;
 
 use crate::metrics::Metrics;

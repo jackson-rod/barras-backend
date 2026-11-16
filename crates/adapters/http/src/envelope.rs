@@ -44,7 +44,7 @@ pub struct ErrorEnvelope {
 /// What failed: the stable code to choose a text by and, on a validation failure only, the
 /// messages for each field path.
 #[derive(Debug, Serialize, ToSchema)]
-pub struct ErrorDetail {
+pub(crate) struct ErrorDetail {
     code: &'static str,
     // utoipa makes every `Option` nullable, but this key is absent or a map, never null.
     // It cannot see through a type alias either, and would refer to a component named

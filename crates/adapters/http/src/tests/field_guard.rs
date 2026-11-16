@@ -8,7 +8,7 @@ use serde::Deserialize;
 use utoipa::ToSchema;
 use utoipa_axum::routes;
 
-use super::support::{SERVICE, client, fixture_metrics};
+use super::support::{client, fixture_metrics};
 use crate::testing::{TestClient, TestRequest};
 use crate::{
     Access, ApiError, ApiResult, ApiRouter, ApiSuccess, ErrorEnvelope, FieldErrors, HttpApp,
@@ -116,7 +116,7 @@ fn refusing_client() -> TestClient {
         .route(routes!(refusing), Access::public(), codes)
         .route(routes!(save_note), Access::public(), codes)
         .route(routes!(save_contact), Access::public(), codes);
-    let app = HttpApp::builder(SERVICE, fixture_metrics())
+    let app = HttpApp::builder(fixture_metrics())
         .routes(routes)
         .build()
         .unwrap();

@@ -175,7 +175,7 @@ async fn every_request_is_timed_in_the_buckets_of_the_spec() {
 async fn a_request_is_timed_from_before_its_handler_runs() {
     let metrics = fixture_metrics();
     let routes = ApiRouter::new().route(routes!(slow), Access::public(), &[]);
-    let app = HttpApp::builder(SERVICE, metrics.clone())
+    let app = HttpApp::builder(metrics.clone())
         .routes(routes)
         .build()
         .unwrap();

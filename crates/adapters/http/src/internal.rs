@@ -12,7 +12,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use serde::Serialize;
 
-use crate::app::ServiceInfo;
 use crate::envelope::json_response;
 use crate::error::with_sources;
 use crate::health::{HealthProbe, ProbeReport, Readiness, check_all};
@@ -29,17 +28,16 @@ pub struct InternalApp {
 /// What the two routes answer from.
 #[derive(Clone)]
 struct Internal {
-    service: ServiceInfo,
     metrics: Metrics,
     probes: Arc<[HealthProbe]>,
 }
 
 impl InternalApp {
-    /// Answers `GET /health` from `probes` and `GET /metrics` from `metrics`: the registry the
-    /// public app records into, when the binary has one.
-    pub fn new(service: ServiceInfo, metrics: Metrics, probes: Vec<HealthProbe>) -> Self {
+    /// Answers `GET /health` from `probes`, under the name and the version of the service the
+    /// metrics were made for, and `GET /metrics` from `metrics`: the registry the public app
+    /// records into, when the binary has one.
+    pub fn new(metrics: Metrics, probes: Vec<HealthProbe>) -> Self {
         let internal = Internal {
-            service,
             metrics,
             probes: probes.into(),
         };
@@ -63,10 +61,11 @@ async fn health(State(internal): State<Internal>) -> Response {
         Readiness::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
         Readiness::Ok | Readiness::Degraded => StatusCode::OK,
     };
+    let service = internal.metrics.service();
     let body = Health {
         status: readiness,
-        service: internal.service.name,
-        version: internal.service.version,
+        service: service.name,
+        version: service.version,
         dependencies: reports.iter().map(Dependency::of).collect(),
     };
     json_response(status, &body)

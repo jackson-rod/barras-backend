@@ -22,6 +22,7 @@ const DURATION_BUCKETS: [f64; 12] = [
 /// [`Metrics::new`] share nothing, so neither sees what the other counted.
 #[derive(Debug, Clone)]
 pub struct Metrics {
+    service: ServiceInfo,
     registry: Registry,
     requests: IntCounterVec,
     durations: HistogramVec,
@@ -70,10 +71,17 @@ impl Metrics {
             .register(Box::new(build))
             .map_err(MetricsError::register)?;
         Ok(Self {
+            service,
             registry,
             requests,
             durations,
         })
+    }
+
+    /// The binary the metrics were made for, as `barras_build_info` names it: the apps built
+    /// with these metrics name themselves the same way on their internal port.
+    pub fn service(&self) -> ServiceInfo {
+        self.service
     }
 
     /// Every metric, in the Prometheus text format (`prometheus::TEXT_FORMAT`).
@@ -229,6 +237,14 @@ mod tests {
             lines[2],
             r#"barras_build_info{service="barras-probe",version="4.5.6"} 1"#
         );
+    }
+
+    #[test]
+    fn the_metrics_know_the_service_they_were_made_for() {
+        let metrics = Metrics::new(SERVICE).unwrap();
+
+        assert_eq!(metrics.service(), SERVICE);
+        assert_eq!(metrics.clone().service(), SERVICE);
     }
 
     #[test]

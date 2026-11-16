@@ -6,7 +6,7 @@ use axum::routing::get;
 use utoipa::openapi::path::{HttpMethod, Operation, PathItem, Paths};
 use utoipa_axum::router::UtoipaMethodRouter;
 
-use super::support::{SERVICE, client, fixture_metrics, fixture_routes};
+use super::support::{client, fixture_metrics, fixture_routes};
 use crate::testing::{TestClient, TestRequest};
 use crate::{Access, ApiResult, ApiRouter, ApiSuccess, HttpApp, NoData};
 
@@ -16,7 +16,7 @@ async fn hidden() -> ApiResult<NoData> {
 
 /// The fixture app, plus `GET /api/v1/hidden`, which the document lacks.
 fn client_with_a_hidden_route() -> TestClient {
-    let app = HttpApp::builder(SERVICE, fixture_metrics())
+    let app = HttpApp::builder(fixture_metrics())
         .routes(fixture_routes())
         .undocumented_route("/hidden", get(hidden))
         .build()
@@ -35,7 +35,7 @@ fn an_app_with_a_route_the_document_cannot_describe_is_not_built() {
     let routes = ApiRouter::new().route(operationless, Access::public(), &[]);
     let more = ApiRouter::new().route(pathless, Access::public(), &[]);
 
-    let built = HttpApp::builder(SERVICE, fixture_metrics())
+    let built = HttpApp::builder(fixture_metrics())
         .routes(fixture_routes())
         .routes(routes)
         .routes(more)
@@ -67,7 +67,7 @@ fn an_app_given_a_method_and_path_twice_is_not_built() {
     let again: UtoipaMethodRouter = (Vec::new(), paths, get(hidden));
     let routes = ApiRouter::new().route(again, Access::public(), &[]);
 
-    let built = HttpApp::builder(SERVICE, fixture_metrics())
+    let built = HttpApp::builder(fixture_metrics())
         .routes(fixture_routes())
         .routes(routes)
         .build();
@@ -104,7 +104,7 @@ async fn a_method_the_document_lacks_on_a_documented_path_fails() {
     paths.paths.insert("/posted".to_owned(), item);
     let route: UtoipaMethodRouter = (Vec::new(), paths, get(hidden));
     let routes = ApiRouter::new().route(route, Access::public(), &[]);
-    let app = HttpApp::builder(SERVICE, fixture_metrics())
+    let app = HttpApp::builder(fixture_metrics())
         .routes(routes)
         .build()
         .unwrap();

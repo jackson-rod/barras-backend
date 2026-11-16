@@ -50,7 +50,7 @@ pub fn build_app(dependencies: Dependencies) -> Result<HttpApp, BuildError> {
     let Dependencies { metrics, probes } = dependencies;
     probes
         .into_iter()
-        .fold(HttpApp::builder(SERVICE, metrics), HttpAppBuilder::probe)
+        .fold(HttpApp::builder(metrics), HttpAppBuilder::probe)
         .build()
 }
 

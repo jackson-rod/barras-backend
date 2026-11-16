@@ -16,7 +16,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout};
 use tracing::Level;
 
-use super::support::{SERVICE, fixture_metrics, logged_json};
+use super::support::{fixture_metrics, logged_json};
 use crate::server::DRAIN_LIMIT;
 use crate::testing::fetch;
 use crate::{
@@ -125,9 +125,7 @@ async fn refused(addr: SocketAddr) {
 
 #[tokio::test]
 async fn serve_api_answers_on_both_listeners() {
-    let app = HttpApp::builder(SERVICE, fixture_metrics())
-        .build()
-        .unwrap();
+    let app = HttpApp::builder(fixture_metrics()).build().unwrap();
     let (public, public_addr) = listener("public").await;
     let (internal, internal_addr) = listener("internal").await;
     let (stop, stopped) = shutdown();
@@ -166,7 +164,7 @@ async fn serve_api_answers_on_both_listeners() {
 #[tokio::test]
 async fn after_the_shutdown_serve_api_answers_the_request_in_flight_and_returns_ok() {
     let gate = Gate::default();
-    let app = HttpApp::builder(SERVICE, fixture_metrics())
+    let app = HttpApp::builder(fixture_metrics())
         .probe(gate.probe())
         .build()
         .unwrap();
@@ -192,7 +190,7 @@ async fn after_the_shutdown_serve_api_answers_the_request_in_flight_and_returns_
 #[tokio::test]
 async fn after_the_shutdown_serve_internal_answers_the_request_in_flight_and_returns_ok() {
     let gate = Gate::default();
-    let app = InternalApp::new(SERVICE, fixture_metrics(), vec![gate.probe()]);
+    let app = InternalApp::new(fixture_metrics(), vec![gate.probe()]);
     let (internal, addr) = listener("internal").await;
     let (stop, stopped) = shutdown();
     let server = tokio::spawn(serve_internal(app, internal, stopped));
@@ -214,9 +212,7 @@ async fn after_the_shutdown_serve_internal_answers_the_request_in_flight_and_ret
 
 #[tokio::test(start_paused = true)]
 async fn after_the_shutdown_serve_api_waits_ten_seconds_at_most_for_the_requests_in_flight() {
-    let app = HttpApp::builder(SERVICE, fixture_metrics())
-        .build()
-        .unwrap();
+    let app = HttpApp::builder(fixture_metrics()).build().unwrap();
     let (public, public_addr) = listener("public").await;
     let (internal, _) = listener("internal").await;
     let (stop, stopped) = shutdown();
@@ -241,7 +237,7 @@ async fn after_the_shutdown_serve_api_waits_ten_seconds_at_most_for_the_requests
 
 #[tokio::test(start_paused = true)]
 async fn after_the_shutdown_serve_internal_waits_ten_seconds_at_most_for_the_requests_in_flight() {
-    let app = InternalApp::new(SERVICE, fixture_metrics(), vec![]);
+    let app = InternalApp::new(fixture_metrics(), vec![]);
     let (internal, addr) = listener("internal").await;
     let (stop, stopped) = shutdown();
     let server = tokio::spawn(serve_internal(app, internal, stopped));

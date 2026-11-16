@@ -124,7 +124,10 @@ async fn length(body: Bytes) -> ApiResult<Length> {
     path = "/bare/{status}",
     tag = "fixtures",
     params(("status" = u16, Path, description = "The status to answer")),
-    responses((status = 200, description = "Plain text", body = SuccessEnvelope<NoData>)),
+    responses(
+        (status = 200, description = "Plain text", body = SuccessEnvelope<NoData>),
+        (status = "default", description = "Any other status, as the safety net wraps it", body = ErrorEnvelope),
+    ),
 )]
 async fn bare(Path(status): Path<u16>) -> Response {
     let headers = [
@@ -153,7 +156,10 @@ async fn bare(Path(status): Path<u16>) -> Response {
         ("status" = u16, Path, description = "The status to answer"),
         ("kind" = String, Path, description = "The kind of content"),
     ),
-    responses((status = 200, description = "Content of that kind", body = SuccessEnvelope<NoData>)),
+    responses(
+        (status = 200, description = "Content of that kind", body = SuccessEnvelope<NoData>),
+        (status = "default", description = "Any other status, as the safety net wraps it", body = ErrorEnvelope),
+    ),
 )]
 async fn content(Path((status, kind)): Path<(u16, String)>) -> Response {
     let content_type = match kind.as_str() {
@@ -482,7 +488,7 @@ pub(super) fn fixture_app() -> HttpApp {
 
 /// The fixture app, recording what it answers in `metrics`.
 pub(super) fn fixture_app_with(metrics: Metrics) -> HttpApp {
-    HttpApp::builder(SERVICE, metrics)
+    HttpApp::builder(metrics)
         .routes(fixture_routes())
         .build()
         .unwrap()

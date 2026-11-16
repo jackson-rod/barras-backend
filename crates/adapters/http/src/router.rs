@@ -50,10 +50,15 @@ impl Access {
 /// A route can still be built by hand, as the tuple `routes!` makes. [`ApiRouter::route`]
 /// refuses one the document cannot describe, and `HttpAppBuilder::build` then refuses the app;
 /// a method the tuple serves and its document lacks is left to the test client's route guard.
+///
+/// Both fields are private, not `pub(crate)`: every handler lives in this crate, so with fields
+/// its modules could set, any of them could build an `ApiRouter` around an axum router of its
+/// own, whose routes the app would serve with no document, no error codes and no problem
+/// recorded. No test here can show that such code fails to compile, hence this note.
 pub struct ApiRouter<S = ()> {
-    pub(crate) router: OpenApiRouter<S>,
+    router: OpenApiRouter<S>,
     /// One line for each route refused and each schema name given two shapes.
-    pub(crate) problems: Vec<String>,
+    problems: Vec<String>,
 }
 
 /// The schema components of a document, by name.
@@ -145,6 +150,16 @@ impl<S: Clone + Send + Sync + 'static> ApiRouter<S> {
         ApiRouter {
             router: self.router.with_state(state),
             problems: self.problems,
+        }
+    }
+
+    /// The routes with their document, or every problem recorded when the document cannot
+    /// describe one of them: then nothing is served.
+    pub(crate) fn into_router(self) -> Result<OpenApiRouter<S>, Vec<String>> {
+        if self.problems.is_empty() {
+            Ok(self.router)
+        } else {
+            Err(self.problems)
         }
     }
 }
@@ -599,6 +614,24 @@ mod tests {
                 "{method} {path}"
             );
         }
+    }
+
+    #[test]
+    fn the_routes_are_given_out_only_when_no_problem_was_recorded() {
+        let fine: ApiRouter = ApiRouter::new().route(routes!(read_fixture), Access::public(), &[]);
+        let refused = two_paths().route(routes!(read_owner), Access::public(), &[]);
+
+        let Ok(routes) = fine.into_router() else {
+            panic!("a router without a problem gave no routes");
+        };
+        assert_eq!(paths_of(routes.get_openapi()), ["/fixtures"]);
+        assert_eq!(
+            refused.into_router().err(),
+            Some(vec![
+                "a route names 2 paths, /fixtures and /widgets: give routes! the handlers of one path"
+                    .to_owned()
+            ])
+        );
     }
 
     #[test]

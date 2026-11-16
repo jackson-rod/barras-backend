@@ -31,7 +31,7 @@ pub const COMMON_ERROR_CODES: &[&str] = &[
 pub(crate) const X_ERROR_CODES: &str = "x-error-codes";
 pub(crate) const X_PERMISSION: &str = "x-permission";
 pub(crate) const X_PLAN_FEATURE: &str = "x-plan-feature";
-const X_COMMON_ERROR_CODES: &str = "x-common-error-codes";
+pub(crate) const X_COMMON_ERROR_CODES: &str = "x-common-error-codes";
 
 // The components utoipa makes of the two envelopes: `SuccessEnvelope<Goal>` becomes
 // `SuccessEnvelope_Goal`, `SuccessEnvelope<Vec<Goal>>` becomes `SuccessEnvelope_Vec_Goal`.
@@ -68,13 +68,10 @@ pub fn metadata_problems(document: &OpenApi) -> Vec<String> {
             }
             _ => missing("no operationId"),
         }
-        if operation
-            .tags
-            .iter()
-            .flatten()
-            .all(|tag| tag.trim().is_empty())
-        {
-            missing("no tag");
+        match operation.tags.as_deref().unwrap_or_default() {
+            [tag] if !tag.trim().is_empty() => {}
+            [] | [_] => missing("no tag"),
+            tags => missing(&format!("{} tags, not one", tags.len())),
         }
         if is_blank(operation.summary.as_deref()) {
             missing("no summary");
@@ -362,7 +359,7 @@ mod tests {
     /// base.
     fn document_of(routes: ApiRouter) -> OpenApi {
         OpenApiRouter::with_openapi(document_base())
-            .nest("/api/v1", routes.router)
+            .nest("/api/v1", routes.into_router().unwrap())
             .split_for_parts()
             .1
     }
@@ -565,6 +562,24 @@ mod tests {
     }
 
     #[test]
+    fn more_than_one_tag_is_one_line() {
+        for tags in [
+            vec!["fixtures".to_owned(), "health".to_owned()],
+            vec!["fixtures".to_owned(), " ".to_owned()],
+        ] {
+            let label = format!("{tags:?}");
+            let mut document = complete();
+            fixture_operation(&mut document).tags = Some(tags);
+
+            assert_eq!(
+                metadata_problems(&document),
+                ["GET /api/v1/fixtures: 2 tags, not one"],
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
     fn a_missing_or_blank_summary_is_one_line() {
         for summary in [None, Some(" ".to_owned())] {
             let label = format!("{summary:?}");
@@ -754,7 +769,7 @@ mod tests {
             ApiRouter::new().route(routes!(read_fixture), Access::public(), &["FIXTURE_GONE"]);
 
         let document = OpenApiRouter::default()
-            .nest("/api/v1", routes.router)
+            .nest("/api/v1", routes.into_router().unwrap())
             .split_for_parts()
             .1;
 

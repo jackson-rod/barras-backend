@@ -20,12 +20,14 @@ pub mod testing;
 mod tests;
 
 pub use app::{BuildError, HttpApp, HttpAppBuilder, ServiceInfo};
-pub use envelope::{ApiResult, ApiSuccess, ErrorDetail, ErrorEnvelope, NoData, SuccessEnvelope};
+pub use envelope::{ApiResult, ApiSuccess, ErrorEnvelope, NoData, SuccessEnvelope};
 pub use error::{ApiError, FieldErrors};
 pub use extract::{ValidatedJson, ValidatedQuery};
 pub use health::{Criticality, HealthProbe};
 pub use internal::InternalApp;
 pub use metrics::{Metrics, MetricsError};
+// What the test client reads; the metrics layer records it on every build.
+#[cfg(any(test, feature = "testing"))]
 pub use middleware::MatchedRoute;
 pub use openapi::{COMMON_ERROR_CODES, canonical_json, metadata_problems};
 pub use router::{Access, ApiRouter};

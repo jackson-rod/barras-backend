@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use utoipa::ToSchema;
 use utoipa_axum::routes;
 
-use super::support::{NewMember, SERVICE, assert_error, client, fixture_metrics};
+use super::support::{NewMember, assert_error, client, fixture_metrics};
 use crate::extract::{
     HAS_THE_WRONG_TYPE, HAS_UNKNOWN_FIELD, IS_NOT_ACCEPTED, IS_NOT_VALID, IS_REQUIRED,
 };
@@ -126,7 +126,7 @@ fn echo_client() -> TestClient {
             Access::public(),
             codes,
         );
-    let app = HttpApp::builder(SERVICE, fixture_metrics())
+    let app = HttpApp::builder(fixture_metrics())
         .routes(routes)
         .build()
         .unwrap();

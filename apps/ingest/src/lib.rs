@@ -32,7 +32,7 @@ pub async fn run(config: IngestConfig) -> Result<(), RunError> {
     install_panic_hook();
     let metrics = Metrics::new(SERVICE).map_err(RunError::Metrics)?;
     // No probe until BAR-4 brings the first dependency.
-    let app = InternalApp::new(SERVICE, metrics, Vec::new());
+    let app = InternalApp::new(metrics, Vec::new());
     // Before anything is bound, so that failing to listen for the signals stops the binary at
     // start rather than once it serves.
     let mut signal = ShutdownSignal::install().map_err(RunError::Signal)?;

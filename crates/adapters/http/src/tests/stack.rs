@@ -5,7 +5,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use super::support::{
-    BARE_TEXT, CONTENT_SIZE, KEPT_HEADER, PANIC_TEXT, SERVICE, assert_error, client, fixture_app,
+    BARE_TEXT, CONTENT_SIZE, KEPT_HEADER, PANIC_TEXT, assert_error, client, fixture_app,
     send_logged,
 };
 use crate::testing::{TestRequest, TestResponse};
@@ -460,9 +460,4 @@ fn the_json_of_the_app_is_its_canonical_document() {
         app.openapi_json().unwrap(),
         canonical_json(app.openapi()).unwrap()
     );
-}
-
-#[test]
-fn the_app_knows_the_service_it_was_built_for() {
-    assert_eq!(fixture_app().service(), SERVICE);
 }

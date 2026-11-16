@@ -30,7 +30,6 @@ pub struct ServiceInfo {
 
 /// The public API, ready to serve, with its OpenAPI document and the internal app.
 pub struct HttpApp {
-    service: ServiceInfo,
     router: Router,
     document: OpenApi,
     internal: InternalApp,
@@ -38,20 +37,15 @@ pub struct HttpApp {
 
 impl HttpApp {
     /// An app that records every answer it gives in `metrics`, and serves them on its internal
-    /// port.
-    pub fn builder(service: ServiceInfo, metrics: Metrics) -> HttpAppBuilder {
+    /// port under the name and the version of the service the metrics were made for.
+    pub fn builder(metrics: Metrics) -> HttpAppBuilder {
         HttpAppBuilder {
-            service,
             metrics,
             routes: ApiRouter::new(),
             probes: Vec::new(),
             #[cfg(any(test, feature = "testing"))]
             undocumented: Router::new(),
         }
-    }
-
-    pub fn service(&self) -> ServiceInfo {
-        self.service
     }
 
     /// The document of every route the app serves under `/api/v1`.
@@ -77,7 +71,6 @@ impl HttpApp {
 /// Gathers the routes of the app. Only [`ApiRouter`] adds one, so every route is documented.
 /// The two health routes are always there.
 pub struct HttpAppBuilder {
-    service: ServiceInfo,
     metrics: Metrics,
     routes: ApiRouter,
     probes: Vec<HealthProbe>,
@@ -111,22 +104,19 @@ impl HttpAppBuilder {
     /// The app, or every problem `ApiRouter` recorded about a route the document cannot
     /// describe: an app that would serve such a route is not built.
     pub fn build(self) -> Result<HttpApp, BuildError> {
-        let routes = health_routes(self.probes.clone()).merge(self.routes);
-        if !routes.problems.is_empty() {
-            return Err(BuildError {
-                problems: routes.problems,
-            });
-        }
+        let routes = health_routes(self.probes.clone())
+            .merge(self.routes)
+            .into_router()
+            .map_err(|problems| BuildError { problems })?;
         // Merging documents drops the top-level `info` and extensions, so the routes are nested
         // into the base rather than the base merged into them.
         let (router, document) = OpenApiRouter::with_openapi(document_base())
-            .nest(API_PREFIX, routes.router)
+            .nest(API_PREFIX, routes)
             .split_for_parts();
         #[cfg(any(test, feature = "testing"))]
         let router = router.merge(self.undocumented);
-        let internal = InternalApp::new(self.service, self.metrics.clone(), self.probes);
+        let internal = InternalApp::new(self.metrics.clone(), self.probes);
         Ok(HttpApp {
-            service: self.service,
             router: middleware::wrap(router, self.metrics),
             document,
             internal,
