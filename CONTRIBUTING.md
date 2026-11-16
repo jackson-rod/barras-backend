@@ -32,7 +32,9 @@ The full rules are in [CLAUDE.md](CLAUDE.md#git-and-pull-requests); the git hook
 | --- | --- | --- |
 | Branch | `feat/BAR-15-email-sign-up` | `feature/bar-15-Email_SignUp`: `feature` is not a type, `bar` is lower case, the slug has capitals and an underscore |
 | Commit subject | `feat(BAR-15): add email sign-up with a verification code` | `Added email sign-up`: no type, no ticket, starts with a capital |
+| Pull request title | `feat(BAR-15): add email sign-up with a verification code` | `BAR-15 Email sign-up`: no type, the ticket is not in parentheses, the description starts with a capital |
 
+- A pull request is merged by squash, so its title becomes the subject of the one commit that lands on `develop` and follows the commit subject rule. Its description may become that commit's body, so it carries no AI attribution either.
 - `git commit --fixup` is refused by the `commit-msg` hook, because a `fixup!` subject does not match the subject rule. Write an ordinary commit instead.
 - After adding or changing a dependency, refresh `Cargo.lock` with a plain `cargo build` before committing: `cargo xtask` and `cargo deny` run with `--locked`, so the hooks fail on a stale lock file.
 
@@ -41,6 +43,6 @@ The full rules are in [CLAUDE.md](CLAUDE.md#git-and-pull-requests); the git hook
 1. Push your branch. The `pre-push` hook checks the branch name and runs `just verify`.
 2. Open the pull request against `develop` and fill in the template: the ticket id and its Trello card, what and why, the four definition of done checkboxes, notes for the reviewer.
 3. Move the card to `EN PRUEBA`.
-4. CI runs `checks`, `test` and `build`. All three must pass. `checks` also checks the branch name and every commit message of the branch, not only the last one.
-5. The owner reviews and merges.
+4. CI runs `checks`, `test` and `build`. All three must pass. `checks` also checks the branch name, every commit message of the branch (not only the last one), and the pull request title and description. Editing the title or the description runs CI again.
+5. The owner reviews and merges by squash.
 6. After the owner approves or merges, the card moves on as the table under [Tickets](#tickets) says.

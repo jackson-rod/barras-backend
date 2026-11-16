@@ -1,3 +1,5 @@
+<!-- The title becomes the commit on develop (the pull request is merged by squash) and must read type(BAR-n): description, as in feat(BAR-15): add email sign-up with a verification code. -->
+
 ## Ticket
 
 BAR-n:

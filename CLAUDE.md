@@ -49,23 +49,23 @@ Every command runs from the repository root through `just`.
 | Command | What it does |
 | --- | --- |
 | `just` | Lists the recipes (the `default` recipe) |
-| `just setup` | Prints the active toolchain, installs cargo-nextest 0.9.152 and cargo-deny 0.20.2, installs the git hooks |
+| `just setup` | Installs the toolchain that `rust-toolchain.toml` names (`rustup toolchain install`), installs cargo-nextest 0.9.152 and cargo-deny 0.20.2, installs the git hooks |
 | `just dev` | Runs `barras-api` (`cargo run -p barras-api`) |
 | `just dev-ingest` | Runs `barras-ingest` (`cargo run -p barras-ingest`) |
 | `just fmt` | Formats the workspace with rustfmt |
 | `just fmt-check` | Fails on unformatted code |
-| `just lint` | clippy on every crate and target; any warning fails |
-| `just deny` | cargo-deny: advisories, licences, bans and sources |
+| `just lint` | clippy on every crate and target; any warning fails, cargo's own too (`build.warnings="deny"`), such as a member without `[lints]` |
+| `just deny` | cargo-deny: advisories, licences, bans and sources. Needs the network |
 | `just check-arch` | `cargo deny check bans`, then `cargo xtask check-arch` |
 | `just check-structure` | `cargo xtask check-structure`: ADRs, module crates, migration names |
-| `just test` | Unit tests with cargo-nextest; no Docker |
+| `just test` | Unit tests with cargo-nextest, then the doctests with `cargo test --doc`, which nextest does not run; no Docker |
 | `just build` | Release build of the workspace |
-| `just verify` | `fmt-check`, `lint`, `deny`, `check-arch`, `check-structure`, `test`, `build`, in that order: what CI runs, apart from the branch and commit checks |
+| `just verify` | `fmt-check`, `lint`, `deny`, `check-arch`, `check-structure`, `test`, `build`, in that order: what CI runs, apart from the branch, commit and pull request checks |
 
-- `cargo xtask` subcommands: `check-branch [name]`, `check-commit-msg <file>`, `check-commits <range>`, `check-arch`, `check-structure`.
+- `cargo xtask` subcommands: `check-branch [name]`, `check-commit-msg <file>`, `check-commits <range>`, `check-pr <file>`, `check-arch`, `check-structure`.
 - The other commands of spec §6.14 (integration tests, coverage, database, OpenAPI) arrive with later tickets and are added to this table when they exist.
 
-Git hooks (lefthook, installed by `just setup`; ADR-0018): `pre-commit` runs `just fmt-check`, `just lint`, `just check-arch` and `just check-structure`; `commit-msg` runs `cargo xtask check-commit-msg`; `pre-push` runs `cargo xtask check-branch` and `just verify`. Never bypass them (`--no-verify` is not allowed).
+Git hooks (lefthook, installed by `just setup`; ADR-0018): `pre-commit` runs `just fmt-check`, `just lint`, `just check-arch` and `just check-structure`; `commit-msg` runs `cargo xtask check-commit-msg`; `pre-push` runs `cargo xtask check-branch` and `just verify`, so it needs the network, as `just deny` does. Never bypass them: `--no-verify` is not allowed, and neither is `LEFTHOOK=0`, which turns lefthook off.
 
 ## Repository layout
 
@@ -122,30 +122,34 @@ crates/modules/<module>/        snake_case; plural for collections
 
 - A module's package is `barras-<module>` ([module anatomy](docs/standards/module-anatomy.md)).
 - `cargo xtask check-structure` fails a module whose folder name is not snake_case, or that lacks `README.md`, `src/lib.rs`, `src/domain/errors.rs`, `src/ports/` or `src/application/`.
+- It also fails a `src/ports/` or `src/application/` with no `.rs` file directly inside: git does not track an empty folder, so the module would fail in CI.
 - It also fails any `.rs` file directly in `src/domain/` (other than `mod.rs` and `errors.rs`) or directly in `src/application/` (other than `mod.rs`) that contains no `#[cfg(test)]`. Hidden files are ignored.
+- The hooks check the working tree, not the commit: a file that exists on disk but is not committed passes locally and fails in CI.
 - Adapters mirror the modules: `crates/adapters/postgres/src/<module>/<name>_repository.rs` with an explicit mapper in both directions, and `crates/adapters/http/src/<module>/` with `routes.rs` and `dto/<action>.rs` (spec §6.3).
 
 ### Dependency rule
 
-- The "May depend on" column is the design rule (ADR-0003). The "Enforced by" column names what a check enforces; review enforces the rest.
+- The "May depend on" column is the design rule (ADR-0003). The "Enforced by" column names what a check enforces (ADR-0024); review enforces the rest.
 - `just check-arch` runs two checks. `cargo xtask check-arch` reads `cargo metadata` and fails: any kernel or module dependency outside its list, any adapter dependency on another adapter, `barras-testkit` taken as anything but a dev dependency, a workspace crate in `xtask`'s dependencies, and a crate outside the folders of the table (`unknown-location`).
-- In those lists, an allowed name counts only from its expected source: `barras-kernel` only as the workspace crate, every other allowed name only from the registry (`check-arch`).
-- `cargo deny check bans` lets only these crates depend directly on a technology crate: `sqlx` only `barras-adapter-postgres` and `barras-testkit`; `axum` only `barras-adapter-http` and `barras-adapter-realtime`; `reqwest` only `barras-adapter-providers`; `redis` only `barras-adapter-redis` and `barras-testkit`. Every other crate, apps included, fails (`deny.toml`).
+- In those lists, an allowed name counts only from its expected source: `barras-kernel` only as the workspace crate, every other allowed name only from crates.io. A workspace crate is known by its package name, so a `git` copy of one is still caught (`check-arch`; ADR-0024).
+- No `[patch]` or `[replace]` table in the root `Cargo.toml`, and no `[patch]` table in `.cargo/config.toml` (`no-patch`, `check-arch`; ADR-0024).
+- Every folder directly under `apps/`, `crates/modules/` and `crates/adapters/` that holds a `Cargo.toml`, and `crates/kernel`, `crates/testkit` and `crates/xtask`, is listed in `members` (`not-a-member`, `check-arch`; ADR-0024).
+- `cargo deny check bans` lets only these crates depend directly on a technology crate: `sqlx` only `barras-adapter-postgres` and `barras-testkit`; `axum` only `barras-adapter-http` and `barras-adapter-realtime`; `reqwest` only `barras-adapter-providers`; `redis` only `barras-adapter-redis` and `barras-testkit`. Every other crate, apps included, fails; an app reaches them through its adapter (`deny.toml`; ADR-0024).
 
 | Crate | May depend on | Enforced by |
 | --- | --- | --- |
-| `crates/kernel` | `std` and the small pure crates `thiserror`, `uuid`, `time`, `rust_decimal` | `check-arch`: normal and build dependencies only from that list; dev dependencies from it plus `tokio`, `mockall`, `insta` (`kernel-allowlist`, `kernel-dev-allowlist`) |
-| `crates/modules/<m>` | `barras-kernel`, the same pure crates and `async-trait`. Never another module, an adapter, axum, sqlx, reqwest, redis, tokio's runtime or serde_json | `check-arch`: normal and build dependencies only from that list; dev dependencies from it plus `tokio`, `mockall`, `insta` (`module-allowlist`, `module-dev-allowlist`) |
-| `crates/adapters/*` | `barras-kernel`, the module crates and its own technology. Never another adapter | `check-arch`: no other adapter (`adapter-isolation`). cargo-deny bans: a technology crate only in its own adapter. Any other library is left to review |
+| `crates/kernel` | `std` and the small pure crates `thiserror`, `uuid`, `time`, `rust_decimal` | `check-arch`: normal and build dependencies only from that list; dev dependencies from it plus `tokio`, `mockall`, `insta`; each only from crates.io (`kernel-allowlist`, `kernel-dev-allowlist`) |
+| `crates/modules/<m>` | `barras-kernel`, the same pure crates and `async-trait`. Never another module, an adapter, axum, sqlx, reqwest, redis, tokio's runtime or serde_json | `check-arch`: normal and build dependencies only from that list; dev dependencies from it plus `tokio`, `mockall`, `insta`; `barras-kernel` only as the workspace crate, every other name only from crates.io (`module-allowlist`, `module-dev-allowlist`) |
+| `crates/adapters/*` | `barras-kernel`, the module crates and its own technology. Never another adapter | `check-arch`: no other adapter, whatever its source (`adapter-isolation`). cargo-deny bans: a technology crate only in its own adapter. Any other library is left to review |
 | `apps/*` | everything. The only place where a concrete adapter meets a port | cargo-deny bans: no direct `sqlx`, `axum`, `reqwest` or `redis`. `check-arch`: `barras-testkit` only as a dev dependency (`testkit-dev-only`) |
 | `crates/testkit` | test-only helpers: containers, fixtures, fakes | cargo-deny bans: `sqlx` and `redis` allowed directly, `axum` and `reqwest` not. `check-arch` sets no list; every crate that uses it takes it only as a dev dependency (`testkit-dev-only`) |
-| `crates/xtask` | no workspace crate | `check-arch` (`tool-isolation`) |
+| `crates/xtask` | no workspace crate | `check-arch`: no workspace crate, whatever its source (`tool-isolation`) |
 
 Reject on sight: a framework type in a module crate; a database row type in a use case signature; a handler calling a repository; a module depending on another module; `unwrap`, `expect` or `panic!` outside tests (ADR-0003, ADR-0006).
 
 ### Adding a crate or a dependency
 
-- List the crate in `members` of the root `Cargo.toml`. The list is explicit, with no globs (`Cargo.toml`).
+- List the crate in `members` of the root `Cargo.toml`. The list is explicit, with no globs (`Cargo.toml`). A crate folder left out of it fails (`not-a-member`, `check-arch`).
 - Its folder decides its layer: `crates/kernel`, `crates/modules/<module>`, `crates/adapters/<name>`, `apps/<name>`, `crates/testkit` or `crates/xtask`. A crate anywhere else fails (`unknown-location`, `check-arch`).
 - Give its `Cargo.toml` the fields every member has, under its own `name` (a module is `barras-<module>`):
 
@@ -163,6 +167,7 @@ workspace = true
 
 - A module crate has the files and folders `check-structure` requires (see Module anatomy).
 - Declare each dependency once, with its version, in `[workspace.dependencies]` of the root `Cargo.toml`, and take it in the crate with `<name>.workspace = true`. Enable only the features you use (spec §6.2, spec §6.12).
+- A workspace crate is declared there too, with its `path`, as in `barras-kernel = { path = "crates/kernel" }`, and taken with `barras-kernel.workspace = true` like any other dependency.
 - Refresh `Cargo.lock` with a plain `cargo build` before committing. The checks run with `--locked`, so the hooks fail on a stale lock file (`justfile`, `.cargo/config.toml`).
 
 ### Ports and wiring
@@ -272,17 +277,19 @@ A change is done only when the same pull request contains (ADR-0017):
 - clippy runs with zero warnings. It denies `unwrap`, `expect`, `panic!`, `dbg!` and printing to stdout or stderr outside tests, and `todo!`, `unimplemented!` and `std::env::var` everywhere (`[workspace.lints]`, `clippy.toml`; spec §9).
 - Every crate inherits the workspace lints with `[lints] workspace = true` (`Cargo.toml`).
 - No `#[allow]` without the reason on the same line, as in `#![allow(clippy::print_stdout, clippy::print_stderr)] // a CLI: its output is the product` (spec §9).
+- clippy's test exemption covers only `#[test]` functions and `#[cfg(test)]` modules. So an integration-test crate (`tests/*.rs`) and `barras-testkit` need a crate-level `#![allow(clippy::unwrap_used, clippy::expect_used)]`, its reason on the same line, to use `unwrap` or `expect` in their helpers, as the files in `crates/xtask/tests/` do (`clippy.toml`).
 - Files are snake_case (spec §9). Format with `just fmt`.
 
 ## Git and pull requests
 
 - Every change belongs to a ticket on the Trello board BARRAS. The card number is the ticket id `BAR-<n>`. One ticket per branch (ADR-0018).
 - **Branch:** from `develop`, named `type/BAR-<n>-short-slug`, at most 50 characters. The slug is lower-case letters and digits in words joined by single hyphens. Types: `feat`, `fix`, `refactor`, `perf`, `test`, `docs`, `chore`, `ci`, `build`. `main`, `develop` and a detached `HEAD` pass the check (ADR-0018; `cargo xtask check-branch` in `pre-push` and CI).
-- **Commit subject:** `type(BAR-<n>): short description starting in lower case`, at most 100 characters, with the same types. Subjects that start with `Merge ` or `Revert "` are exempt (ADR-0018; `cargo xtask check-commit-msg` in `commit-msg`, `cargo xtask check-commits` on every commit of a pull request in CI).
-- **No AI attribution** in commits or pull requests: no AI co-author trailer, no "Generated with" line, no link to an AI tool's site or session (ADR-0018). The `commit-msg` hook and CI catch the patterns listed in `crates/xtask/src/git_rules.rs`, among them any line that contains "generated with", whatever follows; review catches the rest.
-- Pull requests target `develop`. `main` and `develop` are protected: no direct push, no force push, merge only when the checks pass. The owner merges (ADR-0018).
+- **Commit subject:** `type(BAR-<n>): short description starting in lower case`, at most 100 characters, with the same types. Only the merge and revert subjects that git and GitHub write are exempt: `Merge pull request #<n> from …`, `Merge branch '…'…`, `Merge remote-tracking branch '…'…`, `Merge tag '…'…`, `Merge <hex> into <hex>` and `Revert "…"…` (ADR-0018; `cargo xtask check-commit-msg` in `commit-msg`, `cargo xtask check-commits` on every commit of a pull request in CI).
+- **No AI attribution** in commits or pull requests: no trailer that credits an AI tool (`Co-authored-by:`, `Signed-off-by:`, `Generated-by:`, `Assisted-by:`), no "Generated with" or "Generated by" line that names one, no link to an AI tool's session (ADR-0018). The `commit-msg` hook and CI catch the patterns and the tool names listed in `crates/xtask/src/git_rules.rs`; review catches the rest.
+- Pull requests target `develop`. `main` and `develop` are protected: no direct push, no force push, merge only when the checks pass. The owner merges, by squash (ADR-0018, ADR-0025).
+- **Pull request title and description:** a squash merge makes the title the subject of the commit on `develop` and may take the description as its body. So the title follows the commit subject rule and the description the attribution rule. CI checks both on every pull request, and again when either is edited (ADR-0025; `cargo xtask check-pr` in CI).
 - Agents never push, open pull requests or touch production unless the owner asks in that conversation (ADR-0018).
-- **Move the ticket's card as its state changes** (set by the owner; not yet in an ADR):
+- **Move the ticket's card as its state changes** (set by the owner; ADR-0025):
   - `EN PROCESO` when work starts.
   - `EN PRUEBA` when it is implemented and under review, or its pull request is open.
   - `APROBADA` and `PRODUCCIÓN` only after the owner approves or the pull request is merged, never on the contributor's own judgment.

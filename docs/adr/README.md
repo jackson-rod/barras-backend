@@ -31,3 +31,5 @@ When something is not covered: if the decision for an area does not exist, stop 
 | [0021](0021-news-headline-and-link.md) | News as headline and link | Accepted |
 | [0022](0022-informational-suggestions.md) | Informational suggestions and chatbot | Accepted |
 | [0023](0023-subscriptions-through-the-stores.md) | Subscriptions through the stores | Accepted |
+| [0024](0024-enforcement-of-the-layer-rule.md) | Enforcement of the layer rule | Proposed |
+| [0025](0025-tickets-cards-and-merges.md) | Tickets, cards and merges | Proposed |
