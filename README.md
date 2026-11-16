@@ -38,7 +38,7 @@ The first `just setup` compiles cargo-nextest and cargo-deny from source and tak
 | Command | What it does |
 | --- | --- |
 | `just verify` | The checks, tests and release build that CI runs; run it before you push (the `pre-push` hook runs it too) |
-| `just test` | Unit tests with cargo-nextest; no Docker |
+| `just test` | Unit tests with cargo-nextest, then the doctests; no Docker |
 | `just fmt` | Formats the code |
 | `just lint` | clippy; any warning fails |
 | `just check-arch` | The dependency rule between crates |
@@ -54,7 +54,7 @@ The first `just setup` compiles cargo-nextest and cargo-deny from source and tak
 
 | Check | What it runs |
 | --- | --- |
-| `checks` | On a pull request, the branch name (`cargo xtask check-branch`) and every commit message of the branch (`cargo xtask check-commits`). Always `just fmt-check`, `just lint`, `just deny`, `just check-arch` and `just check-structure` |
+| `checks` | On a pull request, the branch name (`cargo xtask check-branch`), every commit message of the branch (`cargo xtask check-commits`) and the pull request's title and description (`cargo xtask check-pr`); editing the title or the description runs the workflow again. Always `just fmt-check`, `just lint`, `just deny`, `just check-arch` and `just check-structure` |
 | `test` | `just test` |
 | `build` | `just build` |
 

@@ -7,7 +7,7 @@ on:
   push:
     branches: [develop, main]
 
-# One run per ref; a newer run cancels the older one.
+# One run per ref. On a pull request, a newer run cancels the older one.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   # On develop and main, a run in progress is not cancelled by a newer one.
@@ -36,7 +36,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           cache: false
-          # Its default sets CARGO_BUILD_WARNINGS=deny, which local runs do not; CI must compile exactly like `just verify`.
+          # Its default sets CARGO_BUILD_WARNINGS=deny for every cargo command of the job. Locally only `just lint` denies cargo warnings, through its own flag; CI must compile exactly like `just verify`.
           build-warnings: ""
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
@@ -78,7 +78,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           cache: false
-          # Its default sets CARGO_BUILD_WARNINGS=deny, which local runs do not; CI must compile exactly like `just verify`.
+          # Its default sets CARGO_BUILD_WARNINGS=deny for every cargo command of the job. Locally only `just lint` denies cargo warnings, through its own flag; CI must compile exactly like `just verify`.
           build-warnings: ""
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
@@ -96,7 +96,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           cache: false
-          # Its default sets CARGO_BUILD_WARNINGS=deny, which local runs do not; CI must compile exactly like `just verify`.
+          # Its default sets CARGO_BUILD_WARNINGS=deny for every cargo command of the job. Locally only `just lint` denies cargo warnings, through its own flag; CI must compile exactly like `just verify`.
           build-warnings: ""
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5

@@ -149,7 +149,7 @@ Reject on sight: a framework type in a module crate; a database row type in a us
 
 ### Adding a crate or a dependency
 
-- List the crate in `members` of the root `Cargo.toml`. The list is explicit, with no globs (`Cargo.toml`). A crate folder left out of it fails (`not-a-member`, `check-arch`).
+- List the crate in `members` of the root `Cargo.toml`. The list is explicit, with no globs (`Cargo.toml`). A crate folder under `apps/`, `crates/modules/` or `crates/adapters/`, or at `crates/kernel`, `crates/testkit` or `crates/xtask`, left out of it fails (`not-a-member`, `check-arch`).
 - Its folder decides its layer: `crates/kernel`, `crates/modules/<module>`, `crates/adapters/<name>`, `apps/<name>`, `crates/testkit` or `crates/xtask`. A crate anywhere else fails (`unknown-location`, `check-arch`).
 - Give its `Cargo.toml` the fields every member has, under its own `name` (a module is `barras-<module>`):
 
