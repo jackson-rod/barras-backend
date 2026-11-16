@@ -22,11 +22,11 @@ use crate::openapi::operations;
 /// test when a route the OpenAPI document does not have served one: so any test that reaches
 /// a route registered around `ApiRouter::route` fails, naming it.
 ///
-/// It also fails the test when a validation failure answered to a JSON body has a key in
-/// `error.fields` that names neither a member of that body, nor a parameter of the query
+/// It also fails the test when a validation failure has a key in `error.fields` with a name
+/// that holds `_`, a Rust name where every JSON name is camelCase (spec §4.2), or, answered to
+/// a JSON body, a key that names neither a member of that body, nor a parameter of the query
 /// string, nor a field missing from an object of the body: the app finds the field to flag by
-/// that key, so a key spelled otherwise, a Rust name where the body has a camelCase one, say,
-/// flags nothing.
+/// that key, so a key spelled otherwise flags nothing.
 pub struct TestClient {
     router: Router,
     /// Each operation of the document, as its method and its path template; `None` for the
@@ -69,9 +69,7 @@ impl TestClient {
         if let (Some(served), Some(documented)) = (response.matched_route(), &self.documented) {
             hold_to_the_document(documented, served);
         }
-        if let Some(sent) = &sent {
-            hold_the_keys_to_the_body(&response, sent, &parameters);
-        }
+        hold_the_keys(&response, sent.as_ref(), &parameters);
         response
     }
 }
@@ -89,11 +87,11 @@ fn hold_to_the_document(documented: &BTreeSet<(String, String)>, served: &Matche
     }
 }
 
-/// On a 422 `VALIDATION_FAILED`, each key of `error.fields` must name a member of `sent`, the
-/// JSON body of the request, one of the `parameters` of its query string, or a field missing
-/// from an object of `sent`, whatever its message: a rule such as garde's `required` reports a
-/// field that was not sent too.
-fn hold_the_keys_to_the_body(response: &TestResponse, sent: &Value, parameters: &BTreeSet<String>) {
+/// On a 422 `VALIDATION_FAILED`, no name in a key of `error.fields` may hold `_`. To a JSON
+/// body, `sent`, each key must also name a member of it, one of the `parameters` of the query
+/// string, or a field missing from an object of `sent`, whatever its message: a rule such as
+/// garde's `required` reports a field that was not sent too.
+fn hold_the_keys(response: &TestResponse, sent: Option<&Value>, parameters: &BTreeSet<String>) {
     if response.status != 422
         || response.error_code().as_deref() != Some(ApiError::VALIDATION_FAILED)
     {
@@ -102,6 +100,15 @@ fn hold_the_keys_to_the_body(response: &TestResponse, sent: &Value, parameters: 
     let answer = response.json();
     let keys = answer["error"]["fields"].as_object().into_iter().flatten();
     for (key, _) in keys {
+        if let Some(name) = key.split('.').find(|name| name.contains('_')) {
+            panic!(
+                "error.fields has the key {key}, whose name {name} is a Rust name: name each \
+                 field as JSON does, in camelCase"
+            );
+        }
+        let Some(sent) = sent else {
+            continue;
+        };
         if member(sent, key).is_none() && !parameters.contains(key) && !is_missing_from(sent, key) {
             panic!(
                 "error.fields has the key {key}, which names no member of the body that was \

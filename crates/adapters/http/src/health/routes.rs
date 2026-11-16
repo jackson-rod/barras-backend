@@ -52,22 +52,28 @@ async fn readiness(State(Probes(probes)): State<Probes>) -> ApiResult<HealthStat
     let reports = check_all(&probes).await;
     match Readiness::of(&reports) {
         Readiness::Ok => Ok(ApiSuccess::ok("Service is ready", HealthStatus::OK)),
-        Readiness::Degraded => Ok(ApiSuccess::ok(
-            "Service is ready but degraded",
-            HealthStatus::DEGRADED,
-        )),
-        Readiness::Unavailable => Err(ApiError::service_unavailable(critical_failures(&reports))),
+        Readiness::Degraded => {
+            // The answer names no dependency, so the log is where an operator sees which.
+            tracing::warn!(detail = %down(&reports, false), "service degraded");
+            Ok(ApiSuccess::ok(
+                "Service is ready but degraded",
+                HealthStatus::DEGRADED,
+            ))
+        }
+        Readiness::Unavailable => Err(ApiError::service_unavailable(down(&reports, true))),
     }
 }
 
-/// The log's account of a 503: each critical dependency that is down, and why.
-fn critical_failures(reports: &[ProbeReport]) -> String {
-    let down: Vec<String> = reports
+/// The log's account of a 503, given `critical`, or of a degraded service: each dependency of
+/// that kind that is down, and why.
+fn down(reports: &[ProbeReport], critical: bool) -> String {
+    let kind = if critical { "critical" } else { "optional" };
+    let failed: Vec<String> = reports
         .iter()
-        .filter(|report| report.critical)
+        .filter(|report| report.critical == critical)
         .filter_map(|report| Some(format!("{} ({})", report.name, report.error.as_deref()?)))
         .collect();
-    format!("critical dependencies are down: {}", down.join(", "))
+    format!("{kind} dependencies are down: {}", failed.join(", "))
 }
 
 /// `GET /health/live` and `GET /health`, the second answering from `probes`.

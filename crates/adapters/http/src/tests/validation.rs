@@ -3,25 +3,135 @@
 //! object, and passed every rule; anything else answers an error envelope, and no answer
 //! repeats a value that was sent.
 
+use std::collections::BTreeMap;
 use std::io;
 
 use axum::body::{Body, Bytes};
 use axum::extract::FromRequest;
 use axum::http::Request;
+use garde::Validate;
 use http_body_util::{BodyExt, Full, Limited};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use utoipa::ToSchema;
+use utoipa_axum::routes;
 
-use super::support::{NewMember, assert_error, client};
+use super::support::{NewMember, SERVICE, assert_error, client, fixture_metrics};
 use crate::extract::{
     HAS_THE_WRONG_TYPE, HAS_UNKNOWN_FIELD, IS_NOT_ACCEPTED, IS_NOT_VALID, IS_REQUIRED,
 };
-use crate::testing::{TestRequest, TestResponse};
-use crate::{ApiError, ValidatedJson};
+use crate::testing::{TestClient, TestRequest, TestResponse};
+use crate::{
+    Access, ApiError, ApiResult, ApiRouter, ApiSuccess, ErrorEnvelope, HttpApp, NoData,
+    SuccessEnvelope, ValidatedJson, ValidatedQuery,
+};
 
 const MIB: usize = 1024 * 1024;
 
-/// What a test sends where nothing must come back: it could be a password.
-const SECRET: &str = "hunter2-secret";
+/// What a test sends where nothing must come back: it could be a password or a token. It is
+/// spelled as an identifier, as many tokens are, so that the shape of a name cannot be what
+/// keeps it out of an answer.
+const SECRET: &str = "sk_live_hunter2Secret";
+
+/// A query string read whole into a map, through a conversion whose error carelessly names, as
+/// a missing field, the first value the caller sent.
+#[derive(Debug, Deserialize, Validate)]
+#[serde(try_from = "BTreeMap<String, String>")]
+struct ValueEcho {}
+
+impl TryFrom<BTreeMap<String, String>> for ValueEcho {
+    type Error = String;
+
+    fn try_from(pairs: BTreeMap<String, String>) -> Result<Self, String> {
+        let first = pairs.into_values().next().unwrap_or_default();
+        Err(format!("missing field `{first}`"))
+    }
+}
+
+/// As `ValueEcho`, naming the first parameter's name instead of its value.
+#[derive(Debug, Deserialize, Serialize, Validate)]
+#[serde(try_from = "BTreeMap<String, String>")]
+struct NameEcho {}
+
+impl TryFrom<BTreeMap<String, String>> for NameEcho {
+    type Error = String;
+
+    fn try_from(pairs: BTreeMap<String, String>) -> Result<Self, String> {
+        let first = pairs.into_keys().next().unwrap_or_default();
+        Err(format!("missing field `{first}`"))
+    }
+}
+
+/// Read the query string, through a careless conversion that quotes a value.
+#[utoipa::path(
+    get,
+    path = "/echoes/values",
+    tag = "fixtures",
+    params(("a" = Option<String>, Query, description = "Anything")),
+    responses(
+        (status = 200, description = "Never sent", body = SuccessEnvelope<NoData>),
+        (status = 422, description = "A parameter failed validation", body = ErrorEnvelope),
+    ),
+)]
+async fn echo_values(ValidatedQuery(_pairs): ValidatedQuery<ValueEcho>) -> ApiResult<NoData> {
+    Ok(ApiSuccess::ok("Read", NoData))
+}
+
+/// Read the query string, through a careless conversion that quotes a name.
+#[utoipa::path(
+    get,
+    path = "/echoes/names",
+    tag = "fixtures",
+    params(("a" = Option<String>, Query, description = "Anything")),
+    responses(
+        (status = 200, description = "Never sent", body = SuccessEnvelope<NoData>),
+        (status = 422, description = "A parameter failed validation", body = ErrorEnvelope),
+    ),
+)]
+async fn echo_names(ValidatedQuery(_pairs): ValidatedQuery<NameEcho>) -> ApiResult<NoData> {
+    Ok(ApiSuccess::ok("Read", NoData))
+}
+
+/// A body with a member read through the careless conversion that quotes a name.
+#[derive(Debug, Deserialize, Serialize, Validate, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct Names {
+    #[garde(skip)]
+    #[schema(value_type = Option<Object>)]
+    names: Option<NameEcho>,
+}
+
+/// Read the body, through a careless conversion that quotes a name.
+#[utoipa::path(
+    post,
+    path = "/echoes/names",
+    tag = "fixtures",
+    request_body = Names,
+    responses(
+        (status = 200, description = "Never sent", body = SuccessEnvelope<Names>),
+        (status = 422, description = "A field failed validation", body = ErrorEnvelope),
+    ),
+)]
+async fn echo_names_in_a_body(ValidatedJson(names): ValidatedJson<Names>) -> ApiResult<Names> {
+    Ok(ApiSuccess::ok("Read", names))
+}
+
+/// A client of an app with the echo routes.
+fn echo_client() -> TestClient {
+    let codes = &[ApiError::VALIDATION_FAILED];
+    let routes = ApiRouter::new()
+        .route(routes!(echo_values), Access::public(), codes)
+        .route(
+            routes!(echo_names, echo_names_in_a_body),
+            Access::public(),
+            codes,
+        );
+    let app = HttpApp::builder(SERVICE, fixture_metrics())
+        .routes(routes)
+        .build()
+        .unwrap();
+    TestClient::new(&app)
+}
 
 /// A member every rule of the fixture accepts.
 fn member() -> Value {
@@ -153,7 +263,9 @@ async fn the_media_type_is_refused_before_the_body_is_read() {
 #[tokio::test]
 async fn a_body_that_is_not_json_is_malformed() {
     let member = member().to_string();
-    let deep = format!(r#"{{"extra": {}{}}}"#, "[".repeat(200), "]".repeat(200));
+    let nested = format!("{}{}", "[".repeat(200), "]".repeat(200));
+    let deep = format!(r#"{{"extra": {nested}}}"#);
+    let deep_beside_a_wrong_field = format!(r#"{{"email": 7, "extra": {nested}}}"#);
     for body in [
         Vec::new(),
         b" \r\n\t".to_vec(),
@@ -161,18 +273,85 @@ async fn a_body_that_is_not_json_is_malformed() {
         br#"{email: "ana@example.com"}"#.to_vec(),
         format!("{member} trailing").into_bytes(),
         format!("{member}{member}").into_bytes(),
-        // As strict as the typed read, even in a field the DTO does not have: no ill-formed
-        // UTF-8 in a value or a key, no lone surrogate, no nesting past serde_json's limit.
+        // Even in a field the DTO does not have: ill-formed UTF-8 in a value or a key, and,
+        // where a field is refused too, nesting past serde_json's limit.
         b"{\"text\": \"a\xffb\"}".to_vec(),
         b"{\"te\xffxt\": 1}".to_vec(),
-        br#"{"text": "\ud800"}"#.to_vec(),
         deep.into_bytes(),
+        deep_beside_a_wrong_field.into_bytes(),
     ] {
         let shown = String::from_utf8_lossy(&body).into_owned();
 
         let response = client().send(post_raw("application/json", body)).await;
 
         assert_eq!(response.status, 400, "{shown}");
+        assert_error(&response, 400, ApiError::MALFORMED_REQUEST);
+    }
+}
+
+#[tokio::test]
+async fn ill_formed_utf8_is_malformed_even_in_a_member_nobody_reads() {
+    // RFC 8259 §8.1: JSON text is UTF-8. The typed read skips a member the DTO does not have
+    // without looking at its bytes.
+    let member = member().to_string();
+    let open = member.strip_suffix('}').unwrap();
+    for extra in [&b"\"x\": \"a\xffb\""[..], b"\"x\": {\"k\xff\": 1}"] {
+        let mut body = format!("{open}, ").into_bytes();
+        body.extend_from_slice(extra);
+        body.push(b'}');
+
+        let response = client().send(post_raw("application/json", body)).await;
+
+        assert_error(&response, 400, ApiError::MALFORMED_REQUEST);
+    }
+}
+
+#[tokio::test]
+async fn what_the_grammar_allows_in_a_member_nobody_reads_is_accepted() {
+    let member = member().to_string();
+    let open = member.strip_suffix('}').unwrap();
+    let deep = format!("{}{}", "[".repeat(200), "]".repeat(200));
+    for extra in [r#""\ud800""#, "1e400", &deep] {
+        let body = format!(r#"{open}, "x": {extra}}}"#);
+
+        let response = client().send(post_raw("application/json", body)).await;
+
+        assert_eq!(response.status, 200, "{extra}");
+    }
+}
+
+#[tokio::test]
+async fn a_value_the_grammar_allows_and_a_field_cannot_hold_is_reported_at_that_field() {
+    let member = member().to_string();
+    for (from, to, field) in [
+        (
+            r#""email":"ana@example.com""#,
+            r#""email":"\ud800""#,
+            "email",
+        ),
+        (r#""zip":110111"#, r#""zip":1e400"#, "address.zip"),
+    ] {
+        assert!(member.contains(from), "{member}");
+        let body = member.replace(from, to);
+
+        let response = client().send(post_raw("application/json", body)).await;
+
+        assert_eq!(failed_fields(&response), [field], "{to}");
+        let messages = &response.json()["error"]["fields"][field];
+        assert_eq!(messages, &json!([IS_NOT_VALID]));
+    }
+}
+
+#[tokio::test]
+async fn a_missing_field_is_not_believed_beside_what_the_grammar_allows_and_no_tree_holds() {
+    let without_email = member_without("/email").to_string();
+    let open = without_email.strip_suffix('}').unwrap();
+    for extra in [r#""\ud800""#, "1e400"] {
+        let body = format!(r#"{open}, "x": {extra}}}"#);
+
+        let response = client().send(post_raw("application/json", body)).await;
+
+        // At the root, a field that cannot be named leaves nothing to answer for.
         assert_error(&response, 400, ApiError::MALFORMED_REQUEST);
     }
 }
@@ -283,6 +462,46 @@ async fn a_field_missing_from_an_element_of_an_array_is_reported_at_its_path() {
     assert_eq!(failed_fields(&response), ["addresses[1].zip"]);
     let messages = &response.json()["error"]["fields"]["addresses[1].zip"];
     assert_eq!(messages, &json!([IS_REQUIRED]));
+}
+
+#[tokio::test]
+async fn a_field_missing_from_a_variant_is_reported_under_the_variant() {
+    let body = json!({ "displayName": "Ana", "plan": { "monthly": {} } });
+
+    let response = client().send(post_profile(&body)).await;
+
+    assert_eq!(failed_fields(&response), ["plan.monthly.amount"]);
+    let messages = &response.json()["error"]["fields"]["plan.monthly.amount"];
+    assert_eq!(messages, &json!([IS_REQUIRED]));
+}
+
+#[tokio::test]
+async fn a_missing_field_named_after_a_value_that_was_sent_is_not_believed() {
+    for value in ["hunter2", "Password123", SECRET] {
+        let body = json!({ "displayName": "Ana", "lookup": { "a": value } });
+        let in_a_body = client().send(post_profile(&body)).await;
+        let path = format!("/api/v1/echoes/values?a={value}");
+        let in_a_query = echo_client().send(TestRequest::new("GET", &path)).await;
+
+        assert_eq!(failed_fields(&in_a_body), ["lookup"], "{value}");
+        let messages = &in_a_body.json()["error"]["fields"]["lookup"];
+        assert_eq!(messages, &json!([IS_NOT_VALID]));
+        // At the root of a query string, no field is left to answer for.
+        assert_error(&in_a_query, 400, ApiError::MALFORMED_REQUEST);
+        for response in [&in_a_body, &in_a_query] {
+            let sent = String::from_utf8_lossy(response.bytes()).into_owned();
+            assert!(!sent.contains(value), "{sent}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_missing_parameter_named_after_one_that_was_sent_is_not_believed() {
+    let response = echo_client()
+        .send(TestRequest::new("GET", "/api/v1/echoes/names?limit=5"))
+        .await;
+
+    assert_error(&response, 400, ApiError::MALFORMED_REQUEST);
 }
 
 #[tokio::test]
@@ -558,7 +777,7 @@ async fn no_answer_repeats_a_value_that_was_sent() {
             post_profile(&json!({ "displayName": "Ana", "kind": SECRET })),
             422,
         ),
-        // The object lacks a key of that name, but no field could be named so.
+        // A type of the DTO's own that names, as a missing field, a value that was sent.
         (
             post_profile(&json!({ "displayName": "Ana", "lookup": { "a": SECRET } })),
             422,
@@ -569,6 +788,29 @@ async fn no_answer_repeats_a_value_that_was_sent() {
         ),
     ] {
         let response = client().send(request).await;
+
+        let body = String::from_utf8_lossy(response.bytes()).into_owned();
+        assert_eq!(response.status, status, "{body}");
+        assert!(!body.contains(SECRET), "{body}");
+    }
+    // The same, through a type that quotes what it read, value or name, of a query string or
+    // of a body.
+    let names = json!({ "names": { SECRET: "x" } });
+    for (request, status) in [
+        (
+            TestRequest::new("GET", &format!("/api/v1/echoes/values?a={SECRET}")),
+            400,
+        ),
+        (
+            TestRequest::new("GET", &format!("/api/v1/echoes/names?{SECRET}=1")),
+            400,
+        ),
+        (
+            TestRequest::new("POST", "/api/v1/echoes/names").json(&names),
+            422,
+        ),
+    ] {
+        let response = echo_client().send(request).await;
 
         let body = String::from_utf8_lossy(response.bytes()).into_owned();
         assert_eq!(response.status, status, "{body}");

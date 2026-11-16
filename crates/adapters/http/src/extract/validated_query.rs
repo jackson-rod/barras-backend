@@ -38,12 +38,19 @@ where
         let pairs = serde_urlencoded::Deserializer::new(form_urlencoded::parse(query.as_bytes()));
         let value: T = serde_path_to_error::deserialize(pairs).map_err(|error| {
             // A query string is one flat object: a parameter is missing only at its root, and
-            // only when no pair has its name.
-            let lacks = |path: &Path, name: &str| {
+            // only when no pair has its name, or has it as its value, which a careless type
+            // could have quoted.
+            let bears_out = |path: &Path, name: &str| {
                 path.iter().len() == 0
-                    && !form_urlencoded::parse(query.as_bytes()).any(|(sent, _)| sent == name)
+                    && !form_urlencoded::parse(query.as_bytes())
+                        .any(|(key, value)| key == name || value == name)
             };
-            refused_value(error.path(), &error.inner().to_string(), UNREADABLE, lacks)
+            refused_value(
+                error.path(),
+                &error.inner().to_string(),
+                UNREADABLE,
+                bears_out,
+            )
         })?;
         value.validate().map_err(|report| broken_rules(&report))?;
         Ok(Self(value))

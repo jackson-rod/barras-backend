@@ -56,10 +56,12 @@ impl HealthProbe {
 
     /// One run of the check, timed, failed when it does not answer within the limit.
     fn timed_check(&self) -> impl Future<Output = (Duration, Result<(), String>)> + Send + 'static {
-        let check = (self.check)();
+        let check = Arc::clone(&self.check);
         async move {
             let started = Instant::now();
-            let outcome = timeout(PROBE_LIMIT, check).await.unwrap_or_else(|_| {
+            // Called inside the task that runs it, so that a check that panics as it is
+            // called fails alone, as one that panics later does.
+            let outcome = timeout(PROBE_LIMIT, check()).await.unwrap_or_else(|_| {
                 let limit = PROBE_LIMIT.as_secs();
                 Err(format!("did not answer within {limit} seconds"))
             });

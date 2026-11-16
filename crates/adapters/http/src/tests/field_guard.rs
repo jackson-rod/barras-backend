@@ -1,7 +1,7 @@
-//! The guard on the keys of a validation failure: on a 422 `VALIDATION_FAILED` to a JSON body,
-//! every key of `error.fields` names a member of the body that was sent, a parameter of the
-//! query string, or a field missing from an object of the body; otherwise the test that sent
-//! it fails, naming the key.
+//! The guard on the keys of a validation failure: on a 422 `VALIDATION_FAILED`, every name in a
+//! key of `error.fields` is camelCase, and, to a JSON body, every key names a member of the body
+//! that was sent, a parameter of the query string, or a field missing from an object of the
+//! body; otherwise the test that sent it fails, naming the key.
 
 use garde::Validate;
 use serde::Deserialize;
@@ -164,6 +164,34 @@ async fn a_missing_field_whose_parent_was_not_sent_fails_the_test() {
 }
 
 #[tokio::test]
+#[should_panic(expected = "display_name")]
+async fn a_rust_name_fails_the_test_even_for_a_field_that_was_not_sent() {
+    let request =
+        TestRequest::new("POST", "/api/v1/misnamed").json(&serde_json::json!({ "text": "Ana" }));
+
+    refusing_client().send(request).await;
+}
+
+#[tokio::test]
+#[should_panic(expected = "display_name")]
+async fn a_rust_name_fails_the_test_when_no_json_was_sent() {
+    refusing_client()
+        .send(TestRequest::new("POST", "/api/v1/misnamed"))
+        .await;
+}
+
+#[tokio::test]
+async fn a_key_that_names_a_parameter_passes_whatever_the_body() {
+    // The query is read first, and the body sent is no object a field could be missing from.
+    let body = serde_json::json!([]);
+    let request = TestRequest::new("POST", "/api/v1/notes?limit=abc").json(&body);
+
+    let response = refusing_client().send(request).await;
+
+    assert_eq!(response.status, 422);
+}
+
+#[tokio::test]
 async fn a_key_that_names_a_parameter_of_the_query_passes() {
     let body = serde_json::json!({ "text": "a" });
     let request = TestRequest::new("POST", "/api/v1/notes?limit=abc").json(&body);
@@ -194,7 +222,7 @@ async fn a_field_a_rule_reports_though_it_was_not_sent_passes() {
 #[tokio::test]
 async fn a_request_that_sent_no_json_is_not_held_to_a_body() {
     let response = refusing_client()
-        .send(TestRequest::new("POST", "/api/v1/misnamed").body("display_name"))
+        .send(TestRequest::new("POST", "/api/v1/refusing").body("tags"))
         .await;
 
     assert_eq!(response.status, 422);

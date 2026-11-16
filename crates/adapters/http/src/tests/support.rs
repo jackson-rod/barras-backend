@@ -250,7 +250,7 @@ async fn list_members(ValidatedQuery(listing): ValidatedQuery<Listing>) -> ApiRe
 
 /// A profile to create: fields whose Rust names are not their JSON names, and the shapes whose
 /// refusal could carry back what was sent: objects that refuse a field they do not name, types
-/// whose own errors quote what was sent, a tuple, two enums and a list of objects.
+/// whose own errors quote what was sent, a tuple, three enums and a list of objects.
 #[derive(Debug, Deserialize, Serialize, Validate, ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct NewProfile {
@@ -291,6 +291,16 @@ struct NewProfile {
     #[garde(dive)]
     #[serde(skip_serializing_if = "Option::is_none")]
     addresses: Option<Vec<Address>>,
+    #[garde(skip)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plan: Option<SavingPlan>,
+}
+
+/// How a member saves, externally tagged: an object whose one key is the variant.
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+enum SavingPlan {
+    Monthly { amount: u32 },
 }
 
 /// What a member does with money.
@@ -566,8 +576,18 @@ pub(super) async fn send_logged_json_at(
     request: TestRequest,
     level: Level,
 ) -> (TestResponse, Vec<Value>) {
+    logged_json(level, client.send(request)).await
+}
+
+/// What `future` gives, and each line logged meanwhile at `level` or above, parsed, as for
+/// `send_logged_json`. The subscriber is the default of this thread only, which on tokio's
+/// current-thread runtime is also where every task the test started runs.
+pub(super) async fn logged_json<T>(
+    level: Level,
+    future: impl Future<Output = T>,
+) -> (T, Vec<Value>) {
     let capture = Capture::default();
-    let response = {
+    let output = {
         let _default = tracing_subscriber::fmt()
             .json()
             .with_current_span(false)
@@ -576,12 +596,12 @@ pub(super) async fn send_logged_json_at(
             .with_writer(capture.clone())
             .finish()
             .set_default();
-        client.send(request).await
+        future.await
     };
     let lines = capture
         .text()
         .lines()
         .map(|line| serde_json::from_str(line).unwrap_or_else(|error| panic!("{error}: {line}")))
         .collect();
-    (response, lines)
+    (output, lines)
 }

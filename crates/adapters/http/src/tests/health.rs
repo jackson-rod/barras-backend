@@ -49,6 +49,11 @@ fn panicking(name: &'static str, criticality: Criticality) -> HealthProbe {
     HealthProbe::new(name, criticality, || async { panic!("probe-panic-secret") })
 }
 
+/// A check that panics as soon as it is called, before it has a future to give.
+fn panic_when_called() -> std::future::Ready<Result<(), String>> {
+    panic!("probe-panic-secret")
+}
+
 fn app_with(probes: Vec<HealthProbe>) -> HttpApp {
     let builder = HttpApp::builder(SERVICE, fixture_metrics());
     let builder = probes
@@ -126,7 +131,6 @@ async fn a_critical_probe_failing_is_service_unavailable() {
     let response = public_client(probes).get("/api/v1/health").await;
 
     assert_error(&response, 503, ApiError::SERVICE_UNAVAILABLE);
-    assert_eq!(response.json()["message"], "Service unavailable");
 }
 
 #[tokio::test]
@@ -207,6 +211,88 @@ async fn the_public_answers_never_name_a_probe_or_its_error() {
             }
         }
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_silent_probe_beside_one_that_answers_fails_alone_after_two_seconds() {
+    let probes = || {
+        vec![
+            silent("cache", Criticality::Optional),
+            up("database", Criticality::Critical),
+        ]
+    };
+    let started = Instant::now();
+
+    let public = public_client(probes()).get("/api/v1/health").await;
+    let internal = internal_client(probes()).get("/health").await;
+
+    assert_eq!(started.elapsed(), Duration::from_secs(4));
+    assert_eq!(public.status, 200);
+    assert_eq!(public.json()["data"], json!({ "status": "degraded" }));
+    let dependencies = internal.json()["dependencies"].clone();
+    assert_eq!(dependencies[0]["status"], "down");
+    assert_eq!(dependencies[0]["latencyMs"], 2000);
+    assert_eq!(dependencies[1]["status"], "up");
+    assert_eq!(dependencies[1]["latencyMs"], 0);
+}
+
+#[tokio::test]
+async fn a_check_that_panics_when_called_counts_as_failed_on_both_ports() {
+    for (criticality, status) in [(Criticality::Optional, 200), (Criticality::Critical, 503)] {
+        let app = app_with(vec![
+            HealthProbe::new("database", criticality, panic_when_called),
+            up("cache", Criticality::Optional),
+        ]);
+
+        let public = TestClient::new(&app).get("/api/v1/health").await;
+        let internal = TestClient::internal(app.internal()).get("/health").await;
+
+        if status == 200 {
+            assert_eq!(public.status, 200, "{}", text(&public));
+            assert_eq!(public.json()["data"], json!({ "status": "degraded" }));
+        } else {
+            assert_error(&public, 503, ApiError::SERVICE_UNAVAILABLE);
+        }
+        assert_eq!(internal.status, status, "{}", text(&internal));
+        let database = &internal.json()["dependencies"][0];
+        assert_eq!(database["status"], "down", "{criticality:?}");
+        assert_eq!(database["error"], "stopped without an answer");
+        assert_eq!(internal.json()["dependencies"][1]["status"], "up");
+    }
+}
+
+#[tokio::test]
+async fn a_degraded_service_warns_of_each_optional_dependency_down_and_why() {
+    let client = public_client(vec![
+        down("cache", Criticality::Optional, "connection refused"),
+        down("search", Criticality::Optional, "timed out"),
+        up("database", Criticality::Critical),
+    ]);
+    // tracing decides whether anyone listens to a call site when it is first reached, and
+    // while one subscriber alone is registered it asks only the reaching thread's: a test with
+    // none, reaching this warning first on another thread, could silence it here. Reached once
+    // before, it is decided again when this test's subscriber is registered.
+    client.get("/api/v1/health").await;
+
+    let (response, lines) =
+        send_logged_json(&client, TestRequest::new("GET", "/api/v1/health")).await;
+
+    assert_eq!(response.status, 200);
+    let warnings: Vec<&Value> = lines
+        .iter()
+        .filter(|line| line["level"] == "WARN")
+        .collect();
+    assert_eq!(warnings.len(), 1, "{lines:?}");
+    assert_eq!(warnings[0]["fields"]["message"], "service degraded");
+    assert_eq!(
+        warnings[0]["fields"]["detail"],
+        "optional dependencies are down: cache (connection refused), search (timed out)"
+    );
+    assert!(
+        warnings[0]["spans"][0]["request_id"].is_string(),
+        "{}",
+        warnings[0]
+    );
 }
 
 #[tokio::test]

@@ -8,8 +8,10 @@
 //! `has the wrong type` for any other; `is not one of the accepted values`; `has a field it
 //! does not accept`; `is not valid`. serde quotes the refused value in its messages, and the
 //! error of a DTO type's own `Deserialize` or `TryFrom` may say anything, including words that
-//! read as serde's. That error must still never quote its input, as the `Display` of a
-//! module's error must not, since a log or a later change could repeat it.
+//! read as serde's: a field it names missing becomes a key only when nothing the caller sent
+//! bears that name. That error must still never quote its input, as the `Display` of a
+//! module's error must not, since a log or a later change could repeat it. The same holds for
+//! the message of a garde `custom` rule, which reaches the client as it is.
 //!
 //! Every key of `error.fields` is a path of the names the caller wrote, and two rules of the
 //! DTOs keep it so:
@@ -90,20 +92,21 @@ fn broken_rules(report: &Report) -> ApiError {
 /// field to answer for, at the root, such as a key given twice, means the input as a whole
 /// cannot be read: 400 with `unreadable`.
 ///
-/// `lacks(path, name)` says whether what was sent holds, at `path`, an object without the key
-/// `name`.
+/// `bears_out(path, name)` says whether what was sent shows the field `name` missing from an
+/// object at `path`, with nothing the caller wrote that a careless type could have quoted as
+/// that name.
 fn refused_value(
     path: &Path,
     message: &str,
     unreadable: &'static str,
-    lacks: impl FnOnce(&Path, &str) -> bool,
+    bears_out: impl FnOnce(&Path, &str) -> bool,
 ) -> ApiError {
     let length = path.iter().len();
     let (field, text) = match missing_field(message) {
         // serde reports a missing field at its parent's path. A type of the DTO's own can write
         // the same words, so they are believed only when what was sent bears them out, and
         // the name, which then becomes a key, is one a field could have.
-        Some(name) if is_identifier(name) && lacks(path, name) => {
+        Some(name) if is_identifier(name) && bears_out(path, name) => {
             let field = match written(path, length) {
                 Some(parent) => format!("{parent}.{name}"),
                 None => name.to_owned(),

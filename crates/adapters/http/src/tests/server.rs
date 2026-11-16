@@ -1,6 +1,7 @@
 //! Serving on real sockets (spec §8.3): both listeners answer; once the shutdown future
 //! resolves, no new connection is taken and the requests in flight are answered before the
-//! server returns; a port already taken is an error that names the listener and the address.
+//! server returns, for ten seconds at most; a port already taken is an error that names the
+//! listener and the address.
 
 use std::error::Error;
 use std::io;
@@ -8,13 +9,15 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::net::TcpStream;
 use tokio::sync::{Notify, oneshot};
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout};
+use tracing::Level;
 
-use super::support::{SERVICE, fixture_metrics};
+use super::support::{SERVICE, fixture_metrics, logged_json};
+use crate::server::DRAIN_LIMIT;
 use crate::testing::fetch;
 use crate::{
     ApiError, Criticality, HealthProbe, HttpApp, InternalApp, Listener, bind, serve_api,
@@ -69,6 +72,39 @@ async fn finished<T>(task: JoinHandle<T>) -> T {
         panic!("still running five seconds on");
     };
     joined.unwrap()
+}
+
+/// A connection to `addr` that sends the start of a request head and never the rest, as a slow
+/// client does. hyper keeps the first request of a connection open until its head is whole, so
+/// only the deadline ends it. On a paused clock each sleep first polls the sockets, so the
+/// server has accepted the connection and read the bytes when this returns.
+async fn hold_a_partial_head(addr: SocketAddr, path: &str) -> TcpStream {
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let head = format!("GET {path} HTTP/1.1\r\nHost: barras\r\n");
+    stream.writable().await.unwrap();
+    assert_eq!(stream.try_write(head.as_bytes()).unwrap(), head.len());
+    for _ in 0..10 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    stream
+}
+
+/// What `server` returned once `stop` resolved its shutdown, how long that took, and the
+/// warnings logged meanwhile.
+async fn stopped_holding<E>(
+    stop: oneshot::Sender<()>,
+    server: JoinHandle<Result<(), E>>,
+) -> (Result<(), E>, Duration, Vec<Value>) {
+    let ((outcome, waited), lines) = logged_json(Level::WARN, async {
+        stop.send(()).unwrap();
+        let started = Instant::now();
+        let Ok(joined) = timeout(Duration::from_secs(60), server).await else {
+            panic!("still running a minute after the shutdown");
+        };
+        (joined.unwrap(), started.elapsed())
+    })
+    .await;
+    (outcome, waited, lines)
 }
 
 /// Waits until `addr` refuses new connections, as a server does once its shutdown began.
@@ -174,6 +210,50 @@ async fn after_the_shutdown_serve_internal_answers_the_request_in_flight_and_ret
     assert_eq!(response.status, 200);
     assert_eq!(response.json()["dependencies"][0]["status"], "up");
     assert!(finished(server).await.is_ok());
+}
+
+#[tokio::test(start_paused = true)]
+async fn after_the_shutdown_serve_api_waits_ten_seconds_at_most_for_the_requests_in_flight() {
+    let app = HttpApp::builder(SERVICE, fixture_metrics())
+        .build()
+        .unwrap();
+    let (public, public_addr) = listener("public").await;
+    let (internal, _) = listener("internal").await;
+    let (stop, stopped) = shutdown();
+    let server = tokio::spawn(serve_api(app, public, internal, stopped));
+    let _slow = hold_a_partial_head(public_addr, "/api/v1/health/live").await;
+
+    let (outcome, waited, lines) = stopped_holding(stop, server).await;
+
+    assert!(outcome.is_ok());
+    assert_eq!(DRAIN_LIMIT, Duration::from_secs(10));
+    assert_eq!(waited, DRAIN_LIMIT);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let fields = &lines[0]["fields"];
+    assert_eq!(lines[0]["level"], "WARN");
+    assert_eq!(
+        fields["message"],
+        "stopped waiting for the requests in flight"
+    );
+    assert_eq!(fields["listener"], "public");
+    assert_eq!(fields["waited_seconds"], 10);
+}
+
+#[tokio::test(start_paused = true)]
+async fn after_the_shutdown_serve_internal_waits_ten_seconds_at_most_for_the_requests_in_flight() {
+    let app = InternalApp::new(SERVICE, fixture_metrics(), vec![]);
+    let (internal, addr) = listener("internal").await;
+    let (stop, stopped) = shutdown();
+    let server = tokio::spawn(serve_internal(app, internal, stopped));
+    let _slow = hold_a_partial_head(addr, "/health").await;
+
+    let (outcome, waited, lines) = stopped_holding(stop, server).await;
+
+    assert!(outcome.is_ok());
+    assert_eq!(waited, DRAIN_LIMIT);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["fields"]["listener"], "internal");
+    assert_eq!(lines[0]["fields"]["waited_seconds"], 10);
 }
 
 #[tokio::test]

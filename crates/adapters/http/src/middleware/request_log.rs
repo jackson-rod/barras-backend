@@ -38,7 +38,8 @@ fn request_span(request: &Request<Body>) -> Span {
         .and_then(|id| id.header_value().to_str().ok());
     // At `error` level, so that no filter turns it off: under `LOG_LEVEL=warn` or `error` an
     // `info` span is disabled, and the `request failed` event of a failing request would lose
-    // its method, its path and its request id with it.
+    // its method, its path and its request id with it. A layer that reads the level of spans,
+    // such as an OpenTelemetry or a Sentry one, will see every request span as an error.
     tracing::error_span!(
         "request",
         method = method_label(request.method()),
