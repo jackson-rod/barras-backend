@@ -9,7 +9,9 @@ use axum::extract::Path;
 use axum::http::header::CONTENT_LENGTH;
 use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use serde::Serialize;
+use garde::Validate;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::util::SubscriberInitExt;
 use utoipa::ToSchema;
@@ -18,7 +20,7 @@ use utoipa_axum::routes;
 use crate::testing::{TestClient, TestRequest, TestResponse};
 use crate::{
     Access, ApiError, ApiResult, ApiRouter, ApiSuccess, ErrorEnvelope, FieldErrors, HttpApp,
-    NoData, ServiceInfo, SuccessEnvelope,
+    NoData, ServiceInfo, SuccessEnvelope, ValidatedJson, ValidatedQuery,
 };
 
 pub(super) const SERVICE: ServiceInfo = ServiceInfo {
@@ -144,6 +146,71 @@ async fn refused() -> ApiResult<NoData> {
     Err(ApiError::validation(fields))
 }
 
+/// A member to create: a body with every kind of field the extractor reports on, a nested
+/// object and an array included.
+#[derive(Debug, Deserialize, Serialize, Validate, ToSchema)]
+pub(super) struct NewMember {
+    #[garde(email)]
+    email: String,
+    #[garde(length(min = 3, max = 20), alphanumeric)]
+    username: String,
+    #[garde(dive)]
+    address: Address,
+    #[garde(inner(length(min = 1, max = 12)))]
+    tags: Vec<String>,
+}
+
+/// Where a member lives.
+#[derive(Debug, Deserialize, Serialize, Validate, ToSchema)]
+struct Address {
+    #[garde(length(min = 1, max = 80))]
+    street: String,
+    #[garde(range(min = 100_000, max = 999_999))]
+    zip: u32,
+}
+
+/// Create a member, answering it as the handler received it.
+#[utoipa::path(
+    post,
+    path = "/members",
+    tag = "fixtures",
+    request_body = NewMember,
+    responses(
+        (status = 200, description = "The member read", body = SuccessEnvelope<NewMember>),
+        (status = 422, description = "A field failed validation", body = ErrorEnvelope),
+    ),
+)]
+async fn create_member(ValidatedJson(member): ValidatedJson<NewMember>) -> ApiResult<NewMember> {
+    Ok(ApiSuccess::ok("Member read", member))
+}
+
+/// Which members to list, read from the query string.
+#[derive(Debug, Deserialize, Serialize, Validate, ToSchema)]
+struct Listing {
+    #[garde(range(min = 1, max = 50))]
+    limit: u32,
+    #[garde(length(min = 1, max = 12))]
+    name: Option<String>,
+}
+
+/// List members, answering the listing as the handler received it.
+#[utoipa::path(
+    get,
+    path = "/members",
+    tag = "fixtures",
+    params(
+        ("limit" = u32, Query, description = "How many members to list"),
+        ("name" = Option<String>, Query, description = "The name to look for"),
+    ),
+    responses(
+        (status = 200, description = "The listing read", body = SuccessEnvelope<Listing>),
+        (status = 422, description = "A parameter failed validation", body = ErrorEnvelope),
+    ),
+)]
+async fn list_members(ValidatedQuery(listing): ValidatedQuery<Listing>) -> ApiResult<Listing> {
+    Ok(ApiSuccess::ok("Listing read", listing))
+}
+
 pub(super) fn fixture_routes() -> ApiRouter {
     ApiRouter::new()
         .route(routes!(small), Access::public(), &[])
@@ -153,6 +220,11 @@ pub(super) fn fixture_routes() -> ApiRouter {
         .route(routes!(bare), Access::public(), &[])
         .route(
             routes!(refused),
+            Access::public(),
+            &[ApiError::VALIDATION_FAILED],
+        )
+        .route(
+            routes!(list_members, create_member),
             Access::public(),
             &[ApiError::VALIDATION_FAILED],
         )
@@ -167,6 +239,19 @@ pub(super) fn fixture_app() -> HttpApp {
 
 pub(super) fn client() -> TestClient {
     TestClient::new(&fixture_app())
+}
+
+/// An error envelope with `status` as its status and its top-level code, and `code` as
+/// `error.code`.
+pub(super) fn assert_error(response: &TestResponse, status: u16, code: &str) {
+    let text = String::from_utf8_lossy(response.bytes()).into_owned();
+    assert_eq!(response.status, status, "{text}");
+    assert_eq!(response.header("content-type"), Some("application/json"));
+    let body: Value = response.json();
+    assert_eq!(body["success"], false, "{text}");
+    assert_eq!(body["data"], Value::Null, "{text}");
+    assert_eq!(body["code"], status, "{text}");
+    assert_eq!(response.error_code().as_deref(), Some(code), "{text}");
 }
 
 /// Keeps what a subscriber writes, for the test that holds a clone.

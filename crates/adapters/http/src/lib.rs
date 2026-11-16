@@ -3,6 +3,7 @@
 mod app;
 mod envelope;
 mod error;
+mod extract;
 mod middleware;
 mod openapi;
 mod router;
@@ -14,6 +15,7 @@ mod tests;
 pub use app::{BuildError, HttpApp, HttpAppBuilder, ServiceInfo};
 pub use envelope::{ApiResult, ApiSuccess, ErrorDetail, ErrorEnvelope, NoData, SuccessEnvelope};
 pub use error::{ApiError, FieldErrors};
+pub use extract::{ValidatedJson, ValidatedQuery};
 pub use middleware::MatchedRoute;
 pub use openapi::{COMMON_ERROR_CODES, canonical_json, metadata_problems};
 pub use router::{Access, ApiRouter};

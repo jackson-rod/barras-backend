@@ -19,12 +19,16 @@ publish = false
 axum = { version = "0.8.9", default-features = false }
 barras-kernel = { path = "crates/kernel" }
 cargo_metadata = "0.23.1"
+form_urlencoded = { version = "1.2.2", default-features = false }
+garde = { version = "0.23.0", default-features = false }
 http-body-util = "0.1.5"
 proc-macro2 = { version = "1.0.107", default-features = false }
 regex = "1.13.1"
 rust_decimal = { version = "1.43.0", default-features = false }
 serde = "1.0.229"
 serde_json = "1.0.154"
+serde_path_to_error = "0.1.20"
+serde_urlencoded = "0.7.1"
 syn = { version = "3.0.10", default-features = false }
 thiserror = "2.0.21"
 tempfile = "3.27.0"

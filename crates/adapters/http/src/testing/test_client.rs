@@ -78,6 +78,7 @@ pub struct TestRequest {
     path: String,
     headers: HeaderMap,
     body: Bytes,
+    streamed: bool,
 }
 
 impl TestRequest {
@@ -88,6 +89,7 @@ impl TestRequest {
             path: path.to_owned(),
             headers: HeaderMap::new(),
             body: Bytes::new(),
+            streamed: false,
         }
     }
 
@@ -112,11 +114,25 @@ impl TestRequest {
         self
     }
 
+    /// Sends the body as a stream whose length is not known before it ends, as a client that
+    /// streams its body does, rather than as a body of known length.
+    pub fn streamed(mut self) -> Self {
+        self.streamed = true;
+        self
+    }
+
     fn into_http(self) -> Request<Body> {
+        let body = Body::from(self.body);
+        let body = if self.streamed {
+            // A stream tells nothing of its length, so no layer below can know it in advance.
+            Body::from_stream(body.into_data_stream())
+        } else {
+            body
+        };
         let mut request = Request::builder()
             .method(self.method)
             .uri(self.path)
-            .body(Body::from(self.body))
+            .body(body)
             .unwrap();
         *request.headers_mut() = self.headers;
         request

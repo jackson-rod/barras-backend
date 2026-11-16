@@ -1,29 +1,16 @@
 //! The stack every public answer goes through (spec §6.1 to §6.4): the two fallbacks, the
 //! panic handler, the safety net, the request id, compression and the body limit.
 
-use serde_json::{Value, json};
+use serde_json::json;
 use uuid::Uuid;
 
 use super::support::{
-    BARE_TEXT, KEPT_HEADER, PANIC_TEXT, SERVICE, client, fixture_app, send_logged,
+    BARE_TEXT, KEPT_HEADER, PANIC_TEXT, SERVICE, assert_error, client, fixture_app, send_logged,
 };
 use crate::testing::{TestRequest, TestResponse};
 use crate::{ApiError, COMMON_ERROR_CODES, MatchedRoute, canonical_json};
 
 const MIB: usize = 1024 * 1024;
-
-/// An error envelope with `status` as its status and its top-level code, and `code` as
-/// `error.code`.
-fn assert_error(response: &TestResponse, status: u16, code: &str) {
-    let text = String::from_utf8_lossy(response.bytes()).into_owned();
-    assert_eq!(response.status, status, "{text}");
-    assert_eq!(response.header("content-type"), Some("application/json"));
-    let body = response.json();
-    assert_eq!(body["success"], false, "{text}");
-    assert_eq!(body["data"], Value::Null, "{text}");
-    assert_eq!(body["code"], status, "{text}");
-    assert_eq!(response.error_code().as_deref(), Some(code), "{text}");
-}
 
 fn request_id(response: &TestResponse) -> &str {
     response.header("x-request-id").unwrap()
@@ -405,6 +392,7 @@ fn the_document_is_the_base_with_every_route_under_the_prefix() {
             "/api/v1/bare/{status}",
             "/api/v1/big",
             "/api/v1/length",
+            "/api/v1/members",
             "/api/v1/panic/{payload}",
             "/api/v1/refused",
             "/api/v1/small",

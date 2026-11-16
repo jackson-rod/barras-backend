@@ -8,8 +8,12 @@ publish.workspace = true
 [dependencies]
 axum = { workspace = true, features = ["matched-path"] }
 barras-kernel.workspace = true
+form_urlencoded = { workspace = true, features = ["alloc"] }
+garde.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+serde_path_to_error.workspace = true
+serde_urlencoded.workspace = true
 tower = { workspace = true, features = ["util"] }
 tower-http = { workspace = true, features = ["catch-panic", "compression-br", "compression-gzip", "request-id"] }
 tracing.workspace = true
@@ -22,6 +26,8 @@ uuid = { workspace = true, features = ["v7"] }
 testing = []
 
 [dev-dependencies]
+# The fixtures derive their rules; the extractors need only the trait.
+garde = { workspace = true, features = ["derive", "email"] }
 http-body-util.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
 tracing-subscriber = { workspace = true, features = ["fmt"] }
