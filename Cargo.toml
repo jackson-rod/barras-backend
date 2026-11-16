@@ -30,6 +30,8 @@ thiserror = "2.0.21"
 tempfile = "3.27.0"
 time = "0.3.55"
 tokio = "1.54.1"
+tower = { version = "0.5.3", default-features = false }
+tower-http = { version = "0.7.1", default-features = false }
 tracing = { version = "0.1.44", default-features = false }
 tracing-subscriber = { version = "0.3.23", default-features = false }
 utoipa = { version = "6.0.0", default-features = false }

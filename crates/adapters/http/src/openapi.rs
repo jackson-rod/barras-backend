@@ -117,7 +117,6 @@ fn body_component<'a>(document: &'a OpenApi, response: &'a RefOr<Response>) -> O
 
 /// The root of the public document. Its `info` is written here, so that nothing comes from
 /// a crate's metadata (utoipa would write an empty licence for a crate that has none).
-#[allow(dead_code)] // the app builder roots the public document on it; until then only tests call it
 pub(crate) fn document_base() -> OpenApi {
     let info = Info::new("Barras API", env!("CARGO_PKG_VERSION"));
     let mut document = OpenApi::new(info, Paths::new());

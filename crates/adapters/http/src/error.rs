@@ -136,6 +136,22 @@ impl ApiError {
         )
     }
 
+    /// The answer to an error a library layer gave without saying more than its status, at
+    /// that status: `MALFORMED_REQUEST` for a 4xx, and for a 5xx `INTERNAL_ERROR`, whose
+    /// detail goes to the log.
+    pub(crate) fn unexplained(status: StatusCode) -> Self {
+        if status.is_server_error() {
+            let detail = format!("a layer answered {status} without an envelope");
+            Self::server(status, Self::INTERNAL_ERROR, detail)
+        } else {
+            Self::client(
+                status,
+                Self::MALFORMED_REQUEST,
+                "Request could not be handled",
+            )
+        }
+    }
+
     /// The HTTP status, which is also the top-level `code` of the envelope.
     pub fn status(&self) -> StatusCode {
         self.status
@@ -709,6 +725,41 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[tokio::test]
+    async fn an_unexplained_client_status_is_a_malformed_request_at_that_status() {
+        for status in [StatusCode::BAD_REQUEST, StatusCode::IM_A_TEAPOT] {
+            let (response, lines) = respond_logged(|| ApiError::unexplained(status));
+
+            let (answered, _, body) = read(response).await;
+            assert_eq!(answered, status);
+            assert_eq!(body["code"], status.as_u16());
+            assert_eq!(body["error"], json!({ "code": "MALFORMED_REQUEST" }));
+            assert!(lines.is_empty(), "{lines:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unexplained_server_status_is_an_internal_error_at_that_status_and_logged() {
+        for (status, message) in [
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error"),
+            (StatusCode::SERVICE_UNAVAILABLE, "Service unavailable"),
+        ] {
+            let (response, lines) = respond_logged(|| ApiError::unexplained(status));
+
+            let (answered, _, body) = read(response).await;
+            assert_eq!(answered, status);
+            assert_eq!(body["code"], status.as_u16());
+            assert_eq!(body["message"], message);
+            assert_eq!(body["error"], json!({ "code": "INTERNAL_ERROR" }));
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            let expected = format!(
+                "ERROR request failed code=\"INTERNAL_ERROR\" status={}",
+                status.as_u16()
+            );
+            assert!(lines[0].starts_with(&expected), "{lines:?}");
+        }
     }
 
     #[test]
