@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
 use axum::extract::Path;
-use axum::http::header::CONTENT_LENGTH;
+use axum::http::header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, LAST_MODIFIED};
 use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use garde::Validate;
@@ -36,6 +36,9 @@ pub(super) const BARE_TEXT: &str = "bare-secret from a library layer";
 
 /// A header the bare route sets, which the safety net keeps.
 pub(super) const KEPT_HEADER: &str = "x-fixture";
+
+/// How many bytes the content route answers: over the size from which a body is compressed.
+pub(super) const CONTENT_SIZE: usize = 2048;
 
 /// What the small route answers: far under the size from which a body is compressed.
 #[derive(Serialize, ToSchema)]
@@ -112,7 +115,8 @@ async fn length(body: Bytes) -> ApiResult<Length> {
     Ok(ApiSuccess::ok("Body measured", length))
 }
 
-/// Answer the status asked for as a library layer does: plain text, with a length.
+/// Answer the status asked for as a library layer does: plain text, with a length, a range,
+/// and the validators of a cache.
 #[utoipa::path(
     get,
     path = "/bare/{status}",
@@ -127,8 +131,38 @@ async fn bare(Path(status): Path<u16>) -> Response {
             HeaderValue::from_static("kept"),
         ),
         (CONTENT_LENGTH, HeaderValue::from(BARE_TEXT.len())),
+        (CONTENT_RANGE, HeaderValue::from_static("bytes 0-31/32")),
+        (ETAG, HeaderValue::from_static("\"bare\"")),
+        (
+            LAST_MODIFIED,
+            HeaderValue::from_static("Mon, 16 Nov 2026 00:00:00 GMT"),
+        ),
     ];
     (StatusCode::from_u16(status).unwrap(), headers, BARE_TEXT).into_response()
+}
+
+/// Answer the status asked for with `CONTENT_SIZE` bytes of the kind of content asked for, as
+/// a library layer does: `image` (PNG), `grpc`, `sse` (an event stream) or `text`.
+#[utoipa::path(
+    get,
+    path = "/content/{status}/{kind}",
+    tag = "fixtures",
+    params(
+        ("status" = u16, Path, description = "The status to answer"),
+        ("kind" = String, Path, description = "The kind of content"),
+    ),
+    responses((status = 200, description = "Content of that kind", body = SuccessEnvelope<NoData>)),
+)]
+async fn content(Path((status, kind)): Path<(u16, String)>) -> Response {
+    let content_type = match kind.as_str() {
+        "image" => "image/png",
+        "grpc" => "application/grpc",
+        "sse" => "text/event-stream",
+        _ => "text/plain",
+    };
+    let status = StatusCode::from_u16(status).unwrap();
+    let headers = [(CONTENT_TYPE, HeaderValue::from_static(content_type))];
+    (status, headers, vec![b'a'; CONTENT_SIZE]).into_response()
 }
 
 /// Refuse, with an error envelope of the app's own.
@@ -218,6 +252,7 @@ pub(super) fn fixture_routes() -> ApiRouter {
         .route(routes!(explode), Access::public(), &[])
         .route(routes!(length), Access::public(), &[])
         .route(routes!(bare), Access::public(), &[])
+        .route(routes!(content), Access::public(), &[])
         .route(
             routes!(refused),
             Access::public(),

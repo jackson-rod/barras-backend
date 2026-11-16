@@ -3,11 +3,25 @@
 
 use axum::BoxError;
 use axum::body::{Body, Bytes, HttpBody};
-use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
-use axum::http::{HeaderMap, Response, StatusCode};
+use axum::http::header::{
+    CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, LAST_MODIFIED,
+};
+use axum::http::{HeaderMap, HeaderName, Response, StatusCode};
 use axum::response::IntoResponse;
 
 use crate::error::ApiError;
+
+/// The headers that describe the body a layer sent, so none of them is true of the envelope
+/// sent in its place: a client would read the envelope as compressed, as a range, or as the
+/// version of a resource a cache holds.
+const BODY_HEADERS: [HeaderName; 6] = [
+    CONTENT_TYPE,
+    CONTENT_LENGTH,
+    CONTENT_ENCODING,
+    CONTENT_RANGE,
+    ETAG,
+    LAST_MODIFIED,
+];
 
 /// Generic over the body, because it receives the body of the layer below it, not axum's.
 pub(crate) async fn envelope_safety_net<B>(response: Response<B>) -> Response<Body>
@@ -27,8 +41,9 @@ where
     let (mut parts, _unsent) = response.into_parts();
     let (envelope, body) = replacement(status).into_response().into_parts();
     parts.status = envelope.status;
-    parts.headers.remove(CONTENT_TYPE);
-    parts.headers.remove(CONTENT_LENGTH);
+    for name in &BODY_HEADERS {
+        parts.headers.remove(name);
+    }
     for (name, value) in &envelope.headers {
         parts.headers.insert(name, value.clone());
     }

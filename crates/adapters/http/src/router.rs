@@ -4,13 +4,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use barras_kernel::Feature;
-use utoipa::openapi::RefOr;
 use utoipa::openapi::extensions::ExtensionsBuilder;
 use utoipa::openapi::path::Paths;
 use utoipa::openapi::schema::Schema;
+use utoipa::openapi::{OpenApi, RefOr};
 use utoipa_axum::router::{OpenApiRouter, UtoipaMethodRouter};
 
-use crate::openapi::{X_ERROR_CODES, X_PERMISSION, X_PLAN_FEATURE, operations_mut, operations_of};
+use crate::openapi::{
+    X_ERROR_CODES, X_PERMISSION, X_PLAN_FEATURE, operations, operations_mut, operations_of,
+};
 
 /// What a route needs from the caller: a permission and a plan feature, each optional. The
 /// document states them from this value, and the guard that will enforce them reads the same
@@ -76,9 +78,10 @@ impl<S: Clone + Send + Sync + 'static> ApiRouter<S> {
     ///
     /// A route the document cannot describe is not added; a problem is recorded instead. That
     /// is a route that names other than exactly one path (utoipa-axum serves each handler of a
-    /// `routes!` call on every path the call names), whose path documents no operation, or
-    /// that brings a schema under a name already registered with another shape (one of the two
-    /// would document the routes of the other).
+    /// `routes!` call on every path the call names), whose path documents no operation, that
+    /// brings a schema under a name already registered with another shape (one of the two
+    /// would document the routes of the other), or that brings a method its path already has
+    /// here (axum would panic).
     pub fn route(
         mut self,
         route: UtoipaMethodRouter<S>,
@@ -86,7 +89,7 @@ impl<S: Clone + Send + Sync + 'static> ApiRouter<S> {
         error_codes: &'static [&'static str],
     ) -> Self {
         let (schemas, mut paths, method_router) = route;
-        let problems = route_problems(&paths, &schemas, registered_schemas(&self.router));
+        let problems = route_problems(&paths, &schemas, self.router.get_openapi());
         if !problems.is_empty() {
             self.problems.extend(problems);
             return self;
@@ -110,12 +113,13 @@ impl<S: Clone + Send + Sync + 'static> ApiRouter<S> {
     }
 
     /// Adds every route of `other`, with its documentation and its problems. A schema name the
-    /// two hold with different shapes is a problem. A method and path both routers serve makes
-    /// axum panic, as it does for any two routes that overlap.
+    /// two hold with different shapes is a problem. So is each method and path both document:
+    /// axum would panic, so `other` is then not merged at all. Two templates that differ only
+    /// in the names of their parameters still make axum panic.
     pub fn merge(mut self, other: Self) -> Self {
-        let ours = registered_schemas(&self.router);
-        for (name, schema) in registered_schemas(&other.router).into_iter().flatten() {
-            if ours
+        let (ours, theirs) = (self.router.get_openapi(), other.router.get_openapi());
+        for (name, schema) in schemas_of(theirs).into_iter().flatten() {
+            if schemas_of(ours)
                 .and_then(|ours| ours.get(name))
                 .is_some_and(|ours| ours != schema)
             {
@@ -123,8 +127,16 @@ impl<S: Clone + Send + Sync + 'static> ApiRouter<S> {
                 self.problems.push(problem);
             }
         }
+        let in_both: Vec<String> = documented(ours)
+            .intersection(&documented(theirs))
+            .map(|(path, method)| format!("the merged routers both have {method} {path}"))
+            .collect();
+        let mergeable = in_both.is_empty();
+        self.problems.extend(in_both);
         self.problems.extend(other.problems);
-        self.router = self.router.merge(other.router);
+        if mergeable {
+            self.router = self.router.merge(other.router);
+        }
         self
     }
 
@@ -143,19 +155,25 @@ impl<S: Clone + Send + Sync + 'static> Default for ApiRouter<S> {
     }
 }
 
-fn registered_schemas<S: Clone + Send + Sync + 'static>(
-    router: &OpenApiRouter<S>,
-) -> Option<&Schemas> {
-    let components = router.get_openapi().components.as_ref()?;
+fn schemas_of(document: &OpenApi) -> Option<&Schemas> {
+    let components = document.components.as_ref()?;
     Some(&components.schemas)
 }
 
+/// Each path and method `document` has an operation for.
+fn documented(document: &OpenApi) -> BTreeSet<(&str, &str)> {
+    operations(document)
+        .into_iter()
+        .map(|(path, method, _)| (path, method))
+        .collect()
+}
+
 /// Why the document cannot describe the route of `paths` and `schemas`, one line each, given
-/// the schemas already `registered`.
+/// the document of the routes already `registered`.
 fn route_problems(
     paths: &Paths,
     schemas: &[(String, RefOr<Schema>)],
-    registered: Option<&Schemas>,
+    registered: &OpenApi,
 ) -> Vec<String> {
     let named: Vec<&str> = paths.paths.keys().map(String::as_str).collect();
     let mut problems = Vec::new();
@@ -176,10 +194,17 @@ fn route_problems(
             many.join(" and ")
         )),
     }
+    let taken = documented(registered);
+    for (path, item) in &paths.paths {
+        let again = operations_of(item).filter(|(method, _)| taken.contains(&(path, method)));
+        problems.extend(again.map(|(method, _)| {
+            format!("the route at {path} brings {method}, which another route already has")
+        }));
+    }
     let mut brought: BTreeMap<&str, &RefOr<Schema>> = BTreeMap::new();
     let mut clashes = BTreeSet::new();
     for (name, schema) in schemas {
-        let earlier = registered
+        let earlier = schemas_of(registered)
             .and_then(|registered| registered.get(name))
             .or_else(|| brought.get(name.as_str()).copied());
         if earlier.is_some_and(|earlier| earlier != schema) {
@@ -684,6 +709,45 @@ mod tests {
                 "the merged routers hold two schemas named Fixture",
                 "the merged routers hold two schemas named SuccessEnvelope_Fixture",
             ]
+        );
+    }
+
+    /// `GET /fixtures`, then `PUT /fixtures`, then `GET /fixtures` again.
+    fn get_put_get() -> ApiRouter {
+        ApiRouter::new()
+            .route(routes!(read_fixture), Access::public(), &[])
+            .route(routes!(replace_fixture), Access::public(), &[])
+            .route(routes!(read_fixture), Access::public(), &[])
+    }
+
+    #[tokio::test]
+    async fn a_method_its_path_already_has_is_a_problem_and_another_method_is_not() {
+        let router = get_put_get();
+
+        assert_eq!(
+            router.problems,
+            ["the route at /fixtures brings GET, which another route already has"]
+        );
+        for method in ["GET", "PUT"] {
+            assert_eq!(status_of(get_put_get(), method, "/fixtures").await, 200);
+        }
+    }
+
+    #[test]
+    fn routers_merged_with_a_method_and_path_in_common_are_a_problem() {
+        let fixtures: ApiRouter =
+            ApiRouter::new().route(routes!(read_fixture), Access::public(), &[]);
+        let both: ApiRouter = ApiRouter::new().route(
+            routes!(read_fixture, replace_fixture),
+            Access::public(),
+            &[],
+        );
+
+        let merged = fixtures.merge(both);
+
+        assert_eq!(
+            merged.problems,
+            ["the merged routers both have GET /fixtures"]
         );
     }
 

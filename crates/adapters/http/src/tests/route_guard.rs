@@ -59,6 +59,28 @@ fn an_app_with_a_route_the_document_cannot_describe_is_not_built() {
     );
 }
 
+#[test]
+fn an_app_given_a_method_and_path_twice_is_not_built() {
+    let item = PathItem::new(HttpMethod::Get, Operation::new());
+    let mut paths = Paths::new();
+    paths.paths.insert("/small".to_owned(), item);
+    let again: UtoipaMethodRouter = (Vec::new(), paths, get(hidden));
+    let routes = ApiRouter::new().route(again, Access::public(), &[]);
+
+    let built = HttpApp::builder(SERVICE)
+        .routes(fixture_routes())
+        .routes(routes)
+        .build();
+
+    let Err(error) = built else {
+        panic!("an app given GET /small twice was built");
+    };
+    assert_eq!(
+        error.problems(),
+        ["the merged routers both have GET /small"]
+    );
+}
+
 #[tokio::test]
 #[should_panic(expected = "GET /api/v1/hidden")]
 async fn a_route_the_document_lacks_fails_the_test_that_reaches_it() {

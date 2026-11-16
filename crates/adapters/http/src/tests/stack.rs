@@ -5,7 +5,8 @@ use serde_json::json;
 use uuid::Uuid;
 
 use super::support::{
-    BARE_TEXT, KEPT_HEADER, PANIC_TEXT, SERVICE, assert_error, client, fixture_app, send_logged,
+    BARE_TEXT, CONTENT_SIZE, KEPT_HEADER, PANIC_TEXT, SERVICE, assert_error, client, fixture_app,
+    send_logged,
 };
 use crate::testing::{TestRequest, TestResponse};
 use crate::{ApiError, COMMON_ERROR_CODES, MatchedRoute, canonical_json};
@@ -133,6 +134,33 @@ async fn the_safety_net_keeps_the_headers_but_the_type_and_the_length() {
     assert_eq!(response.header("content-type"), Some("application/json"));
     let length = response.bytes().len().to_string();
     assert_eq!(response.header("content-length"), Some(length.as_str()));
+}
+
+#[tokio::test]
+async fn the_safety_net_drops_the_range_and_the_validators_of_the_body_it_replaces() {
+    let response = client().get("/api/v1/bare/400").await;
+
+    assert_error(&response, 400, ApiError::MALFORMED_REQUEST);
+    for name in ["content-range", "etag", "last-modified"] {
+        assert_eq!(response.header(name), None, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn a_replaced_body_that_was_compressed_comes_back_as_a_plain_envelope() {
+    // The same content with a success status is compressed, so the 4xx is compressed too
+    // before the safety net replaces it.
+    let success = client()
+        .send(get("/api/v1/content/200/text").header("accept-encoding", "gzip"))
+        .await;
+    assert_eq!(success.header("content-encoding"), Some("gzip"));
+
+    let response = client()
+        .send(get("/api/v1/content/400/text").header("accept-encoding", "gzip"))
+        .await;
+
+    assert_error(&response, 400, ApiError::MALFORMED_REQUEST);
+    assert_eq!(response.header("content-encoding"), None);
 }
 
 #[tokio::test]
@@ -294,6 +322,26 @@ async fn a_big_body_is_brotli_when_the_client_accepts_br() {
 }
 
 #[tokio::test]
+async fn images_grpc_and_event_streams_are_sent_as_they_are() {
+    for (kind, encoding) in [
+        ("text", Some("gzip")),
+        ("image", None),
+        ("grpc", None),
+        ("sse", None),
+    ] {
+        let request = get(&format!("/api/v1/content/200/{kind}")).header("accept-encoding", "gzip");
+
+        let response = client().send(request).await;
+
+        assert_eq!(response.status, 200, "{kind}");
+        assert_eq!(response.header("content-encoding"), encoding, "{kind}");
+        if encoding.is_none() {
+            assert_eq!(response.bytes().len(), CONTENT_SIZE, "{kind}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn a_body_under_one_kib_is_sent_as_it_is() {
     let response = client()
         .send(get("/api/v1/small").header("accept-encoding", "gzip, br"))
@@ -391,6 +439,7 @@ fn the_document_is_the_base_with_every_route_under_the_prefix() {
         [
             "/api/v1/bare/{status}",
             "/api/v1/big",
+            "/api/v1/content/{status}/{kind}",
             "/api/v1/length",
             "/api/v1/members",
             "/api/v1/panic/{payload}",
