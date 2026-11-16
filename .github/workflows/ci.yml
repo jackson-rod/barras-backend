@@ -54,19 +54,40 @@ jobs:
         env:
           BASE_REF: ${{ github.base_ref }}
         run: cargo xtask check-commits "origin/$BASE_REF..HEAD"
+      # The code steps run even when a step above failed, so a branch name or a
+      # commit message to fix never hides what they find.
+      #
+      # Before anything compiles the workspace: cargo xtask builds only xtask, and
+      # cargo metadata runs no build script, so no build script of the change can
+      # rewrite what these two read before they read it.
+      - name: Architecture and structure
+        if: ${{ !cancelled() }}
+        run: just check-arch check-structure
+      - name: Format, lint, deny and the OpenAPI document
+        if: ${{ !cancelled() }}
+        run: just fmt-check lint deny openapi-check
       # A squash merge makes the title the subject of the commit on develop and may
       # take the description as its body. Both are written by whoever opens the pull
-      # request, so they reach the shell only through env.
+      # request, so they reach the shell only through env. Last, so the code steps
+      # report whatever the title says; it runs when they fail, too.
       - name: Check the pull request title and description
-        if: github.event_name == 'pull_request'
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
           printf '%s\n\n%s\n' "$PR_TITLE" "$PR_BODY" > "$RUNNER_TEMP/pull-request.txt"
           cargo xtask check-pr "$RUNNER_TEMP/pull-request.txt"
-      - name: Format, lint, deny, architecture and structure
-        run: just fmt-check lint deny check-arch check-structure
+      # A build script or a check that rewrites a tracked file, or writes one git
+      # does not ignore, would change the code the steps above judged.
+      - name: Check that the tree is unchanged
+        if: ${{ !cancelled() }}
+        run: |
+          changes="$(git status --porcelain --untracked-files=all)"
+          if [ -n "$changes" ]; then
+            printf 'The steps above changed the tree:\n%s\n' "$changes"
+            exit 1
+          fi
 
   test:
     runs-on: ubuntu-latest
@@ -75,6 +96,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      # llvm-tools, which cargo-llvm-cov needs, is a component in rust-toolchain.toml.
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           cache: false
@@ -83,8 +105,20 @@ jobs:
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
-          tool: just@1.59.0,cargo-nextest@0.9.152
-      - run: just test
+          tool: just@1.59.0,cargo-nextest@0.9.152,cargo-llvm-cov@0.9.1
+      # Every test once under coverage, then the thresholds; the doctests apart,
+      # because cargo-llvm-cov cannot measure them on stable.
+      - run: just test-cov test-doc
+      # A build script or a test that rewrites a tracked file, or writes one git
+      # does not ignore, would change the code the tests ran against.
+      - name: Check that the tree is unchanged
+        if: ${{ !cancelled() }}
+        run: |
+          changes="$(git status --porcelain --untracked-files=all)"
+          if [ -n "$changes" ]; then
+            printf 'The steps above changed the tree:\n%s\n' "$changes"
+            exit 1
+          fi
 
   build:
     runs-on: ubuntu-latest
@@ -103,3 +137,13 @@ jobs:
         with:
           tool: just@1.59.0
       - run: just build
+      # A build script that rewrites a tracked file, or writes one git does not
+      # ignore, would change the code the release was built from.
+      - name: Check that the tree is unchanged
+        if: ${{ !cancelled() }}
+        run: |
+          changes="$(git status --porcelain --untracked-files=all)"
+          if [ -n "$changes" ]; then
+            printf 'The steps above changed the tree:\n%s\n' "$changes"
+            exit 1
+          fi
