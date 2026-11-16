@@ -16,7 +16,10 @@ rust-version = "1.100"
 publish = false
 
 [workspace.dependencies]
+axum = { version = "0.8.9", default-features = false }
+barras-kernel = { path = "crates/kernel" }
 cargo_metadata = "0.23.1"
+http-body-util = "0.1.5"
 proc-macro2 = { version = "1.0.107", default-features = false }
 regex = "1.13.1"
 rust_decimal = { version = "1.43.0", default-features = false }
@@ -29,6 +32,7 @@ time = "0.3.55"
 tokio = "1.54.1"
 tracing = { version = "0.1.44", default-features = false }
 tracing-subscriber = { version = "0.3.23", default-features = false }
+utoipa = { version = "6.0.0", default-features = false }
 uuid = "1.29.2"
 
 [workspace.lints.rust]
