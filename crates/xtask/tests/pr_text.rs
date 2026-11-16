@@ -34,6 +34,19 @@ fn a_title_that_breaks_the_subject_rule_fails() {
 }
 
 #[test]
+fn a_marker_that_skips_ci_fails_in_the_title_or_the_description() {
+    for text in [
+        "build(BAR-2): add the workspace skeleton [skip ci]\n\n## Ticket\n\nBAR-2:\n",
+        "build(BAR-2): add the workspace skeleton\n\n## Notes\n\nDocs only, so [CI SKIP].\n",
+        "build(BAR-2): add the workspace skeleton\n\n## Notes\n\nDocs only.\n\n\nskip-checks: true\n",
+    ] {
+        let (code, stderr) = check_pr(text);
+        assert_eq!(code, Some(1), "{text}");
+        assert!(stderr.contains("skip-CI marker rule"), "{stderr}");
+    }
+}
+
+#[test]
 fn attribution_under_a_markdown_heading_fails() {
     let (code, stderr) = check_pr(
         "build(BAR-2): add the workspace skeleton\n\n## Notes\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",

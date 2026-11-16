@@ -736,6 +736,27 @@ fn a_testing_feature_turned_on_outside_a_dev_dependency_is_refused() {
 }
 
 #[test]
+fn a_testing_feature_turned_on_in_a_target_specific_dependency_is_refused() {
+    // cargo reports a `[target.'cfg(…)'.dependencies]` entry as a normal dependency with a
+    // target, so it reaches the build on that platform like any other.
+    let root = workspace(
+        &[
+            KERNEL_WITH_TESTING,
+            (
+                "apps/api",
+                "barras-api",
+                "\n[target.'cfg(unix)'.dependencies]\nbarras-kernel = { path = \"../../crates/kernel\", features = [\"testing\"] }\n\n[target.'cfg(unix)'.dev-dependencies]\nbarras-kernel = { path = \"../../crates/kernel\", features = [\"testing\"] }\n",
+            ),
+        ],
+        "",
+    );
+    assert_eq!(
+        rules(&check_workspace(root.path()).unwrap()),
+        [("barras-api", "barras-kernel", "testing-dev-only")]
+    );
+}
+
+#[test]
 fn a_feature_other_than_testing_may_not_turn_a_testing_feature_on() {
     // `cargo build --workspace` turns on every member's default features, so `default`, or
     // a feature that some normal dependency turns on, would carry test code into the build.
