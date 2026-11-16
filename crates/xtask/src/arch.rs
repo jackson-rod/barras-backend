@@ -8,18 +8,24 @@ use cargo_metadata::{DependencyKind, MetadataCommand};
 use crate::error::XtaskError;
 use crate::structure::entries;
 
-const KERNEL_ALLOWED: &[&str] = &["thiserror", "uuid", "time", "rust_decimal"];
+const KERNEL_ALLOWED: &[&str] = &["thiserror", "uuid", "time", "rust_decimal", HACK];
 const MODULE_ALLOWED: &[&str] = &[
-    "barras-kernel",
+    KERNEL,
     "thiserror",
     "uuid",
     "time",
     "rust_decimal",
     "async-trait",
+    HACK,
 ];
 const DEV_EXTRA: &[&str] = &["tokio", "mockall", "insta"];
 const KERNEL: &str = "barras-kernel";
+const KERNEL_DIR: &str = "crates/kernel";
+const BOOTSTRAP: &str = "barras-bootstrap";
 const TESTKIT: &str = "barras-testkit";
+/// The crate cargo-hakari generates. Every member but `xtask` depends on it.
+const HACK: &str = "workspace-hack";
+const HACK_DIR: &str = "crates/workspace-hack";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Layer {
@@ -27,8 +33,10 @@ pub enum Layer {
     Module,
     Adapter,
     App,
+    Bootstrap,
     Testkit,
     Tool,
+    WorkspaceHack,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +73,9 @@ pub struct Dep {
     pub name: String,
     pub kind: DepKind,
     pub origin: Origin,
+    /// The folder of a path dependency: relative to the workspace root when it is inside
+    /// it, as cargo reports it otherwise.
+    pub path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -89,8 +100,10 @@ pub fn layer_of(dir: &Path) -> Option<Layer> {
         ["crates", "modules", _] => Some(Layer::Module),
         ["crates", "adapters", _] => Some(Layer::Adapter),
         ["apps", _] => Some(Layer::App),
+        ["crates", "bootstrap"] => Some(Layer::Bootstrap),
         ["crates", "testkit"] => Some(Layer::Testkit),
         ["crates", "xtask"] => Some(Layer::Tool),
+        ["crates", "workspace-hack"] => Some(Layer::WorkspaceHack),
         _ => None,
     }
 }
@@ -122,6 +135,9 @@ pub fn check_arch(crates: &[CrateInfo]) -> Vec<Violation> {
                 Layer::Adapter if depends_on_adapter(crates, name) => {
                     violations.push(violation(krate, name, "adapter-isolation"));
                 }
+                Layer::Bootstrap if is_member(crates, name) && !is_the_hack(dep) => {
+                    violations.push(violation(krate, name, "bootstrap-isolation"));
+                }
                 Layer::Tool if is_member(crates, name) => {
                     violations.push(violation(krate, name, "tool-isolation"));
                 }
@@ -130,22 +146,44 @@ pub fn check_arch(crates: &[CrateInfo]) -> Vec<Violation> {
             if name == TESTKIT && dep.kind != DepKind::Dev {
                 violations.push(violation(krate, name, "testkit-dev-only"));
             }
+            if name == BOOTSTRAP && layer != Layer::App {
+                violations.push(violation(krate, name, "bootstrap-apps-only"));
+            }
         }
     }
     violations
 }
 
-/// An allowlisted name counts only from its expected source: `barras-kernel` is a
-/// workspace path, everything else comes from crates.io. Otherwise a `path` or `git`
-/// entry, or another registry, could pass a foreign crate off under an allowed name.
-/// `[patch]` and `[replace]` are stopped by `check_patches`.
+/// An allowlisted name counts only from its expected source: `barras-kernel` and
+/// `workspace-hack` are the path dependency at that member's own folder, everything else
+/// comes from crates.io. Otherwise a `path` or `git` entry, or another registry, could
+/// pass a foreign crate off under an allowed name. `[patch]` and `[replace]` are stopped
+/// by `check_patches`.
 fn allowed(lists: &[&[&str]], dep: &Dep) -> bool {
-    let expected = if dep.name == KERNEL {
-        Origin::Path
-    } else {
-        Origin::CratesIo
+    let from_expected_source = match member_folder(&dep.name) {
+        Some(folder) => is_path_to(dep, folder),
+        None => dep.origin == Origin::CratesIo,
     };
-    lists.iter().any(|list| list.contains(&dep.name.as_str())) && dep.origin == expected
+    lists.iter().any(|list| list.contains(&dep.name.as_str())) && from_expected_source
+}
+
+/// The folder of each workspace crate that an allowlist names.
+fn member_folder(name: &str) -> Option<&'static str> {
+    match name {
+        KERNEL => Some(KERNEL_DIR),
+        HACK => Some(HACK_DIR),
+        _ => None,
+    }
+}
+
+/// A path dependency taken from `folder`, which is relative to the workspace root. A
+/// copy of the crate kept in any other folder has the same name and is other code.
+fn is_path_to(dep: &Dep, folder: &str) -> bool {
+    dep.path.as_deref() == Some(Path::new(folder))
+}
+
+fn is_the_hack(dep: &Dep) -> bool {
+    dep.name == HACK && is_path_to(dep, HACK_DIR)
 }
 
 /// A workspace crate is known by its package name, so a `git` copy of one is still caught.
@@ -190,7 +228,16 @@ fn check_members(root: &Path, crates: &[CrateInfo]) -> Result<Vec<Violation>, Xt
             }
         }
     }
-    folders.extend(["crates/kernel", "crates/testkit", "crates/xtask"].map(String::from));
+    folders.extend(
+        [
+            "crates/bootstrap",
+            "crates/kernel",
+            "crates/testkit",
+            "crates/workspace-hack",
+            "crates/xtask",
+        ]
+        .map(String::from),
+    );
     Ok(folders
         .into_iter()
         .filter(|folder| root.join(folder).join("Cargo.toml").is_file())
@@ -298,6 +345,15 @@ pub fn load_workspace(root: &Path) -> Result<Vec<CrateInfo>, XtaskError> {
                     _ => DepKind::Normal,
                 },
                 origin: Origin::of(d.source.as_ref()),
+                // Cargo spells it like the root and normalises it, so a plain prefix strip
+                // is enough. A folder outside the root keeps its whole path and so equals
+                // no member's folder.
+                path: d.path.as_ref().map(|path| {
+                    let path = path.as_std_path();
+                    path.strip_prefix(workspace_root)
+                        .unwrap_or(path)
+                        .to_path_buf()
+                }),
             })
             .collect();
         crates.push(CrateInfo {
@@ -320,7 +376,7 @@ mod tests {
 
     const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
-    /// `true` marks a path dependency, `false` one from crates.io.
+    /// `true` marks a path dependency at its usual folder, `false` one from crates.io.
     fn krate(name: &str, dir: &str, deps: &[(&str, DepKind, bool)]) -> CrateInfo {
         let sources: Vec<(&str, DepKind, Option<&str>)> = deps
             .iter()
@@ -329,7 +385,8 @@ mod tests {
         krate_from(name, dir, &sources)
     }
 
-    /// Each dependency carries the `source` that `cargo metadata` would report: `None` for a path.
+    /// Each dependency carries the `source` that `cargo metadata` would report: `None` for
+    /// a path, which is then the crate's usual folder.
     fn krate_from(name: &str, dir: &str, deps: &[(&str, DepKind, Option<&str>)]) -> CrateInfo {
         CrateInfo {
             name: name.to_owned(),
@@ -346,8 +403,36 @@ mod tests {
                             })
                             .as_ref(),
                     ),
+                    path: source.is_none().then(|| usual_folder(name)),
                 })
                 .collect(),
+        }
+    }
+
+    /// Path dependencies only, each from the folder given.
+    fn krate_at(name: &str, dir: &str, deps: &[(&str, DepKind, &str)]) -> CrateInfo {
+        CrateInfo {
+            name: name.to_owned(),
+            dir: PathBuf::from(dir),
+            deps: deps
+                .iter()
+                .map(|(name, kind, path)| Dep {
+                    name: (*name).to_owned(),
+                    kind: *kind,
+                    origin: Origin::Path,
+                    path: Some(PathBuf::from(path)),
+                })
+                .collect(),
+        }
+    }
+
+    /// Where this workspace keeps the two crates an allowlist takes by path; any other
+    /// name gets a folder no rule looks at.
+    fn usual_folder(name: &str) -> PathBuf {
+        match name {
+            "barras-kernel" => PathBuf::from("crates/kernel"),
+            "workspace-hack" => PathBuf::from("crates/workspace-hack"),
+            other => Path::new("elsewhere").join(other),
         }
     }
 
@@ -540,6 +625,284 @@ mod tests {
                 ),
                 ("xtask", "barras-kernel", "tool-isolation"),
             ]
+        );
+    }
+
+    #[test]
+    fn the_kernel_counts_only_from_its_own_folder() {
+        let crates = [
+            krate("barras-kernel", "crates/kernel", &[]),
+            krate_at(
+                "barras-identity",
+                "crates/modules/identity",
+                &[("barras-kernel", Normal, "crates/kernel")],
+            ),
+            krate_at(
+                "barras-goals",
+                "crates/modules/goals",
+                &[
+                    ("barras-kernel", Normal, "vendor/kernel"),
+                    ("barras-kernel", Build, "crates/kernel/copy"),
+                    ("barras-kernel", Dev, "/outside/crates/kernel"),
+                ],
+            ),
+        ];
+        assert_eq!(
+            rules(&check_arch(&crates)),
+            [
+                ("barras-goals", "barras-kernel", "module-allowlist"),
+                ("barras-goals", "barras-kernel", "module-allowlist"),
+                ("barras-goals", "barras-kernel", "module-dev-allowlist"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_path_dependency_without_its_folder_never_counts() {
+        let mut module = krate_at(
+            "barras-identity",
+            "crates/modules/identity",
+            &[("barras-kernel", Normal, "crates/kernel")],
+        );
+        module.deps[0].path = None;
+        assert_eq!(
+            rules(&check_arch(&[module])),
+            [("barras-identity", "barras-kernel", "module-allowlist")]
+        );
+    }
+
+    #[test]
+    fn the_hack_is_allowed_in_the_kernel_and_the_modules_from_its_own_folder() {
+        let crates = [
+            krate("workspace-hack", "crates/workspace-hack", &[]),
+            krate_at(
+                "barras-kernel",
+                "crates/kernel",
+                &[
+                    ("workspace-hack", Normal, "crates/workspace-hack"),
+                    ("workspace-hack", Dev, "crates/workspace-hack"),
+                ],
+            ),
+            krate_at(
+                "barras-identity",
+                "crates/modules/identity",
+                &[
+                    ("workspace-hack", Normal, "crates/workspace-hack"),
+                    ("workspace-hack", Build, "crates/workspace-hack"),
+                    ("workspace-hack", Dev, "crates/workspace-hack"),
+                ],
+            ),
+        ];
+        assert_eq!(check_arch(&crates), []);
+    }
+
+    #[test]
+    fn the_hack_counts_only_from_its_own_folder() {
+        let crates = [
+            krate_from(
+                "barras-kernel",
+                "crates/kernel",
+                &[
+                    ("workspace-hack", Normal, Some(CRATES_IO)),
+                    ("workspace-hack", Dev, Some(GIT)),
+                ],
+            ),
+            krate_at(
+                "barras-identity",
+                "crates/modules/identity",
+                &[
+                    ("workspace-hack", Normal, "vendor/workspace-hack"),
+                    ("workspace-hack", Dev, "crates/kernel"),
+                ],
+            ),
+        ];
+        assert_eq!(
+            rules(&check_arch(&crates)),
+            [
+                ("barras-kernel", "workspace-hack", "kernel-allowlist"),
+                ("barras-kernel", "workspace-hack", "kernel-dev-allowlist"),
+                ("barras-identity", "workspace-hack", "module-allowlist"),
+                ("barras-identity", "workspace-hack", "module-dev-allowlist"),
+            ]
+        );
+    }
+
+    #[test]
+    fn bootstrap_and_the_hack_are_known_folders() {
+        assert_eq!(
+            layer_of(Path::new("crates/bootstrap")),
+            Some(Layer::Bootstrap)
+        );
+        assert_eq!(
+            layer_of(Path::new("crates/workspace-hack")),
+            Some(Layer::WorkspaceHack)
+        );
+        let crates = [
+            krate(
+                "barras-bootstrap",
+                "crates/bootstrap",
+                &[("tokio", Normal, false), ("workspace-hack", Normal, true)],
+            ),
+            krate(
+                "workspace-hack",
+                "crates/workspace-hack",
+                &[("tokio", Normal, false), ("axum", Normal, false)],
+            ),
+            krate("barras-nested", "crates/bootstrap/nested", &[]),
+            krate("barras-hacks", "crates/workspace-hacks", &[]),
+        ];
+        assert_eq!(
+            rules(&check_arch(&crates)),
+            [
+                ("barras-nested", "", "unknown-location"),
+                ("barras-hacks", "", "unknown-location"),
+            ]
+        );
+    }
+
+    #[test]
+    fn bootstrap_depends_on_no_workspace_crate_but_the_hack() {
+        let crates = [
+            krate("barras-kernel", "crates/kernel", &[]),
+            krate("barras-adapter-http", "crates/adapters/http", &[]),
+            krate("workspace-hack", "crates/workspace-hack", &[]),
+            krate_from(
+                "barras-bootstrap",
+                "crates/bootstrap",
+                &[
+                    ("tracing", Normal, Some(CRATES_IO)),
+                    ("workspace-hack", Normal, None),
+                    ("barras-kernel", Normal, None),
+                    ("barras-adapter-http", Dev, None),
+                    ("barras-kernel", Build, Some(GIT)),
+                ],
+            ),
+        ];
+        assert_eq!(
+            rules(&check_arch(&crates)),
+            [
+                ("barras-bootstrap", "barras-kernel", "bootstrap-isolation"),
+                (
+                    "barras-bootstrap",
+                    "barras-adapter-http",
+                    "bootstrap-isolation"
+                ),
+                ("barras-bootstrap", "barras-kernel", "bootstrap-isolation"),
+            ]
+        );
+    }
+
+    #[test]
+    fn bootstrap_takes_the_hack_only_from_its_own_folder() {
+        let hack = krate("workspace-hack", "crates/workspace-hack", &[]);
+        let from_another_folder = krate_at(
+            "barras-bootstrap",
+            "crates/bootstrap",
+            &[("workspace-hack", Normal, "vendor/workspace-hack")],
+        );
+        let from_git = krate_from(
+            "barras-bootstrap",
+            "crates/bootstrap",
+            &[("workspace-hack", Normal, Some(GIT))],
+        );
+        for bootstrap in [from_another_folder, from_git] {
+            assert_eq!(
+                rules(&check_arch(&[hack.clone(), bootstrap])),
+                [("barras-bootstrap", "workspace-hack", "bootstrap-isolation")]
+            );
+        }
+    }
+
+    #[test]
+    fn only_an_app_may_depend_on_bootstrap() {
+        let crates = [
+            krate("barras-bootstrap", "crates/bootstrap", &[]),
+            krate(
+                "barras-api",
+                "apps/api",
+                &[("barras-bootstrap", Normal, true)],
+            ),
+            krate(
+                "barras-ingest",
+                "apps/ingest",
+                &[("barras-bootstrap", Dev, true)],
+            ),
+            krate(
+                "barras-adapter-http",
+                "crates/adapters/http",
+                &[("barras-bootstrap", Normal, true)],
+            ),
+            krate(
+                "barras-testkit",
+                "crates/testkit",
+                &[("barras-bootstrap", Dev, true)],
+            ),
+            krate_from(
+                "workspace-hack",
+                "crates/workspace-hack",
+                &[("barras-bootstrap", Build, Some(GIT))],
+            ),
+        ];
+        assert_eq!(
+            rules(&check_arch(&crates)),
+            [
+                (
+                    "barras-adapter-http",
+                    "barras-bootstrap",
+                    "bootstrap-apps-only"
+                ),
+                ("barras-testkit", "barras-bootstrap", "bootstrap-apps-only"),
+                ("workspace-hack", "barras-bootstrap", "bootstrap-apps-only"),
+            ]
+        );
+    }
+
+    #[test]
+    fn bootstrap_in_a_crate_with_its_own_rule_breaks_both() {
+        let crates = [
+            krate("barras-bootstrap", "crates/bootstrap", &[]),
+            krate(
+                "barras-kernel",
+                "crates/kernel",
+                &[("barras-bootstrap", Dev, true)],
+            ),
+            krate(
+                "barras-identity",
+                "crates/modules/identity",
+                &[("barras-bootstrap", Normal, true)],
+            ),
+            krate(
+                "xtask",
+                "crates/xtask",
+                &[("barras-bootstrap", Normal, true)],
+            ),
+        ];
+        assert_eq!(
+            rules(&check_arch(&crates)),
+            [
+                ("barras-kernel", "barras-bootstrap", "kernel-dev-allowlist"),
+                ("barras-kernel", "barras-bootstrap", "bootstrap-apps-only"),
+                ("barras-identity", "barras-bootstrap", "module-allowlist"),
+                ("barras-identity", "barras-bootstrap", "bootstrap-apps-only"),
+                ("xtask", "barras-bootstrap", "tool-isolation"),
+                ("xtask", "barras-bootstrap", "bootstrap-apps-only"),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_tool_still_may_not_depend_on_the_hack() {
+        let crates = [
+            krate("workspace-hack", "crates/workspace-hack", &[]),
+            krate_at(
+                "xtask",
+                "crates/xtask",
+                &[("workspace-hack", Normal, "crates/workspace-hack")],
+            ),
+        ];
+        assert_eq!(
+            rules(&check_arch(&crates)),
+            [("xtask", "workspace-hack", "tool-isolation")]
         );
     }
 
