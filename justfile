@@ -33,6 +33,15 @@ check-arch:
 check-structure:
     cargo xtask check-structure
 
+# Rewrites openapi.json from the code; through a temporary file, so a failed build leaves it whole
+openapi:
+    mkdir -p target
+    cargo run --locked --quiet -p barras-api -- openapi > target/openapi.json.new
+    mv target/openapi.json.new openapi.json
+
+openapi-check:
+    cargo run --locked --quiet -p barras-api -- openapi --check openapi.json
+
 test:
     cargo nextest run --workspace --locked
     cargo test --workspace --doc --locked

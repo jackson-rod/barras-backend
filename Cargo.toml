@@ -17,7 +17,10 @@ publish = false
 
 [workspace.dependencies]
 axum = { version = "0.8.9", default-features = false }
+barras-adapter-http = { path = "crates/adapters/http" }
+barras-bootstrap = { path = "crates/bootstrap" }
 barras-kernel = { path = "crates/kernel" }
+barras-testkit = { path = "crates/testkit" }
 cargo_metadata = "0.23.1"
 form_urlencoded = { version = "1.2.2", default-features = false }
 garde = { version = "0.23.0", default-features = false }
