@@ -179,15 +179,15 @@ The optional root lets the tests run the binary on a temporary workspace. Withou
 - An `SF` outside the root, under the spelling given or the canonical one, is ignored. An `SF` inside the root but outside every known crate folder and outside `target/` is an error, so code included from elsewhere cannot escape the bars. A missing source file inside the root is an error, under either spelling.
 - Only files under a crate's `src/` are measured. The rest of the crate folder (`tests/`, `benches/`, `examples/`, `build.rs`) is not. `crates/testkit` and `crates/workspace-hack` are not measured.
 - Every `.rs` file under the `src/` of each measured crate is parsed with `syn`, whether the report names it or not, and a file that does not parse is an error. Line positions come from `proc-macro2` with its `span-locations` feature.
-- A source file under a measured `src/` that holds a function body outside test items must be named by the report. cargo-llvm-cov drops some paths by default (`tests.rs`, `*_tests.rs`, any path with `/rustc/<hex>/`, …), and a crate whose tests never run is absent from the report; neither can escape the bars this way, and every crate with code has a figure.
-- A source nested deeper than 256 groups is an error naming the file, found by a walk that does not recurse, before the parse; the parse runs on a thread with a large stack.
+- A source file under a measured `src/` that holds a function body outside test items must be named by the report. cargo-llvm-cov drops some paths by default (`tests.rs`, `*_tests.rs`, any path with `/rustc/<hex>/`, …), and a crate whose tests never run is absent from the report; neither can escape the bars this way, and every crate with code has a figure. A file is exempt when every `mod` line that declares it is gated by a cfg other than the test mark (on the line, on an item or inline module around it, a file-level `#![cfg]`, or a gated module further up), and a body under such a cfg does not ask for its file: the measured build compiles that code out, so it is measured only where it is compiled (CI on Linux, a developer's Mac). A crate root is never exempt.
+- A source nested deeper than 256 groups is an error naming the file, found by a walk that does not recurse, before the parse; the parse runs on a thread with a large stack. The limit guards nested brackets only: a long chain without brackets (`!!!x`, deep generics) can still exhaust the stack, which stops the gate without naming the file.
 - An item that carries exactly `#[cfg(test)]` is test code at any depth: in a file, in an inline module, in an `impl`, `trait` or `extern` block. The lines of its whole span, its attributes and doc comments included, are left out. `#[cfg(any(test, feature = "<name>"))]`, test support that other crates' tests use, counts as production.
 - These are errors, each naming the file and the line, because each would hide code from the measure:
   - a `cfg` predicate that names `test` in any other form (`not(test)`, `all(test, …)`, …), or `#[cfg(test)]` anywhere but on an item;
-  - a `cfg` or `cfg_attr` predicate that uses anything but `test` (as the test mark), `feature = "…"`, `unix`, `windows` and the `target_*` keys, combined with `all`, `any` and `not`, or that puts `not` around a `feature`: code that only a release build (`debug_assertions`), a custom cfg or a missing feature compiles is never measured;
+  - a `cfg` or `cfg_attr` predicate that uses anything but `test` (as the test mark), `feature = "…"`, `debug_assertions`, `unix`, `windows` and the `target_*` keys, combined with `all`, `any` and `not`, or that puts `not` around a `feature` or `debug_assertions`: code that only a release build, a custom cfg or a missing feature compiles is never measured (the measured build is the dev profile, so code under `debug_assertions` is);
   - a `cfg` or `cfg_attr` predicate that names `coverage`, and any `coverage(…)` attribute;
-  - outside test items, the identifiers `cfg`, `cfg_attr`, `coverage`, `test` or `include`, or the keyword `mod`, inside a `macro_rules!` body or a macro call: macros are not expanded, so they could otherwise produce every shape this list refuses;
-  - the identifier `include` anywhere, test code included, except in `include!(concat!(env!("OUT_DIR"), "<literal without ..>"))`: an included file is measured, or dropped, under its own path;
+  - inside a `macro_rules!` body outside test items: the keyword `mod`; a test attribute (`#[test]`, `#[tokio::test]`, `#[cfg(test)]`), since a macro that writes tests belongs inside the test module; and any written attribute or `include!` this list refuses elsewhere. Macro calls, `cfg!` and a `#[$meta]` passthrough are not judged: macros are not expanded, and the rule refused honest code when it read every call;
+  - `include!`, test code included, except `include!(concat!(env!("OUT_DIR"), "<literal without ..>"))`, and a `use` path that names `include`: an included file is measured, or dropped, under its own path. A field, a method or a variable named `include` is fine;
   - a `cfg_attr` whose attributes include `cfg`;
   - an out-of-line `#[cfg(test)] mod <name>;` whose name is not `tests`;
   - an out-of-line `mod <name>;` without `#[cfg(test)]` whose name is `tests` or ends in `_tests`: cargo-llvm-cov drops such files, so production code in them would escape;
@@ -201,7 +201,8 @@ The optional root lets the tests run the binary on a temporary workspace. Withou
 - A stale report is caught only when it names a line past a file's end, so `just test-cov` always regenerates it; the report comes from the change's own code and can be forged.
 - The total averages across crates. Trivially covered production lines, and test support under `any(test, feature = "…")`, count as production: only review sees padding.
 - Code generated under `target/` and code a macro expands are not measured as such; a dependency's proc macro can emit any attribute, and only adapters and apps can take such dependencies.
-- Code compiled out of the coverage build by a feature the workspace build leaves off is not measured.
+- Code compiled out of the measured build (a feature the workspace leaves off, another platform) is measured only where it is compiled.
+- A `#[$meta]` passthrough macro applies whatever attribute its caller writes, and macro calls are not judged: review covers a macro used to hide code.
 - Test attributes not named `test` (`#[rstest]`, `#[test_case]`) are not recognised as test marks; the kernel's and the modules' dev dependencies allow none of them.
 - A file swapped for a FIFO between the check and the open is a residual race.
 
@@ -210,7 +211,8 @@ The optional root lets the tests run the binary on a temporary workspace. Withou
 - [x] Part B, first version: `feat(BAR-3): add the check-coverage subcommand` (`f749706`).
 - [x] Review fixes to Part A, test first: each rule above gets a test that fails on the first version. Commit: `fix(BAR-3): close the check-arch rules found open in review`
 - [x] Review fixes to Part B, test first, same way. Commit: `fix(BAR-3): read sources with syn in check-coverage and fail closed` (`e7bb417`; Part A was `a26a23f`).
-- [ ] Second round, test first: `refactor(BAR-3): share one folder walker and one list of crate folders in xtask` (no change in behaviour), `fix(BAR-3): refuse symlinks and build scripts where check-arch cannot see code`, `fix(BAR-3): close the remaining ways around check-coverage`.
+- [x] Second round, test first: `refactor(BAR-3): share one folder walker and one list of crate folders in xtask` (no change in behaviour), `fix(BAR-3): refuse symlinks and build scripts where check-arch cannot see code`, `fix(BAR-3): close the remaining ways around check-coverage`.
+- [x] Third round, after both re-reviews found rules refusing honest code: `fix(BAR-3): stop the coverage gate refusing honest code found in review`. Its own review is part of Task 16.
 
 ---
 
@@ -337,6 +339,8 @@ pub struct ApiRouter<S = ()>(/* utoipa_axum::router::OpenApiRouter<S> */);
 impl<S: Clone + Send + Sync + 'static> ApiRouter<S> {
     pub fn new() -> Self;
     pub fn route(self, route: UtoipaMethodRouter<S>, access: Access, error_codes: &'static [&'static str]) -> Self;
+    // records a problem, and registers nothing, for a tuple with other than one path, a path item with no
+    // operation, or a schema name already registered with another shape; merge and with_state carry problems
     pub fn merge(self, other: Self) -> Self;
     pub fn with_state<S2>(self, state: S) -> ApiRouter<S2>;
 }
@@ -353,7 +357,7 @@ pub(crate) fn operations(document: &OpenApi) -> Vec<(&str, &'static str, &Operat
 - `route` writes `x-permission` (`public`), `x-plan-feature` (`none`) and `x-error-codes` (sorted) on every operation of the route it is given (A.1). `ApiRouter` has no method that takes a bare `MethodRouter`.
 - `canonical_json`: `serde_json::to_value`, `sort_all_objects()`, pretty-printed, one final newline. Two calls give the same bytes for a document whose operations carry three `x-` keys; so do two processes (the e2e of Task 11 compares with the committed file).
 - `document_base`: `info.title` is `Barras API`, `info.version` is `CARGO_PKG_VERSION`, no `license`, no `contact`, no `description` taken from a crate. Sub-routers start from `OpenApiRouter::default()`, never `new()` (A.1).
-- `metadata_problems` returns, for a fixture document, one line per missing item of spec §7.2, each naming the method, the path and the item: no `operationId`; no tag; no summary; no 2xx response whose body refers to a `SuccessEnvelope_` component; a 4xx or 5xx response whose body is not `ErrorEnvelope`; a response without `description`; a missing `x-error-codes`, `x-permission` or `x-plan-feature`. A complete document gives an empty list.
+- `metadata_problems` returns, for a fixture document, one line per missing item of spec §7.2, each naming the method, the path and the item: no `operationId`; no tag; no summary; no 2xx response whose body refers to a `SuccessEnvelope_` component; a 4xx or 5xx response whose body is not `ErrorEnvelope`; a response without `description`; a missing `x-error-codes`, `x-permission` or `x-plan-feature`. After review (`1fbc40b`) it also refuses: a 2xx without a success-envelope body (so no 204; use `NoData`), a `default` response without the error envelope, a duplicated `operationId` (one line naming every use), a blank `x-permission` or `x-plan-feature`, an `x-error-codes` that is not a sorted list of unique codes or repeats a common one, and a root whose title, version or `x-common-error-codes` is wrong. A complete document gives an empty list.
 
 **Steps**
 - [ ] `router.rs`, test first, with a fixture handler carrying `#[utoipa::path]`.
@@ -367,7 +371,9 @@ pub(crate) fn operations(document: &OpenApi) -> Vec<(&str, &'static str, &Operat
 
 **Files**
 - Modify: `Cargo.toml` (`tower`, `tower-http`, `http`, `http-body`, `bytes`, `tokio`, `uuid` as needed), `crates/adapters/http/Cargo.toml` (feature `testing`), `crates/adapters/http/src/lib.rs`
-- Create: `crates/adapters/http/src/app.rs`, `crates/adapters/http/src/middleware/{mod,request_id,fallback,safety_net}.rs`, `crates/adapters/http/src/testing/{mod,test_client}.rs`, `crates/adapters/http/tests/{support/mod.rs,stack.rs,route_guard.rs}`
+- Create: `crates/adapters/http/src/app.rs`, `crates/adapters/http/src/middleware/{mod,request_id,fallback,safety_net}.rs`, `crates/adapters/http/src/testing/{mod,test_client}.rs`, `crates/adapters/http/src/tests/{mod,support,stack,route_guard}.rs`
+
+The adapter's own tests that need its `testing` feature live in `src/tests/` (declared `#[cfg(test)] mod tests;`), not in `tests/`: an integration test gets the feature only through a dev-dependency of the crate on itself, which `check-arch` refuses as `adapter-isolation`. The `testing` module is gated `any(test, feature = "testing")`. The same holds for Tasks 7 to 9.
 
 **Interfaces**
 
@@ -383,7 +389,7 @@ impl HttpApp {
 impl HttpAppBuilder {
     pub fn routes(self, routes: ApiRouter) -> Self;      // nested under /api/v1
     #[cfg(feature = "testing")] pub fn undocumented_route(self, path: &str, route: MethodRouter) -> Self;
-    pub fn build(self) -> HttpApp;
+    pub fn build(self) -> Result<HttpApp, BuildError>;   // lists every problem ApiRouter recorded
 }
 
 // middleware: a response extension the test client reads
@@ -408,7 +414,7 @@ What Tasks 4 and 5 left for this one:
 - `ApiError::method_not_allowed()` carries no `allow` header: the 405 path copies it from axum's own response. The panic handler answers `ApiError::internal(panic_text)`, which logs the text once and never sends it. Codes come from the `ApiError::*` constants, never from string literals.
 - `operations()` gives methods in upper case, comparable with `Method::as_str()`. `routes!` given handlers of different paths serves each handler on every path, and a hand-built route tuple can serve methods the document lacks: only the `TestClient` guard sees these, so it compares every served method and template with the document.
 
-**Rules the tests pin** (in `tests/stack.rs`, in-process against a fixture app from `tests/support`, built with `ApiRouter` like the real one)
+**Rules the tests pin** (in `src/tests/stack.rs`, in-process against a fixture app from `src/tests/support.rs`, built with `ApiRouter` like the real one)
 - An unknown path under and outside `/api/v1`: 404 `ROUTE_NOT_FOUND`. A known path with the wrong method: 405 `METHOD_NOT_ALLOWED`, with the `allow` header kept.
 - A handler that panics: 500 `INTERNAL_ERROR`, a generic message, the panic text only in the log.
 - A response that a library layer produced on its own (a fixture route using axum's stock `Json` extractor without a content type): the safety net turns it into an envelope with the code its status maps to: 400 `MALFORMED_REQUEST`, 413 `PAYLOAD_TOO_LARGE`, 415 `UNSUPPORTED_MEDIA_TYPE`, 406 `NOT_ACCEPTABLE`, any other 4xx `MALFORMED_REQUEST`, any 5xx `INTERNAL_ERROR`. A response that is already an envelope passes untouched, 406 excepted (A.3).
@@ -416,7 +422,7 @@ What Tasks 4 and 5 left for this one:
 - Compression: a body of 4 KiB with `accept-encoding: gzip` comes back with `content-encoding: gzip` and the gzip magic bytes; with `br`, brotli; a body under 1 KiB is not compressed; `identity;q=0` gives 406 `NOT_ACCEPTABLE`.
 - A body over 1 MiB to a route that reads its body is refused with 413 (Task 7 gives it the right code through the extractor; here the safety net does).
 - `MatchedRoute` is on the response of a matched route and absent on a fallback response.
-- `tests/route_guard.rs`: `TestClient` panics, naming `GET /api/v1/hidden`, when a request is served by a route added with `undocumented_route`; it does not panic for a documented route, for a fallback, for a 405, or for `HEAD` on a documented `GET`.
+- `src/tests/route_guard.rs`: `TestClient` panics, naming `GET /api/v1/hidden`, when a request is served by a route added with `undocumented_route`; it does not panic for a documented route, for a fallback, for a 405, or for `HEAD` on a documented `GET`.
 
 `TestClient` is test support compiled as library code, so its module carries `#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]` with the reason on the same line.
 
@@ -431,8 +437,8 @@ What Tasks 4 and 5 left for this one:
 ### Task 7: HTTP adapter: validating extractors
 
 **Files**
-- Modify: `Cargo.toml` (`garde`, `serde_path_to_error`; `axum` feature `query`), `crates/adapters/http/Cargo.toml`, `crates/adapters/http/src/lib.rs`, `crates/adapters/http/tests/support/mod.rs`
-- Create: `crates/adapters/http/src/extract/{mod,validated_json,validated_query}.rs`, `crates/adapters/http/tests/validation.rs`
+- Modify: `Cargo.toml` (`garde`, `serde_path_to_error`; `axum` feature `query`), `crates/adapters/http/Cargo.toml`, `crates/adapters/http/src/lib.rs`, `crates/adapters/http/src/tests/support.rs`
+- Create: `crates/adapters/http/src/extract/{mod,validated_json,validated_query}.rs`, `crates/adapters/http/src/tests/validation.rs`
 
 **Interfaces:** `pub struct ValidatedJson<T>(pub T)` and `pub struct ValidatedQuery<T>(pub T)`, both `FromRequest`/`FromRequestParts` with `Rejection = ApiError`, for `T: DeserializeOwned + garde::Validate` with `T::Context: Default`. The shape is A.4.
 
@@ -448,7 +454,7 @@ What Tasks 4 and 5 left for this one:
 - Query: `?limit=abc` on a numeric field gives 422 with the key `limit`; a broken rule gives 422 with its key; a query string that cannot be parsed at all gives 400 `MALFORMED_REQUEST`.
 
 **Steps**
-- [ ] `tests/validation.rs` first, then `validated_json.rs`, then `validated_query.rs`.
+- [ ] `src/tests/validation.rs` first, then `validated_json.rs`, then `validated_query.rs`.
 - [ ] Commit: `feat(BAR-3): add the validating extractors`
 
 ---
@@ -459,7 +465,9 @@ Skill: `observability-and-instrumentation`.
 
 **Files**
 - Modify: `Cargo.toml` (`prometheus` with `default-features = false`, `tracing`; `tower-http` feature `trace`), `deny.toml` if a licence is new, `crates/adapters/http/Cargo.toml`, `crates/adapters/http/src/{lib,app}.rs`, `crates/adapters/http/src/middleware/mod.rs`
-- Create: `crates/adapters/http/src/metrics.rs`, `crates/adapters/http/src/middleware/{request_log,http_metrics}.rs`, `crates/adapters/http/tests/{request_log.rs,http_metrics.rs}`
+- Create: `crates/adapters/http/src/metrics.rs`, `crates/adapters/http/src/middleware/{request_log,http_metrics}.rs`, `crates/adapters/http/src/tests/{request_log,http_metrics}.rs`
+
+From Task 6: the request log goes between `SetRequestIdLayer` and `PropagateRequestIdLayer`, and the metrics layer replaces `record_matched_route` in its place. Take the route template from the request's `MatchedPath`, because `MatchedRoute` is absent on a 405. The `method` label maps any method outside the standard set to one value, so its values stay bounded.
 
 **Interfaces**
 
@@ -491,7 +499,9 @@ pub fn builder(service: ServiceInfo, metrics: Metrics) -> HttpAppBuilder;
 
 **Files**
 - Modify: `Cargo.toml` (`hyper-util`, optional, for `testing`), `crates/adapters/http/Cargo.toml`, `crates/adapters/http/src/{lib,app}.rs`, `crates/adapters/http/src/testing/mod.rs`
-- Create: `crates/adapters/http/src/health/{mod,probe,routes}.rs`, `crates/adapters/http/src/health/dto/health_status.rs`, `crates/adapters/http/src/{internal,server}.rs`, `crates/adapters/http/src/testing/fetch.rs`, `crates/adapters/http/tests/{health.rs,server.rs}`
+- Create: `crates/adapters/http/src/health/{mod,probe,routes}.rs`, `crates/adapters/http/src/health/dto/health_status.rs`, `crates/adapters/http/src/{internal,server}.rs`, `crates/adapters/http/src/testing/fetch.rs`, `crates/adapters/http/src/tests/{health,server}.rs`
+
+From Task 6: remove the `dead_code` allow on `HttpApp::router()` once the server reads it; `hyper-util` is both an optional dependency (feature `testing`) and a dev-dependency, for `fetch`; `TestClient::internal` skips the route guard; every 2xx of a public route needs a success-envelope body.
 
 **Interfaces** (spec §5)
 
@@ -524,11 +534,11 @@ impl TestClient { pub fn internal(app: &InternalApp) -> Self; }       // no rout
 The two public routes are registered with `ApiRouter::route(routes!(…), Access::public(), …)`: `GET /health/live` with no code of its own, `GET /health` with `SERVICE_UNAVAILABLE`. Both have a summary, the tag `health`, described responses and the envelope schemas. The code comes from `ApiError::SERVICE_UNAVAILABLE`, not a literal; a doc comment's first line becomes the summary; every response needs a `description`; a route with nothing to return declares `SuccessEnvelope<NoData>`, never `()`, on which utoipa panics.
 
 **Rules the tests pin**
-- `tests/health.rs`, in-process: no probe gives `ok`; an optional probe failing gives 200 `degraded`; a critical probe failing gives 503 `SERVICE_UNAVAILABLE`; a probe that never answers counts as failed after 2 seconds (the test pauses tokio's clock; it does not wait). The public bodies never contain a probe's name or its error.
+- `src/tests/health.rs`, in-process: no probe gives `ok`; an optional probe failing gives 200 `degraded`; a critical probe failing gives 503 `SERVICE_UNAVAILABLE`; a probe that never answers counts as failed after 2 seconds (the test pauses tokio's clock; it does not wait). The public bodies never contain a probe's name or its error.
 - Internal `GET /health`: 200 or 503 with `status`, `service`, `version` and one entry per probe (`name`, `critical`, `status` of `up` or `down`, `latencyMs`, and `error` only when down). No envelope.
 - Internal `GET /metrics`: the text of `Metrics::render`, content type `text/plain; version=0.0.4`. Requests to the internal router are not counted in `http_requests_total`.
 - The internal routes do not exist on the public router, and the public ones do not exist on the internal router.
-- `tests/server.rs`, real sockets on `127.0.0.1:0`: both listeners answer through `fetch`; after the shutdown future resolves, a request already in flight completes and `serve_api` returns `Ok`; `bind` on a taken port returns an error that names the listener and the address.
+- `src/tests/server.rs`, real sockets on `127.0.0.1:0`: both listeners answer through `fetch`; after the shutdown future resolves, a request already in flight completes and `serve_api` returns `Ok`; `bind` on a taken port returns an error that names the listener and the address.
 - `metadata_problems(app.openapi())` is empty for an app with only the health routes.
 
 **Steps**
@@ -744,8 +754,8 @@ Skill: `documentation-and-adrs`.
 | --- | --- |
 | 0024 (amended, then `Accepted`) | Adds: members known by their folder, and `package-name`; `path-outside-members` and `apps-are-roots`; `barras-kernel` only at the member's path; the `workspace-hack` exception (a path dependency in the kernel's and modules' lists, a wrapper in the bans, `xtask` left out) and the two rules that make it safe, `hack-isolation` and `hack-is-a-stub`; `no-build-script` for the kernel and the modules; the bans on `axum-core`, `hyper`, `hyper-util` and the deny list of alternatives. Its Context says the owner confirmed the stricter rule on 2026-11-15 |
 | 0026 | `barras-bootstrap`: what it holds, its row in the dependency table, the two rules; Barras builds and runs only on Unix, because the shutdown signal is SIGTERM and SIGINT |
-| 0027 | Tiers by file name (`e2e_`, `int_`); coverage over production lines, per crate; the kernel at 95%; what is not measured; doctests outside the measure; how `check-coverage` reads the sources (`syn`, `#[cfg(test)]` items) and the shapes it refuses; what the gates guard against and what they do not; its accepted limits (Task 2), with the definitions of the second round: a function body is a fn, a method, a default trait method or a closure; `tests.rs` and `tests/` inside `src/` are only tokenized; any identifier named `include` is refused; deep recursion without groups can still exhaust the parse stack; a macro inside syntax `syn` keeps as raw tokens is not seen by the macro rule |
-| 0028 | `barras-api openapi` and `--check`; the canonical file; the metadata of spec §7.2; `ApiRouter` as the only door; the three-layer guard |
+| 0027 | Tiers by file name (`e2e_`, `int_`); coverage over production lines, per crate; the kernel at 95%; what is not measured; doctests outside the measure; how `check-coverage` reads the sources (`syn`, `#[cfg(test)]` items) and the shapes it refuses; what the gates guard against and what they do not; its accepted limits (Task 2), with the definitions of the second round: a function body is a fn, a method, a default trait method or a closure; `tests.rs` and `tests/` inside `src/` are only tokenized; `include!` and a `use` that names `include` are refused, other identifiers named `include` are not; only `macro_rules!` bodies are judged, never macro calls; a cfg-gated file may be absent from the report; deep recursion without brackets can still exhaust the parse stack; an adapter's tests that need its `testing` feature live in `src/tests/` |
+| 0028 | `barras-api openapi` and `--check`; the canonical file; the metadata of spec §7.2; `ApiRouter` as the only door, refusing at `build` what the document cannot describe; the three-layer guard; operationIds unique across the API; a schema name registered once (`#[schema(as = …)]` when two modules share a type name) |
 | 0029 | The adapter's own codes and statuses; camelCase; no 204; `x-request-id`; the body limit and compression; the internal port without envelope; metrics from an explicit registry; `error.fields` comes only with `VALIDATION_FAILED`, so a domain `Validation` error such as `INVALID_CURRENCY` answers 422 without it; `NoData` for a route with nothing to return; a 401 carries `WWW-Authenticate: Bearer` |
 
 ADR-0003, ADR-0015, ADR-0016 and ADR-0017 keep their Decisions. A Consequence that is no longer accurate gets a pointer: ADR-0003 and the design §6.4 (`check-arch` has lists only for the kernel and the modules: ADR-0024); ADR-0015 (the internal port: ADR-0029); ADR-0016 (clippy now denies the four ways of reading the environment); ADR-0017 (how coverage is measured: ADR-0027).
