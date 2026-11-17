@@ -40,6 +40,7 @@ Date: 2026-11-17
 - A probe's error is one sentence of a fixed set. It never holds a URL, a user name, a password, or a driver's or a server's text, which can name the user when a password is refused, and in one SCRAM failure prints a character of the password. The internal `/health` and the log show it; the public routes never do.
 - The HTTP adapter's own sentences: `did not answer within 2 seconds`, and `stopped without an answer` for a check that panicked.
 - The sentences of the database probes of ADR-0030, the postgres adapter's `DatabaseUnavailable`: `no connection within 2 seconds`, when the database cannot be reached or every connection is busy; `the pool is closed`; `the server refused it with SQLSTATE <code>`, or `the server refused it` when the server gave no code; `the connection failed: <kind>`, where the kind is the standard library's fixed description of an `io::ErrorKind`, never the operating system's text; `TLS could not be set up`; `the server answered outside the protocol`; and `the driver failed`.
+- A pool gives up getting a connection after 2 seconds, and a probe gives up on its check after 2 seconds too. So a probe of a database that cannot be reached reports `no connection within 2 seconds` or the probe's own `did not answer within 2 seconds`, whichever limit passes first.
 
 ## Consequences
 

@@ -8,7 +8,9 @@ publish.workspace = true
 [dependencies]
 log.workspace = true
 sqlx.workspace = true
-# A connection to migrate with that does not close cleanly is logged.
+# `migrate`, `seed` and `reset` log at `warn` a connection of theirs that does not close cleanly.
+# barras-api's commands install no subscriber, so those warnings show only where one is
+# installed, as in a test that installs its own.
 tracing.workspace = true
 url.workspace = true
 workspace-hack.workspace = true

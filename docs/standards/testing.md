@@ -37,8 +37,8 @@ A test target's file name decides its tier, so a new test has nothing to registe
 - One container per test, never one shared: nextest runs every test in a process of its own, and a container held in a `static` would never be removed.
 - Dropping the container removes it, also while a failed test unwinds; it must be dropped inside the tokio runtime that started it. testcontainers' `watchdog` removes it when the test is stopped with SIGTERM, as nextest does at its time limit, or with SIGINT. Only SIGKILL leaves one behind: the label `barras-test=1` finds it, and `barras-throwaway=1` the throwaway database of `just db-prepare` and `just db-check`.
 - Docker not running fails the test with a sentence that says so. No test skips itself: that would hide a failure.
-- No test reaches the local database. Every URL a test uses comes from a container it started; the testkit reads no environment variable, apart from the coverage profile its process helper hands on; and the process tests hand each binary its whole environment.
-- `LoopbackRelay` of the testkit reaches a container through a port of `127.0.0.1`, as `ssh -L` would, and `PostgresContainer::start_as_another_server()` starts one without the local `cluster_name`. Together they stand for a server on another machine behind a port of this one, which `seed` and `reset` must refuse.
+- No test reaches the local database. Every URL a test connects to comes from a container it started; the testkit reads no environment variable, apart from the coverage profile its process helper hands on; and the process tests hand each binary its whole environment.
+- `LoopbackRelay` of the testkit reaches a container through a port of `127.0.0.1`, as `ssh -L` would, and `PostgresContainer::start_as_another_server()` starts one without the local `cluster_name`. Together they stand for a server on another machine behind a port of this one, which `seed` and `reset` must refuse. `LoopbackRelay::start_alternating` sends each new connection to two containers in turn, as a proxy in front of several servers would, so that a run that asked only its first connection would act on the second server.
 
 ## Coverage
 

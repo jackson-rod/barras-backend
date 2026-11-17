@@ -140,7 +140,7 @@ Built on appendix A.
 **The card's "Done when", shown on 2026-11-17:**
 
 - `just db-reset` rebuilds and seeds a local database: on the owner's machine, `just db-up` started the Postgres of `compose.yaml`, healthy; `just db-reset`, run twice, dropped, created, applied the migration and reported no seed to apply (no seed file exists until BAR-15); `just db-status` showed the migration installed.
-- Integration tests run against a throwaway container and never touch the local database: every `int_` and `e2e_` test starts its own container through the testkit, which reads no environment variable; no test names port 5433.
+- Integration tests run against a throwaway container and never touch the local database: every `int_` and `e2e_` test starts its own container through the testkit, which reads no environment variable; no test connects to port 5433.
 - CI fails when `.sqlx` is stale: in a clean clone, `just db-check` passed on the branch, then failed when `SELECT 1` became `SELECT 2` without `just db-prepare` ("missing one or more queries"), and failed when a migration widened to `int8` a column a checked query read ("one or more query files differ").
 
 **Measurements** (Apple M4; budgets from ADR-0014; 863 tests, coverage 96.9%):

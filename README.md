@@ -80,7 +80,7 @@ With the values of `.env.example`, `barras-api` listens on two addresses:
 | `just db-seed` | Loads the seeds into the database of `.env`; only a local database |
 | `just db-migrate <name>` | Creates a migration, `migrations/<timestamp>_<name>.sql`; the name is snake_case |
 | `just db-deploy` | Applies the pending migrations to the database of `.env` |
-| `just db-status` | Which migrations the database of `.env` has applied, which are pending, and which changed after they ran. It creates the history table, `public._sqlx_migrations`, in a database that lacks it |
+| `just db-status` | Which migrations the database of `.env` has applied, which are pending, and which changed after they ran. It creates the history table, `public._sqlx_migrations`, in a database that lacks it. A failure shows sqlx-cli's own error text, which can name the database user |
 | `just db-prepare` | Rewrites `.sqlx/` against a throwaway Postgres; run it after changing a query or adding a migration |
 | `just db-check` | Fails when `.sqlx/` is stale, or when a migration does not apply to an empty database |
 
