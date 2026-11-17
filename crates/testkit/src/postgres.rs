@@ -5,6 +5,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::net::SocketAddr;
+use std::process::Command;
 
 use testcontainers::bollard::models::{HostConfig, PortBinding};
 use testcontainers::core::{ContainerPort, WaitFor};
@@ -124,6 +125,30 @@ impl PostgresContainer {
     /// The container's id, for a test that asks Docker about it.
     pub fn id(&self) -> &str {
         self.container.id()
+    }
+
+    /// What `psql`, run inside the container as its user on the database `barras`, prints for
+    /// `sql`: its rows, one per line, without headers or alignment, trimmed. A test reads and
+    /// changes the database this way without a driver of its own, which only the postgres adapter
+    /// and the testkit may take. The test fails when psql does.
+    pub fn psql(&self, sql: &str) -> String {
+        let output = Command::new("docker")
+            .args(["exec", self.id(), "psql"])
+            .args([format!("--username={USER}"), format!("--dbname={DATABASE}")])
+            .args(["--quiet", "--tuples-only", "--no-align", "--command", sql])
+            .output()
+            .unwrap_or_else(|error| panic!("cannot run psql in the container: {error}"));
+        assert!(
+            output.status.success(),
+            "psql {sql}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .unwrap_or_else(|error| {
+                panic!("psql {sql} printed something that is not UTF-8: {error}")
+            })
+            .trim()
+            .to_owned()
     }
 }
 

@@ -2,9 +2,9 @@
 //! start without its configuration, naming each variable and never a value; it serves the public
 //! API and the internal port on the addresses it is given, reports its database in readiness
 //! without ever showing a credential (BAR-4 spec §6.3), logs JSON outside `local`, and stops with
-//! status 0 on SIGTERM; `openapi` prints the document and reads no variable, and
-//! `openapi --check` fails on a stale file. Neither a closed standard error nor a worker count
-//! for tokio in the environment turns a run into a panic.
+//! status 0 on SIGTERM, its database connections closed; `openapi` prints the document and reads
+//! no variable, and `openapi --check` fails on a stale file. Neither a closed standard error nor
+//! a worker count for tokio in the environment turns a run into a panic.
 //!
 //! Every address the binary binds is `127.0.0.1:0`: the system picks a free port, so no other
 //! process can take it first, and the test reads the ports from the `listening` line. A binary
@@ -18,8 +18,8 @@
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::path::Path;
-use std::process::Command;
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use barras_adapter_http::testing::{TestResponse, fetch};
 use barras_api::ApiConfig;
@@ -49,6 +49,11 @@ const NO_ANSWER_IN_TIME: [&str; 2] = [
     "no connection within 2 seconds",
     "did not answer within 2 seconds",
 ];
+
+/// How many sessions the binary has in a container's server: each of its connections names
+/// itself after it.
+const BINARY_SESSIONS: &str =
+    "SELECT count(*) FROM pg_stat_activity WHERE application_name = 'barras-api'";
 
 /// `GET path` on `addr`, from a test that has no runtime of its own.
 fn get(addr: SocketAddr, path: &str) -> TestResponse {
@@ -85,28 +90,6 @@ fn with_database(database: &str) -> BinaryCommand {
         .env("API_DATABASE_READ_URL", database)
 }
 
-/// What `psql`, run inside the container, prints for `sql`, trimmed. A test reads the database
-/// through the container: only the postgres adapter and the testkit may take a driver.
-fn psql(container: &PostgresContainer, sql: &str) -> String {
-    let output = Command::new("docker")
-        .args([
-            "exec",
-            container.id(),
-            "psql",
-            "--username=barras",
-            "--dbname=barras",
-        ])
-        .args(["--tuples-only", "--no-align", "--command", sql])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "psql {sql}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    text(&output.stdout).trim().to_owned()
-}
-
 /// A binary that listens on both its addresses.
 struct Serving {
     binary: RunningBinary,
@@ -137,6 +120,20 @@ fn serve(database: &str, variables: &[(&str, &str)]) -> Serving {
         public: address_in(&listening, "public_addr"),
         internal: address_in(&listening, "internal_addr"),
         binary,
+    }
+}
+
+/// Waits until the binary has no session left in `container`'s server. A session's server
+/// process records how the session ended before it leaves `pg_stat_activity`, so what
+/// `pg_stat_database` says of the binary's sessions is then whole.
+fn wait_until_no_session_is_left(container: &PostgresContainer) {
+    let deadline = Instant::now() + PATIENCE;
+    while container.psql(BINARY_SESSIONS) != "0" {
+        assert!(
+            Instant::now() < deadline,
+            "the binary's sessions were still open after {PATIENCE:?}"
+        );
+        thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -190,11 +187,11 @@ async fn with_the_database_up_the_binary_is_ready_and_its_internal_port_lists_ea
     let metrics_on_public = fetch(serving.public, "/metrics").await;
     let health = fetch(serving.internal, "/health").await;
     let metrics = fetch(serving.internal, "/metrics").await;
-    let connections = psql(
-        &container,
-        "SELECT count(*) FROM pg_stat_activity WHERE application_name = 'barras-api'",
-    );
+    let connections = container.psql(BINARY_SESSIONS);
     let output = serving.binary.terminate(PATIENCE);
+    wait_until_no_session_is_left(&container);
+    let abandoned =
+        container.psql("SELECT sessions_abandoned FROM pg_stat_database WHERE datname = 'barras'");
 
     assert_eq!(ready.status, 200);
     assert_eq!(ready.json()["data"]["status"], "ok");
@@ -242,6 +239,9 @@ async fn with_the_database_up_the_binary_is_ready_and_its_internal_port_lists_ea
     let ready_counted = r#"http_requests_total{method="GET",path="/api/v1/health",status="200"} 1"#;
     assert!(metrics.contains(ready_counted), "{metrics}");
     assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    // The pools closed both connections before the binary exited. A connection that the end of
+    // the process cut instead would count as abandoned (spec §4.2).
+    assert_eq!(abandoned, "0");
 }
 
 #[test]

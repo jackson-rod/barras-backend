@@ -1,9 +1,10 @@
 //! Test-only helpers for the workspace's tests; only dev-dependencies take this crate
 //! (`testkit-dev-only`). It holds:
 //!
-//! - containers: [`PostgresContainer`], a throwaway Postgres 18 that one test starts and that
-//!   is removed when the test ends, for the `int_` and `e2e_` tests, and [`LoopbackRelay`], a
-//!   port of this machine that leads to one, as a relay to another machine would;
+//! - containers: [`PostgresContainer`], a throwaway Postgres 18 that one test starts, reads with
+//!   `psql` inside it, and that is removed when the test ends, for the `int_` and `e2e_` tests,
+//!   and [`LoopbackRelay`], a port of this machine that leads to one, as a relay to another
+//!   machine would;
 //! - fixtures: the files of the repository ([`repository_file`]) and the variables of an env
 //!   file such as `.env.example` ([`env_file`]);
 //! - the process helper ([`process`]): a workspace binary started with a clean environment,

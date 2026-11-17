@@ -20,21 +20,6 @@ fn docker(args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
-/// One value, through `psql` inside the container: no client on this machine is needed.
-fn query(container: &PostgresContainer, sql: &str) -> String {
-    docker(&[
-        "exec",
-        container.id(),
-        "psql",
-        "--username=barras",
-        "--dbname=barras",
-        "--no-align",
-        "--tuples-only",
-        "--command",
-        sql,
-    ])
-}
-
 #[tokio::test]
 async fn a_container_serves_an_empty_barras_database_on_a_loopback_port() {
     let container = PostgresContainer::start().await;
@@ -56,10 +41,9 @@ async fn a_container_serves_an_empty_barras_database_on_a_loopback_port() {
         ]),
         "1"
     );
-    assert_eq!(query(&container, "SHOW fsync"), "off");
+    assert_eq!(container.psql("SHOW fsync"), "off");
     assert_eq!(
-        query(
-            &container,
+        container.psql(
             "SELECT count(*) FROM information_schema.tables \
              WHERE table_schema NOT IN ('pg_catalog', 'information_schema')"
         ),
@@ -72,9 +56,9 @@ async fn a_container_starts_as_the_local_server_unless_it_stands_for_another() {
     let local = PostgresContainer::start().await;
     let elsewhere = PostgresContainer::start_as_another_server().await;
 
-    assert_eq!(query(&local, "SHOW cluster_name"), "barras-local");
-    assert_eq!(query(&elsewhere, "SHOW cluster_name"), "");
-    assert_eq!(query(&elsewhere, "SHOW fsync"), "off");
+    assert_eq!(local.psql("SHOW cluster_name"), "barras-local");
+    assert_eq!(elsewhere.psql("SHOW cluster_name"), "");
+    assert_eq!(elsewhere.psql("SHOW fsync"), "off");
 }
 
 #[tokio::test]

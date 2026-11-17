@@ -12,7 +12,7 @@ use std::fs;
 use std::io;
 use std::net::{Ipv4Addr, TcpListener};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 use std::time::{Duration, Instant};
 
 use barras_api::{ApiConfig, LocalDatabaseConfig, MigrateConfig};
@@ -57,28 +57,6 @@ fn not_valid_but(variables: &[(&'static str, &'static str)]) -> Vec<(&'static st
         .map(|&name| (name, "not-valid"))
         .chain(variables.iter().copied())
         .collect()
-}
-
-/// What `psql`, run inside the container, prints for `sql`, trimmed. A test reads the database
-/// through the container: only the postgres adapter and the testkit may take a driver.
-fn psql(container: &PostgresContainer, sql: &str) -> String {
-    let output = Command::new("docker")
-        .args([
-            "exec",
-            container.id(),
-            "psql",
-            "--username=barras",
-            "--dbname=barras",
-        ])
-        .args(["--quiet", "--tuples-only", "--no-align", "--command", sql])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "psql {sql}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    text(&output.stdout).trim().to_owned()
 }
 
 /// The files of the repository's `migrations/` folder, in name order: every migration the binary
@@ -136,6 +114,15 @@ impl Drop for SeedFolder {
     }
 }
 
+/// A folder holding one seed file. With none to apply, `seed` connects to nothing even where it
+/// may run, so a refusal of it would prove nothing about connecting.
+fn one_seed(test: &str) -> SeedFolder {
+    SeedFolder::new(test).with(
+        "20261116000001_demo.sql",
+        "CREATE TABLE barras.demo (id int);",
+    )
+}
+
 #[tokio::test]
 async fn migrate_applies_every_migration_the_binary_carries_then_has_nothing_to_apply() {
     let container = PostgresContainer::start().await;
@@ -153,19 +140,16 @@ async fn migrate_applies_every_migration_the_binary_carries_then_has_nothing_to_
     assert_eq!(text(&second.stdout), "no migration to apply\n");
     assert_eq!(text(&second.stderr), "");
     let schema = "SELECT count(*) FROM pg_namespace WHERE nspname = 'barras'";
-    assert_eq!(psql(&container, schema), "1");
+    assert_eq!(container.psql(schema), "1");
 }
 
 #[tokio::test]
 async fn a_migration_that_fails_is_named_on_standard_error_with_its_sqlstate() {
     let container = PostgresContainer::start().await;
     // What the first migration creates, made by hand, so that the migration fails.
-    psql(&container, "CREATE SCHEMA barras");
+    container.psql("CREATE SCHEMA barras");
     // The tests' password, which the failure must not show.
-    psql(
-        &container,
-        &format!("ALTER USER barras PASSWORD '{PASSWORD}'"),
-    );
+    container.psql(&format!("ALTER USER barras PASSWORD '{PASSWORD}'"));
     let url = container
         .url()
         .replace(":barras@", &format!(":{PASSWORD}@"));
@@ -216,7 +200,7 @@ async fn seed_loads_the_sql_files_of_the_folder_in_name_order() {
     );
     assert_eq!(text(&seeded.stderr), "");
     let names = "SELECT string_agg(name, ',' ORDER BY id) FROM barras.demo";
-    assert_eq!(psql(&container, names), "first,second");
+    assert_eq!(container.psql(names), "first,second");
     // A seed assumes a database just migrated: run again, its first file fails, and the run says
     // so on standard error, with the file and the SQLSTATE, and applies nothing.
     assert_eq!(again.status.code(), Some(1), "{}", describe(&again));
@@ -227,7 +211,7 @@ async fn seed_loads_the_sql_files_of_the_folder_in_name_order() {
     );
     assert!(failure.ends_with("; nothing was applied\n"), "{failure}");
     assert_eq!(text(&again.stdout), "");
-    assert_eq!(psql(&container, names), "first,second");
+    assert_eq!(container.psql(names), "first,second");
 }
 
 #[tokio::test]
@@ -235,7 +219,7 @@ async fn reset_rebuilds_the_database_with_only_the_migrations_and_the_seeds() {
     let container = PostgresContainer::start().await;
     let migrated = run(&["migrate"], &[("API_DATABASE_URL", container.url())]);
     assert_eq!(migrated.status.code(), Some(0), "{}", describe(&migrated));
-    psql(&container, "CREATE TABLE public.left_over (id int)");
+    container.psql("CREATE TABLE public.left_over (id int)");
     let seeds = SeedFolder::new("reset").with(
         "20261116000001_demo.sql",
         "CREATE TABLE barras.demo (id int PRIMARY KEY);\nINSERT INTO barras.demo VALUES (1), (2);",
@@ -275,16 +259,16 @@ async fn reset_rebuilds_the_database_with_only_the_migrations_and_the_seeds() {
                   ORDER BY table_schema, table_name) FROM information_schema.tables \
                   WHERE table_schema NOT IN ('pg_catalog', 'information_schema')";
     assert_eq!(
-        psql(&container, tables),
+        container.psql(tables),
         "barras.demo,public._sqlx_migrations"
     );
-    assert_eq!(psql(&container, "SELECT count(*) FROM barras.demo"), "2");
+    assert_eq!(container.psql("SELECT count(*) FROM barras.demo"), "2");
 }
 
 #[tokio::test]
 async fn an_option_where_the_folder_goes_prints_the_usage_and_changes_nothing() {
     let container = PostgresContainer::start().await;
-    psql(&container, "CREATE TABLE public.left_over (id int)");
+    container.psql("CREATE TABLE public.left_over (id int)");
     // Everything a reset needs, so that only the command line stops one.
     let variables = [("APP_ENV", "local"), ("API_DATABASE_URL", container.url())];
 
@@ -297,7 +281,7 @@ async fn an_option_where_the_folder_goes_prints_the_usage_and_changes_nothing() 
     let tables = "SELECT string_agg(table_schema || '.' || table_name, ',' \
                   ORDER BY table_schema, table_name) FROM information_schema.tables \
                   WHERE table_schema NOT IN ('pg_catalog', 'information_schema')";
-    assert_eq!(psql(&container, tables), "public.left_over");
+    assert_eq!(container.psql(tables), "public.left_over");
     for (args, output) in outputs {
         assert_eq!(
             output.status.code(),
@@ -378,6 +362,7 @@ fn seed_and_reset_refuse_outside_local_before_any_connection() {
         "postgres://barras:{PASSWORD}@{}/barras",
         listener.local_addr().unwrap()
     );
+    let seeds = one_seed("refused-outside-local");
 
     for (command, refused) in [
         ("seed", "seeding refused: APP_ENV is not local\n"),
@@ -386,7 +371,7 @@ fn seed_and_reset_refuse_outside_local_before_any_connection() {
         for app_env in ["staging", "production"] {
             let started = Instant::now();
             let output = run(
-                &[command, "seeds"],
+                &[command, seeds.path()],
                 &[("APP_ENV", app_env), ("API_DATABASE_URL", &url)],
             );
 
@@ -408,11 +393,12 @@ fn seed_and_reset_refuse_outside_local_before_any_connection() {
 fn seed_and_reset_refuse_a_database_on_another_machine_before_any_connection() {
     // TEST-NET-1 (RFC 5737), where no machine answers.
     let url = format!("postgres://barras:{PASSWORD}@192.0.2.10:5432/barras");
+    let seeds = one_seed("refused-elsewhere");
 
     for (command, refused) in [("seed", "seeding refused"), ("reset", "reset refused")] {
         let started = Instant::now();
         let output = run(
-            &[command, "seeds"],
+            &[command, seeds.path()],
             &[("APP_ENV", "local"), ("API_DATABASE_URL", &url)],
         );
 
