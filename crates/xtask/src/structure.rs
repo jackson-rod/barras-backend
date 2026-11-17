@@ -1,6 +1,6 @@
-//! The layout rules for docs, module crates and migrations.
+//! The layout rules for docs, module crates, migrations and seeds.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
@@ -159,15 +159,43 @@ pub fn check_modules(modules_dir: &Path) -> Result<Vec<String>, XtaskError> {
     Ok(problems)
 }
 
+/// sqlx keys its history by version alone, so of two migrations that share one, only one is
+/// ever applied.
 pub fn check_migrations(migrations_dir: &Path) -> Result<Vec<String>, XtaskError> {
-    let name_rule = pattern(r"^\d{14}_[a-z0-9_]+\.sql$")?;
-    Ok(entries(migrations_dir)?
-        .into_iter()
-        .filter(|(name, _)| !name_rule.is_match(name))
-        .map(|(name, _)| {
-            format!("migrations/{name}: name must match YYYYMMDDHHMMSS_snake_case.sql")
-        })
-        .collect())
+    check_versioned_sql(migrations_dir, "migrations")
+}
+
+/// Seeds are named like migrations and run in name order, so in the order of their versions:
+/// two that share one would run in an order no version decides.
+pub fn check_seeds(seeds_dir: &Path) -> Result<Vec<String>, XtaskError> {
+    check_versioned_sql(seeds_dir, "seeds")
+}
+
+/// Every entry of `dir`, a folder of SQL files that run in the order of the version their names
+/// start with, is named `YYYYMMDDHHMMSS_snake_case.sql`, and no two share a version. A name that
+/// breaks the rule is reported for that alone: it is no such file, so it shares no version.
+fn check_versioned_sql(dir: &Path, folder: &str) -> Result<Vec<String>, XtaskError> {
+    let name_rule = pattern(r"^(\d{14})_[a-z0-9_]+\.sql$")?;
+    let mut problems = Vec::new();
+    let mut by_version: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (name, _) in entries(dir)? {
+        let Some(version) = name_rule.captures(&name).map(|c| c[1].to_owned()) else {
+            problems.push(format!(
+                "{folder}/{name}: name must match YYYYMMDDHHMMSS_snake_case.sql"
+            ));
+            continue;
+        };
+        by_version.entry(version).or_default().push(name);
+    }
+    for (version, names) in by_version {
+        if names.len() > 1 {
+            problems.push(format!(
+                "{folder}: version {version} is used by more than one file: {}",
+                names.join(", ")
+            ));
+        }
+    }
+    Ok(problems)
 }
 
 pub fn check_structure(repo_root: &Path) -> Result<Vec<String>, XtaskError> {
@@ -185,6 +213,12 @@ pub fn check_structure(repo_root: &Path) -> Result<Vec<String>, XtaskError> {
     let migrations = repo_root.join("migrations");
     if migrations.is_dir() {
         problems.extend(check_migrations(&migrations)?);
+    }
+    // A missing folder holds no seed, as the seed runner reads it: the first seed comes with the
+    // first module that needs local data.
+    let seeds = repo_root.join("seeds");
+    if seeds.is_dir() {
+        problems.extend(check_seeds(&seeds)?);
     }
     Ok(problems)
 }
@@ -319,12 +353,80 @@ mod tests {
     }
 
     #[test]
+    fn two_migrations_with_the_same_version_are_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "20261115120000_create_users.sql", "");
+        write(dir.path(), "20261115120000_create_wallets.sql", "");
+        write(dir.path(), "20261116090000_create_goals.sql", "");
+        // Refused for its name alone: it is no migration, so it shares no version.
+        write(dir.path(), "20261115120000_create_users.sql.bak", "");
+        assert_eq!(
+            check_migrations(dir.path()).unwrap(),
+            [
+                "migrations/20261115120000_create_users.sql.bak: name must match \
+                 YYYYMMDDHHMMSS_snake_case.sql",
+                "migrations: version 20261115120000 is used by more than one file: \
+                 20261115120000_create_users.sql, 20261115120000_create_wallets.sql",
+            ]
+        );
+    }
+
+    #[test]
+    fn seed_names() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "20261116000001_demo_user.sql", "");
+        write(dir.path(), "demo_user.sql", "");
+        write(dir.path(), "20261116000002_DemoWallets.sql", "");
+        write(dir.path(), "README.md", "");
+        assert_eq!(
+            check_seeds(dir.path()).unwrap(),
+            [
+                "seeds/20261116000002_DemoWallets.sql: name must match \
+                 YYYYMMDDHHMMSS_snake_case.sql",
+                "seeds/README.md: name must match YYYYMMDDHHMMSS_snake_case.sql",
+                "seeds/demo_user.sql: name must match YYYYMMDDHHMMSS_snake_case.sql",
+            ]
+        );
+    }
+
+    #[test]
+    fn two_seeds_with_the_same_version_are_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "20261116000001_demo_user.sql", "");
+        write(dir.path(), "20261116000001_demo_wallets.sql", "");
+        write(dir.path(), "20261116000001_demo_goals.sql", "");
+        write(dir.path(), "20261116000002_demo_budgets.sql", "");
+        assert_eq!(
+            check_seeds(dir.path()).unwrap(),
+            [
+                "seeds: version 20261116000001 is used by more than one file: \
+                 20261116000001_demo_goals.sql, 20261116000001_demo_user.sql, \
+                 20261116000001_demo_wallets.sql"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_seeds_folder_is_checked_when_it_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "docs/adr/README.md", "[0001](0001-a.md)\n");
+        write(root, "docs/adr/0001-a.md", &adr(1, "A"));
+        write(root, "seeds/demo_user.sql", "");
+        assert_eq!(
+            check_structure(root).unwrap(),
+            ["seeds/demo_user.sql: name must match YYYYMMDDHHMMSS_snake_case.sql"]
+        );
+    }
+
+    #[test]
     fn missing_optional_folders_are_fine_but_adrs_are_required() {
         let dir = tempfile::tempdir().unwrap();
         let found = check_structure(dir.path()).unwrap().join("\n");
         assert!(found.contains("docs/adr is missing"));
         assert!(!found.contains("modules"));
         assert!(!found.contains("migrations"));
+        assert!(!found.contains("seeds"));
     }
 
     #[test]
@@ -351,6 +453,8 @@ mod tests {
         write(root, "crates/modules/.DS_Store", "");
         write(root, "migrations/20261115120000_create_users.sql", "");
         write(root, "migrations/.DS_Store", "");
+        write(root, "seeds/20261116000001_demo_user.sql", "");
+        write(root, "seeds/.DS_Store", "");
         assert_eq!(check_structure(dir.path()).unwrap(), Vec::<String>::new());
     }
 
