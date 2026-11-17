@@ -15,7 +15,10 @@ workspace-hack.workspace = true
 
 [dev-dependencies]
 barras-testkit.workspace = true
+# The statement logs, written as JSON lines and read back.
+serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "time"] }
+tracing-subscriber = { workspace = true, features = ["fmt", "json"] }
 
 [lints]
 workspace = true

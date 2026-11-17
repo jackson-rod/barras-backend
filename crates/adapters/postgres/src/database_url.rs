@@ -26,6 +26,7 @@ const SLOW_STATEMENT: Duration = Duration::from_millis(250);
 ///
 /// It holds the password, so it has no `Debug`: the driver's options and the URL both print it.
 pub struct DatabaseUrl {
+    url: Url,
     options: PgConnectOptions,
 }
 
@@ -65,6 +66,7 @@ impl DatabaseUrl {
         }
         let options = PgConnectOptions::from_url(&url).map_err(|_| UrlProblem::Unreadable)?;
         Ok(Self {
+            url,
             // sqlx's event for each statement has no message, which every log line must have,
             // and shows the SQL at `debug`; a slow statement's event has one (plan, refinement 3).
             options: options
@@ -76,6 +78,11 @@ impl DatabaseUrl {
     /// The options every connection of this crate starts from.
     pub(crate) fn connect_options(&self) -> PgConnectOptions {
         self.options.clone()
+    }
+
+    /// Whether `other` is the same URL, as the `url` crate writes both out.
+    pub(crate) fn is_same_as(&self, other: &Self) -> bool {
+        self.url == other.url
     }
 }
 

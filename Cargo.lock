@@ -220,9 +220,11 @@ version = "0.1.0"
 dependencies = [
  "barras-testkit",
  "log",
+ "serde_json",
  "sqlx",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "url",
  "workspace-hack",
 ]
