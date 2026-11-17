@@ -11,7 +11,7 @@ use axum::routing::MethodRouter;
 use utoipa::openapi::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 
-use crate::health::{HealthProbe, health_routes};
+use crate::health::{HealthChecks, HealthProbe, health_routes};
 use crate::internal::InternalApp;
 use crate::metrics::Metrics;
 use crate::middleware;
@@ -104,7 +104,10 @@ impl HttpAppBuilder {
     /// The app, or every problem `ApiRouter` recorded about a route the document cannot
     /// describe: an app that would serve such a route is not built.
     pub fn build(self) -> Result<HttpApp, BuildError> {
-        let routes = health_routes(self.probes.clone())
+        // One value for both ports, so that the public readiness route and the internal health
+        // route share each run of the probes.
+        let checks = HealthChecks::new(self.probes);
+        let routes = health_routes(checks.clone())
             .merge(self.routes)
             .into_router()
             .map_err(|problems| BuildError { problems })?;
@@ -115,7 +118,7 @@ impl HttpAppBuilder {
             .split_for_parts();
         #[cfg(any(test, feature = "testing"))]
         let router = router.merge(self.undocumented);
-        let internal = InternalApp::new(self.metrics.clone(), self.probes);
+        let internal = InternalApp::with_checks(self.metrics.clone(), checks);
         Ok(HttpApp {
             router: middleware::wrap(router, self.metrics),
             document,

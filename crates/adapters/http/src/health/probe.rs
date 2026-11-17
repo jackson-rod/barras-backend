@@ -38,9 +38,10 @@ pub struct HealthProbe {
 }
 
 impl HealthProbe {
-    /// `check` runs once per readiness request, at the same time as every other probe, and has
-    /// two seconds to answer. The name and the error show on the internal port and in the log,
-    /// never on the public port; neither may hold a credential.
+    /// `check` runs at the same time as every other probe, and has two seconds to answer. The
+    /// readiness requests that arrive while it runs, on either port, share its answer, and an
+    /// answer less than one second old is given again. The name and the error show on the
+    /// internal port and in the log, never on the public port; neither may hold a credential.
     pub fn new<F, Fut>(name: &'static str, criticality: Criticality, check: F) -> Self
     where
         F: Fn() -> Fut + Send + Sync + 'static,

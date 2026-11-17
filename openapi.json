@@ -122,7 +122,7 @@
   "paths": {
     "/api/v1/health": {
       "get": {
-        "description": "Every probe of a dependency runs at once, each with two seconds to answer. The answer is\n`ok` when every probe passes and `degraded` when only probes of optional dependencies fail.",
+        "description": "Every probe of a dependency runs at once, each with two seconds to answer. The answer is\n`ok` when every probe passes and `degraded` when only probes of optional dependencies fail.\nRequests that arrive while the probes run share their answer, and an answer less than one\nsecond old is given again.",
         "operationId": "readiness",
         "responses": {
           "200": {

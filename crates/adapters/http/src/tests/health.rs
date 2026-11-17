@@ -1,6 +1,10 @@
 //! Health (spec §5): the two public routes, whose answers never name a dependency, and the
-//! internal port, which details every probe and serves the metrics.
+//! internal port, which details every probe and serves the metrics. Both ports answer from one
+//! run of the probes, shared by the requests that come while it goes, and given again for a
+//! second (BAR-4 spec §6.3).
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -52,6 +56,28 @@ fn panicking(name: &'static str, criticality: Criticality) -> HealthProbe {
 /// A check that panics as soon as it is called, before it has a future to give.
 fn panic_when_called() -> std::future::Ready<Result<(), String>> {
     panic!("probe-panic-secret")
+}
+
+/// A critical probe that passes once `delay` has passed, counting each run of its check in
+/// `runs`.
+fn counted(name: &'static str, runs: &Arc<AtomicUsize>, delay: Duration) -> HealthProbe {
+    let runs = Arc::clone(runs);
+    HealthProbe::new(name, Criticality::Critical, move || {
+        runs.fetch_add(1, Ordering::SeqCst);
+        async move {
+            tokio::time::sleep(delay).await;
+            Ok(())
+        }
+    })
+}
+
+/// A counter of the runs of a check.
+fn counter() -> Arc<AtomicUsize> {
+    Arc::new(AtomicUsize::new(0))
+}
+
+fn count(runs: &Arc<AtomicUsize>) -> usize {
+    runs.load(Ordering::SeqCst)
 }
 
 fn app_with(probes: Vec<HealthProbe>) -> HttpApp {
@@ -575,4 +601,131 @@ fn the_health_routes_document_their_tag_their_codes_and_their_answers() {
             "description": "`ok`, or `degraded` while a dependency the service can do without is down."
         })
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn two_requests_at_the_same_time_run_each_check_once() {
+    let (database, cache) = (counter(), counter());
+    let delay = Duration::from_millis(100);
+    let client = public_client(vec![
+        counted("database", &database, delay),
+        counted("cache", &cache, delay),
+    ]);
+    let started = Instant::now();
+
+    let (first, second) = tokio::join!(client.get("/api/v1/health"), client.get("/api/v1/health"));
+
+    assert_eq!((count(&database), count(&cache)), (1, 1));
+    // The second waited for the run the first started, and none after it.
+    assert_eq!(started.elapsed(), delay);
+    for response in [first, second] {
+        assert_eq!(response.status, 200, "{}", text(&response));
+        assert_eq!(response.json()["data"], json!({ "status": "ok" }));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_request_less_than_a_second_after_a_run_is_answered_from_it() {
+    let runs = counter();
+    let client = public_client(vec![counted("database", &runs, Duration::ZERO)]);
+    client.get("/api/v1/health").await;
+
+    tokio::time::sleep(Duration::from_millis(999)).await;
+    let response = client.get("/api/v1/health").await;
+
+    assert_eq!(count(&runs), 1);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.json()["data"], json!({ "status": "ok" }));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_request_a_second_after_a_run_runs_the_checks_again() {
+    let runs = counter();
+    let client = public_client(vec![counted("database", &runs, Duration::ZERO)]);
+    client.get("/api/v1/health").await;
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let response = client.get("/api/v1/health").await;
+
+    assert_eq!(count(&runs), 2);
+    assert_eq!(response.status, 200);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_public_and_the_internal_routes_share_a_run() {
+    let runs = counter();
+    let app = app_with(vec![counted("database", &runs, Duration::ZERO)]);
+
+    let public = TestClient::new(&app).get("/api/v1/health").await;
+    let internal = TestClient::internal(app.internal()).get("/health").await;
+
+    assert_eq!(count(&runs), 1);
+    assert_eq!(public.status, 200);
+    assert_eq!(internal.status, 200);
+    assert_eq!(internal.json()["dependencies"][0]["status"], "up");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_shared_run_still_reports_a_check_that_panics_or_never_answers() {
+    let runs = counter();
+    let app = app_with(vec![
+        silent("cache", Criticality::Optional),
+        panicking("search", Criticality::Optional),
+        counted("database", &runs, Duration::ZERO),
+    ]);
+    let (public_port, internal_port) =
+        (TestClient::new(&app), TestClient::internal(app.internal()));
+    let started = Instant::now();
+
+    let (public, internal) = tokio::join!(
+        public_port.get("/api/v1/health"),
+        internal_port.get("/health")
+    );
+
+    assert_eq!(count(&runs), 1);
+    assert_eq!(started.elapsed(), Duration::from_secs(2));
+    assert_eq!(public.status, 200, "{}", text(&public));
+    assert_eq!(public.json()["data"], json!({ "status": "degraded" }));
+    assert_eq!(internal.status, 200);
+    // A check that panicked took no longer than the whole run, the one time known of it.
+    assert_eq!(
+        internal.json()["dependencies"],
+        json!([
+            {
+                "name": "cache",
+                "critical": false,
+                "status": "down",
+                "latencyMs": 2000,
+                "error": "did not answer within 2 seconds"
+            },
+            {
+                "name": "search",
+                "critical": false,
+                "status": "down",
+                "latencyMs": 2000,
+                "error": "stopped without an answer"
+            },
+            { "name": "database", "critical": true, "status": "up", "latencyMs": 0 },
+        ])
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_run_goes_on_when_its_request_goes_away_and_answers_the_next_one() {
+    let runs = counter();
+    let delay = Duration::from_millis(100);
+    let client = public_client(vec![counted("database", &runs, delay)]);
+    let started = Instant::now();
+    // As a client that closes its connection does, which drops its request.
+    let gone = tokio::time::timeout(delay / 2, client.get("/api/v1/health")).await;
+    assert!(gone.is_err(), "the first request was answered");
+
+    let next = tokio::time::timeout(Duration::from_secs(10), client.get("/api/v1/health")).await;
+
+    let response = next.expect("the next request had no answer");
+    // Leaving starts runs no faster than waiting does.
+    assert_eq!(count(&runs), 1);
+    assert_eq!(started.elapsed(), delay);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.json()["data"], json!({ "status": "ok" }));
 }

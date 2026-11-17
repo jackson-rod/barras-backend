@@ -1,20 +1,15 @@
 //! The two public health routes (spec §5). Neither answer names a dependency: what each probe
 //! said is for the internal port and, on a 503, for the log.
 
-use std::sync::Arc;
-
 use axum::extract::State;
 use utoipa_axum::routes;
 
+use super::checks::HealthChecks;
 use super::dto::HealthStatus;
-use super::probe::{HealthProbe, ProbeReport, Readiness, check_all};
+use super::probe::{ProbeReport, Readiness};
 use crate::envelope::{ApiResult, ApiSuccess, ErrorEnvelope, SuccessEnvelope};
 use crate::error::ApiError;
 use crate::router::{Access, ApiRouter};
-
-/// The probes readiness runs, shared by every request.
-#[derive(Clone)]
-struct Probes(Arc<[HealthProbe]>);
 
 /// Whether the process is running.
 ///
@@ -35,6 +30,8 @@ async fn liveness() -> ApiResult<HealthStatus> {
 ///
 /// Every probe of a dependency runs at once, each with two seconds to answer. The answer is
 /// `ok` when every probe passes and `degraded` when only probes of optional dependencies fail.
+/// Requests that arrive while the probes run share their answer, and an answer less than one
+/// second old is given again.
 #[utoipa::path(
     get,
     path = "/health",
@@ -48,8 +45,8 @@ async fn liveness() -> ApiResult<HealthStatus> {
         (status = 503, description = "A dependency the service needs is down", body = ErrorEnvelope),
     ),
 )]
-async fn readiness(State(Probes(probes)): State<Probes>) -> ApiResult<HealthStatus> {
-    let reports = check_all(&probes).await;
+async fn readiness(State(checks): State<HealthChecks>) -> ApiResult<HealthStatus> {
+    let reports = checks.reports().await;
     match Readiness::of(&reports) {
         Readiness::Ok => Ok(ApiSuccess::ok("Service is ready", HealthStatus::OK)),
         Readiness::Degraded => {
@@ -76,8 +73,8 @@ fn down(reports: &[ProbeReport], critical: bool) -> String {
     format!("{kind} dependencies are down: {}", failed.join(", "))
 }
 
-/// `GET /health/live` and `GET /health`, the second answering from `probes`.
-pub(crate) fn health_routes(probes: Vec<HealthProbe>) -> ApiRouter {
+/// `GET /health/live` and `GET /health`, the second answering from `checks`.
+pub(crate) fn health_routes(checks: HealthChecks) -> ApiRouter {
     ApiRouter::new()
         .route(routes!(liveness), Access::public(), &[])
         .route(
@@ -85,5 +82,5 @@ pub(crate) fn health_routes(probes: Vec<HealthProbe>) -> ApiRouter {
             Access::public(),
             &[ApiError::SERVICE_UNAVAILABLE],
         )
-        .with_state(Probes(probes.into()))
+        .with_state(checks)
 }

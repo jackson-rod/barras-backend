@@ -2,8 +2,6 @@
 //! Prometheus. No `/api/v1` prefix, no envelope, nothing in the OpenAPI document, and none of
 //! the public middleware, so its requests are neither counted nor logged as public ones.
 
-use std::sync::Arc;
-
 use axum::Router;
 use axum::extract::State;
 use axum::http::header::CONTENT_TYPE;
@@ -14,7 +12,7 @@ use serde::Serialize;
 
 use crate::envelope::json_response;
 use crate::error::with_sources;
-use crate::health::{HealthProbe, ProbeReport, Readiness, check_all};
+use crate::health::{HealthChecks, HealthProbe, ProbeReport, Readiness};
 use crate::metrics::Metrics;
 
 const PROMETHEUS_TEXT: HeaderValue = HeaderValue::from_static(prometheus::TEXT_FORMAT);
@@ -29,7 +27,7 @@ pub struct InternalApp {
 #[derive(Clone)]
 struct Internal {
     metrics: Metrics,
-    probes: Arc<[HealthProbe]>,
+    checks: HealthChecks,
 }
 
 impl InternalApp {
@@ -37,10 +35,13 @@ impl InternalApp {
     /// metrics were made for, and `GET /metrics` from `metrics`: the registry the public app
     /// records into, when the binary has one.
     pub fn new(metrics: Metrics, probes: Vec<HealthProbe>) -> Self {
-        let internal = Internal {
-            metrics,
-            probes: probes.into(),
-        };
+        Self::with_checks(metrics, HealthChecks::new(probes))
+    }
+
+    /// As [`InternalApp::new`], answering `GET /health` from `checks`, whose runs the public
+    /// app of the same binary shares.
+    pub(crate) fn with_checks(metrics: Metrics, checks: HealthChecks) -> Self {
+        let internal = Internal { metrics, checks };
         let router = Router::new()
             .route("/health", get(health))
             .route("/metrics", get(metrics_text))
@@ -55,7 +56,7 @@ impl InternalApp {
 
 /// 200, or 503 when a critical dependency is down, with every probe's answer.
 async fn health(State(internal): State<Internal>) -> Response {
-    let reports = check_all(&internal.probes).await;
+    let reports = internal.checks.reports().await;
     let readiness = Readiness::of(&reports);
     let status = match readiness {
         Readiness::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
