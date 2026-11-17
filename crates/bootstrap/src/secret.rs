@@ -25,15 +25,16 @@ impl<T> Secret<T> {
     }
 }
 
+// `pad`, so that a width or a fill applies to `[redacted]` as it would to the value.
 impl<T> fmt::Debug for Secret<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(REDACTED)
+        f.pad(REDACTED)
     }
 }
 
 impl<T> fmt::Display for Secret<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(REDACTED)
+        f.pad(REDACTED)
     }
 }
 
@@ -83,6 +84,10 @@ mod tests {
         assert_eq!(format!("{secret:?}"), "[redacted]");
         assert_eq!(format!("{secret:#?}"), "[redacted]");
         assert_eq!(secret.to_string(), "[redacted]");
+        assert_eq!(
+            format!("{secret:>12}|{secret:<12?}|"),
+            "  [redacted]|[redacted]  |"
+        );
     }
 
     #[test]
@@ -182,7 +187,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "DATABASE_PASSWORD is not valid: expected any text"
+            "DATABASE_PASSWORD is not valid: expected text in UTF-8"
         );
         let debug = format!("{error:?}");
         assert!(!debug.contains("hunter2"), "{debug}");

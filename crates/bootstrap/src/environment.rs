@@ -31,7 +31,9 @@ pub trait FromEnvValue: Sized {
     const EXPECTED: &'static str;
 
     /// The value the text stands for, or `None`. [`Environment`] never passes an empty
-    /// text, and never trims one.
+    /// text, and never trims one. An implementation never logs, keeps or returns `raw` when it
+    /// refuses it, nor puts it in an error: through [`Secret`](crate::Secret) it can be a
+    /// credential.
     fn from_env_value(raw: &str) -> Option<Self>;
 }
 
@@ -87,7 +89,8 @@ impl FromEnvValue for NonZeroU32 {
 /// For a value with no structure of its own to check. It takes any text: an empty one never
 /// gets here, since it counts as missing, and one that is not Unicode is refused before.
 impl FromEnvValue for String {
-    const EXPECTED: &'static str = "any text";
+    // It is refused only when it is not UTF-8, so that is what its problem line names.
+    const EXPECTED: &'static str = "text in UTF-8";
 
     fn from_env_value(raw: &str) -> Option<Self> {
         Some(raw.to_owned())
@@ -470,7 +473,7 @@ mod tests {
             "a socket address such as 127.0.0.1:8080"
         );
         assert_eq!(NonZeroU32::EXPECTED, "a whole number from 1 to 4294967295");
-        assert_eq!(String::EXPECTED, "any text");
+        assert_eq!(String::EXPECTED, "text in UTF-8");
     }
 
     #[test]
