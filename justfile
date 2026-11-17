@@ -27,6 +27,14 @@ _watch binary: (_with-env "watchexec" "--restart" "--filter" "*.rs" "--filter" "
 
 # Runs the given command in place of this script, with the variables of .env exported. A binary
 # refuses to start without its variables, so a missing .env is named before anything builds.
+#
+# .env is read line by line and never run: run as a script, a value holding $, ; or a backtick
+# would expand, run a command, or show pieces of itself in bash's errors. Each line is blank, a
+# comment, or NAME=value with a value that holds only what the rule of .env.example allows
+# (letters, digits and . _ : / @ % + , = [ ] -), exported as written. Any other line is refused by
+# its number alone, since its text may hold a password, and nothing runs. The letters are listed
+# one by one rather than as ranges, which a locale can widen. It runs on bash 3.2, macOS's, as on
+# bash 5.
 [positional-arguments]
 _with-env +command:
     #!/usr/bin/env bash
@@ -35,11 +43,32 @@ _with-env +command:
         echo 'copy .env.example to .env' >&2
         exit 1
     fi
-    set -a
-    # With a slash: bash's source looks a bare name up in the folders of PATH before this one, so
-    # a .env in any of them would be read in place of the project's.
-    source ./.env
-    set +a
+    upper=ABCDEFGHIJKLMNOPQRSTUVWXYZ
+    lower=abcdefghijklmnopqrstuvwxyz
+    digits=0123456789
+    skipped='^[[:space:]]*(#|$)'
+    name_rule="^[_$upper][_$upper$digits]*\$"
+    # ] first and - last, so that each stands for itself inside the brackets.
+    value_rule="^[][$upper$lower$digits._:/@%+,=-]*\$"
+    number=0
+    refused=0
+    while IFS= read -r line || [[ -n $line ]]; do
+        number=$((number + 1))
+        if [[ $line =~ $skipped ]]; then
+            continue
+        fi
+        name="${line%%=*}"
+        value="${line#*=}"
+        if [[ $name == "$line" || ! $name =~ $name_rule || ! $value =~ $value_rule ]]; then
+            echo ".env, line $number: not a comment or NAME=value with a value of letters, digits and . _ : / @ % + , = [ ] -" >&2
+            refused=1
+            continue
+        fi
+        export "$name=$value"
+    done < .env
+    if [[ $refused -ne 0 ]]; then
+        exit 1
+    fi
     exec "$@"
 
 # The local database is the postgres service of compose.yaml, on 127.0.0.1:5433 (ADR-0007). The

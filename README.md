@@ -49,7 +49,7 @@ With the values of `.env.example`, `barras-api` listens on two addresses:
 | `http://127.0.0.1:8080/api/v1` | The public API. `GET /api/v1/health/live` answers while the process runs; `GET /api/v1/health` answers whether it can take traffic |
 | `http://127.0.0.1:9080` | The internal port, for operators: `GET /health`, the health of each dependency, and `GET /metrics`, the Prometheus metrics |
 
-`just dev-ingest` runs `barras-ingest`, whose internal port, `http://127.0.0.1:9081`, answers the same `GET /health` and `GET /metrics`. A binary that misses a variable, or reads one it cannot use, names each such variable and does not start; `just dev` stops before it builds anything when `.env` is missing.
+`just dev-ingest` runs `barras-ingest`, whose internal port, `http://127.0.0.1:9081`, answers the same `GET /health` and `GET /metrics`. A binary that misses a variable, or reads one it cannot use, names each such variable and does not start; `just dev` stops before it builds anything when `.env` is missing, or holds a line that is not blank, a `#` comment or `NAME=value` with a value of letters, digits and `. _ : / @ % + , = [ ] -`, which it names by its number.
 
 ## The local database
 

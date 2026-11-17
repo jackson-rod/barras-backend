@@ -63,6 +63,7 @@ sqlx-cli is a tool, not a member of the workspace, so `just deny` never reads it
 ## Your `.env`
 
 - `just dev` and the `db-*` commands that connect export the variables of `.env`, your copy of `.env.example`. When `.env.example` gains a variable, add it to your `.env`: a binary refuses to start without it, naming it.
+- They read `.env` line by line and never run it as a script, so a value is exported exactly as written. A line that is not blank, a `#` comment or `NAME=value` with a value as below stops them before anything runs, named by its number alone, never by its text, which may hold a password.
 - The sqlx query macros read every `.env` from the crate's folder up to `/` when they compile, offline too. One that their parser cannot read fails every build, with `error reading dotenv file` and its path, not the line, and that includes a `.env` above the checkout, such as one in your home folder. Keep each line a comment or `NAME=value`, with a value of letters, digits and `. _ : / @ % + , = [ ] -` only, as `.env.example` has: a blank or an unclosed quote in a value breaks it.
 
 ## Pull requests

@@ -96,13 +96,13 @@ jobs:
             echo "dockerd does not list $MIRROR among its registry mirrors after the restart" >&2
             exit 1
           fi
-      # The image of compose.yaml's postgres service, read from that file alone, as the
-      # throwaway database of `just db-check` reads it. In a step of its own, with its
-      # own bound, so that a slow pull is charged to no check.
+      # The image of compose.yaml's postgres service, read from that file alone, without
+      # a .env, as the throwaway database of `just db-check` reads it. In a step of its
+      # own, with its own bound, so that a slow pull is charged to no check.
       - name: Pull the Postgres image
         timeout-minutes: 5
         run: |
-          image="$(docker compose --file compose.yaml config --images postgres)"
+          image="$(docker compose --file compose.yaml --env-file /dev/null config --images postgres)"
           docker pull "$image"
       # Every check runs even when a step above it failed, so one finding never
       # hides another.
@@ -230,13 +230,13 @@ jobs:
             exit 1
           fi
       # The int_ and e2e_ tests start their containers from the image of compose.yaml's
-      # postgres service, read from that file alone, as the testkit reads it. Pulled in
-      # a step of its own, with its own bound, so that a slow pull is charged to no
-      # test's time limit.
+      # postgres service, read from that file alone, without a .env, as the testkit
+      # reads it. Pulled in a step of its own, with its own bound, so that a slow pull is
+      # charged to no test's time limit.
       - name: Pull the Postgres image
         timeout-minutes: 5
         run: |
-          image="$(docker compose --file compose.yaml config --images postgres)"
+          image="$(docker compose --file compose.yaml --env-file /dev/null config --images postgres)"
           docker pull "$image"
       # Every test once under coverage, then the thresholds. nextest kills a test
       # that hangs (.config/nextest.toml).

@@ -51,7 +51,7 @@ Every command runs from the repository root through `just`.
 | --- | --- |
 | `just` | Lists the recipes (the `default` recipe) |
 | `just setup` | Installs the toolchain that `rust-toolchain.toml` names, with its components (`rustup toolchain install`); installs cargo-nextest 0.9.152, cargo-deny 0.20.2, cargo-hakari 0.9.39, cargo-llvm-cov 0.9.1 and watchexec 2.8.0, then sqlx-cli 0.9.0 with Postgres support alone and its `sqlx-toml` feature, without which it refuses to run beside `sqlx.toml` (`cargo install --locked`); installs the git hooks |
-| `just dev` | Fails with `copy .env.example to .env` when `.env` is missing. Otherwise exports the variables of `.env` and runs `barras-api` under watchexec, which restarts it with SIGTERM whenever a `.rs` file or a `Cargo.toml` changes. It serves while the database is down, readiness answering 503 |
+| `just dev` | Fails with `copy .env.example to .env` when `.env` is missing. Otherwise exports the variables of `.env` and runs `barras-api` under watchexec, which restarts it with SIGTERM whenever a `.rs` file or a `Cargo.toml` changes. It serves while the database is down, readiness answering 503. `.env` is read line by line, never run as a script: each line is blank, a `#` comment, or `NAME=value` with a value that follows the rule of `.env.example`, exported as written; any other line fails it, named by its number alone |
 | `just dev-ingest` | The same for `barras-ingest` |
 | `just db-up` | Starts the local Postgres, the `postgres` service of `compose.yaml` on `127.0.0.1:5433`, and waits until it accepts connections (`docker compose up --detach --wait`) |
 | `just db-down` | Stops it; its data stays in the volume |
