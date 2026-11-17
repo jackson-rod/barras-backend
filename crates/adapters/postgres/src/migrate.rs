@@ -51,7 +51,7 @@ pub async fn migrate_with(
 }
 
 /// [`migrate`] on a database the guard judged local, at the address it judged, as `reset`
-/// migrates the database it created again.
+/// migrates the database it has just created.
 pub(crate) async fn migrate_local(
     local: &LocalDatabase,
 ) -> Result<Vec<AppliedMigration>, MigrateError> {

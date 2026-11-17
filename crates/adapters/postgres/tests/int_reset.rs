@@ -1,6 +1,6 @@
 //! `reset` against a real Postgres, in a container of each test's own: the database rebuilt with
-//! only the migrations and the seeds, whatever it held and whoever was connected to it, and the
-//! state each failure leaves it in.
+//! only the migrations and the seeds, whatever it held, whoever was connected to it and whatever
+//! its name holds; the server that answers; and the state each failure leaves it in.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // an integration test: a step that fails must fail the test
 
 use std::fs;
@@ -9,8 +9,8 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 
 use barras_adapter_postgres::{
-    AppliedMigration, AppliedSeed, DatabaseUnavailable, DatabaseUrl, NotLocal, ResetError,
-    SeedError, SeedFailure, migrate, reset,
+    AppliedMigration, AppliedSeed, DatabaseUnavailable, DatabaseUrl, MigrateError,
+    MigrationFailure, NotLocal, ResetError, SeedError, SeedFailure, migrate, reset,
 };
 use barras_testkit::{LoopbackRelay, PostgresContainer};
 use sqlx::postgres::PgConnectOptions;
@@ -353,6 +353,7 @@ async fn a_database_dropped_that_the_user_may_not_create_again_is_gone() {
         error,
         ResetError::Create {
             database: "visited".to_owned(),
+            dropped: true,
             cause: DatabaseUnavailable::Refused {
                 sqlstate: Some("42501".to_owned())
             },
@@ -364,6 +365,134 @@ async fn a_database_dropped_that_the_user_may_not_create_again_is_gone() {
             .await
             .unwrap();
     assert!(!exists);
+}
+
+#[tokio::test]
+async fn a_database_that_did_not_exist_and_may_not_be_created_is_not_said_to_be_dropped() {
+    let container = PostgresContainer::start().await;
+    // A user that may reach the server, and may create no database.
+    sqlx::raw_sql("CREATE ROLE visitor LOGIN PASSWORD 'visitor'")
+        .execute(&mut connect(container.url()).await)
+        .await
+        .unwrap();
+    let fresh =
+        url_with_database(&container, "fresh").replace("barras:barras@", "visitor:visitor@");
+    let folder = SeedFolder::new("not-creator-fresh");
+
+    let error = reset(&DatabaseUrl::parse(&fresh).unwrap(), folder.path())
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        ResetError::Create {
+            database: "fresh".to_owned(),
+            dropped: false,
+            cause: DatabaseUnavailable::Refused {
+                sqlstate: Some("42501".to_owned())
+            },
+        }
+    );
+    assert_eq!(
+        error.to_string(),
+        "cannot create the database fresh, which did not exist: the server refused it with \
+         SQLSTATE 42501"
+    );
+}
+
+#[tokio::test]
+async fn a_failing_migration_is_not_said_to_leave_the_database_empty() {
+    let container = PostgresContainer::start().await;
+    // Every database created from now on holds the schema that the first migration creates, so
+    // that migration fails.
+    let mut template = connect(&url_with_database(&container, "template1")).await;
+    sqlx::raw_sql("CREATE SCHEMA barras")
+        .execute(&mut template)
+        .await
+        .unwrap();
+    // No session may be connected to the template of a database being created.
+    template.close().await.unwrap();
+    let folder = SeedFolder::new("failing-migration");
+
+    let error = reset(
+        &DatabaseUrl::parse(&url_with_database(&container, "fresh")).unwrap(),
+        folder.path(),
+    )
+    .await
+    .unwrap_err();
+
+    let ResetError::Migrate(MigrateError::Migration {
+        applied,
+        file,
+        failure,
+    }) = &error
+    else {
+        panic!("{error:?}");
+    };
+    assert!(applied.is_empty(), "{applied:?}");
+    assert_eq!(file, &migration_files()[0]);
+    assert_eq!(
+        failure,
+        &MigrationFailure::Sql {
+            sqlstate: "42P06".to_owned(),
+            message: "schema \"barras\" already exists".to_owned(),
+        }
+    );
+    let sentence = error.to_string();
+    assert!(!sentence.contains("empty"), "{sentence}");
+    assert_eq!(
+        sentence,
+        format!(
+            "the database was created, and keeps the migrations applied before the failure; \
+             migration {file} failed with SQLSTATE 42P06: schema \"barras\" already exists"
+        )
+    );
+}
+
+#[tokio::test]
+async fn reset_creates_and_drops_databases_whose_names_need_quoting() {
+    let container = PostgresContainer::start().await;
+    let folder = SeedFolder::new("quoted");
+    // 63 bytes, the most Postgres keeps of a name, in 32 characters.
+    let longest = format!("{}x", "ñ".repeat(31));
+    let longest_encoded = format!("{}x", "%C3%B1".repeat(31));
+    let names = [
+        ("Barras Dev", "Barras%20Dev"),
+        ("we\"ird", "we%22ird"),
+        // Written to end the statement and drop another database, and one name all the same.
+        (
+            "x\" WITH (FORCE); DROP DATABASE postgres; --",
+            "x%22%20WITH%20(FORCE)%3B%20DROP%20DATABASE%20postgres%3B%20--",
+        ),
+        (longest.as_str(), longest_encoded.as_str()),
+    ];
+
+    for (name, encoded) in &names {
+        let url = url_with_database(&container, encoded);
+        let parsed = DatabaseUrl::parse(&url).unwrap();
+
+        let created = reset(&parsed, &folder.path().join("missing"))
+            .await
+            .unwrap();
+        let rebuilt = reset(&parsed, &folder.path().join("missing"))
+            .await
+            .unwrap();
+
+        assert_eq!(created.database(), *name);
+        assert!(!created.dropped(), "{name}");
+        assert!(rebuilt.dropped(), "{name}");
+        assert_eq!(tables(&url).await, ["public._sqlx_migrations"], "{name}");
+    }
+    let databases: Vec<String> = sqlx::query_scalar(
+        "SELECT datname FROM pg_database WHERE NOT datistemplate ORDER BY datname COLLATE \"C\"",
+    )
+    .fetch_all(&mut connect(container.url()).await)
+    .await
+    .unwrap();
+    let mut expected: Vec<&str> = names.iter().map(|(name, _)| *name).collect();
+    expected.extend(["barras", "postgres"]);
+    expected.sort_unstable();
+    assert_eq!(databases, expected);
 }
 
 #[tokio::test]
