@@ -14,11 +14,13 @@
 //! of a fixed set ([`DatabaseUnavailable`]), never sqlx's text.
 
 mod database_url;
+mod guard;
 mod migrate;
 mod pools;
 mod unavailable;
 
 pub use database_url::{DatabaseUrl, UrlProblem};
+pub use guard::{NotLocal, ensure_local};
 pub use migrate::{AppliedMigration, MigrateError, MigrationFailure, migrate, migrate_with};
 pub use pools::Pools;
 pub use unavailable::DatabaseUnavailable;
