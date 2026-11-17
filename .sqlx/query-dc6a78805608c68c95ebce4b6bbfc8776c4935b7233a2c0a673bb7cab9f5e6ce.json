@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "ROLLBACK TO SAVEPOINT barras_seed_file",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "dc6a78805608c68c95ebce4b6bbfc8776c4935b7233a2c0a673bb7cab9f5e6ce"
+}

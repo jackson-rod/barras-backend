@@ -1,12 +1,14 @@
 //! `seed` against a real Postgres, in a container of each test's own: the order of the files,
-//! one transaction for the run, a failing file, a second run, a file that ends the transaction,
-//! and folders with nothing to apply.
+//! one transaction for the run, a failing file, a second run, the ways a file can end the
+//! transaction, a file that leaves the connection waiting, the server that answers, and folders
+//! with nothing to apply.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // an integration test: a step that fails must fail the test
 
 use std::fs;
 use std::io;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use barras_adapter_postgres::{
     AppliedSeed, DatabaseUnavailable, DatabaseUrl, ErrorPosition, NotLocal, SeedError, SeedFailure,
@@ -378,6 +380,238 @@ async fn a_file_that_ends_the_transaction_in_any_other_way_is_named_too() {
             "{ending}"
         );
     }
+}
+
+/// Seeds a folder whose first file creates `public.first`, whose second inserts a row there and
+/// ends the run's transaction as `second` does, and whose third fails, as it does when it runs.
+/// The run must name the second for ending the transaction, and never say that nothing was
+/// applied, since the row it committed stays.
+async fn assert_named_for_ending_the_transaction(test: &str, second: &str) {
+    let container = PostgresContainer::start().await;
+    let folder = SeedFolder::new(test)
+        .with(
+            "20261116000001_first.sql",
+            "CREATE TABLE public.first (id int);",
+        )
+        .with("20261116000002_ends.sql", second)
+        .with(
+            "20261116000003_fails.sql",
+            "INSERT INTO public.nowhere VALUES (3);",
+        );
+
+    let error = seed(&url_of(&container), folder.path()).await.unwrap_err();
+
+    assert_eq!(
+        error,
+        SeedError::EndedTransaction {
+            file: "20261116000002_ends.sql".to_owned()
+        },
+        "{second}"
+    );
+    assert!(
+        !error.to_string().contains("nothing was applied"),
+        "{error}"
+    );
+    assert_eq!(
+        count(&container, "SELECT count(*) FROM public.first").await,
+        1,
+        "{second}"
+    );
+}
+
+#[tokio::test]
+async fn a_file_that_commits_then_fails_in_a_transaction_of_its_own_is_named_for_ending_the_run_s()
+{
+    assert_named_for_ending_the_transaction(
+        "commit-begin-fail",
+        "BEGIN;\nINSERT INTO public.first VALUES (1);\nCOMMIT;\nBEGIN;\n\
+         INSERT INTO public.nowhere VALUES (2);",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_file_that_commits_and_chains_then_fails_is_named_for_ending_the_transaction() {
+    assert_named_for_ending_the_transaction(
+        "commit-and-chain",
+        "INSERT INTO public.first VALUES (1);\nCOMMIT AND CHAIN;\n\
+         INSERT INTO public.nowhere VALUES (2);",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_file_that_sets_in_a_transaction_of_its_own_what_marked_the_run_s_is_named_for_it() {
+    // The run once marked its transaction with this setting, which a file can set again.
+    assert_named_for_ending_the_transaction(
+        "forged-local-marker",
+        "INSERT INTO public.first VALUES (1);\nCOMMIT;\nBEGIN;\n\
+         SELECT set_config('barras.seed_run', 'on', true);",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_file_that_sets_for_the_session_what_marked_the_run_s_transaction_is_named_for_it() {
+    // Set for the session, the old marker outlived the transaction that the file committed.
+    assert_named_for_ending_the_transaction(
+        "forged-session-marker",
+        "INSERT INTO public.first VALUES (1);\nSET barras.seed_run = 'on';\nCOMMIT;",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_file_that_fails_under_a_savepoint_named_as_the_run_s_in_its_own_transaction_is_named() {
+    // Rolling back to the savepoint works in the file's transaction too: its id tells them apart.
+    assert_named_for_ending_the_transaction(
+        "forged-savepoint",
+        "INSERT INTO public.first VALUES (1);\nCOMMIT;\nBEGIN;\nSAVEPOINT barras_seed_file;\n\
+         INSERT INTO public.nowhere VALUES (2);",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_file_may_roll_back_to_savepoints_of_its_own() {
+    let container = PostgresContainer::start().await;
+    let folder = SeedFolder::new("own-savepoints")
+        .with(
+            "20261116000001_first.sql",
+            "CREATE TABLE public.first (id int);\nSAVEPOINT mine;\n\
+             INSERT INTO public.first VALUES (1);\nROLLBACK TO SAVEPOINT mine;\n\
+             INSERT INTO public.first VALUES (2);",
+        )
+        .with(
+            "20261116000002_second.sql",
+            "INSERT INTO public.first VALUES (3);",
+        );
+
+    let applied = seed(&url_of(&container), folder.path()).await.unwrap();
+
+    assert_eq!(
+        files(&applied),
+        ["20261116000001_first.sql", "20261116000002_second.sql"]
+    );
+    let ids: Vec<i32> = sqlx::query_scalar("SELECT id FROM public.first ORDER BY id")
+        .fetch_all(&mut connect(&container).await)
+        .await
+        .unwrap();
+    assert_eq!(ids, [2, 3]);
+}
+
+#[tokio::test]
+async fn a_file_that_leaves_the_connection_waiting_for_copy_data_fails_at_once() {
+    // `COPY … FROM stdin` waits for data that the run never sends, and so would any question the
+    // run asked after it.
+    let container = PostgresContainer::start().await;
+    let file = "CREATE TABLE public.copied (id int);\nCOPY public.copied FROM stdin;";
+    let folder = SeedFolder::new("copy").with("20261116000001_copy.sql", file);
+
+    let error = tokio::time::timeout(
+        Duration::from_secs(5),
+        seed(&url_of(&container), folder.path()),
+    )
+    .await
+    .expect("the run waited on its connection")
+    .unwrap_err();
+
+    assert_eq!(
+        error,
+        SeedError::Failed {
+            file: "20261116000001_copy.sql".to_owned(),
+            failure: SeedFailure::Unavailable(DatabaseUnavailable::ProtocolViolated),
+        }
+    );
+    // The run cannot tell whether the file ended its transaction before the COPY.
+    assert!(
+        !error.to_string().contains("nothing was applied"),
+        "{error}"
+    );
+    // Closed: the session that ran the file ends, and its transaction with it.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while count_sessions_running(&container, file).await != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the session of the run outlived it"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!table_exists(&container, "copied").await);
+}
+
+#[tokio::test]
+async fn a_file_that_ends_its_own_session_after_a_commit_is_never_said_to_have_applied_nothing() {
+    let container = PostgresContainer::start().await;
+    let folder = SeedFolder::new("terminate")
+        .with(
+            "20261116000001_first.sql",
+            "CREATE TABLE public.first (id int);",
+        )
+        .with(
+            "20261116000002_ends.sql",
+            "INSERT INTO public.first VALUES (1);\nCOMMIT;\n\
+             SELECT pg_terminate_backend(pg_backend_pid());",
+        );
+
+    let error = seed(&url_of(&container), folder.path()).await.unwrap_err();
+
+    // The session is gone, and the run cannot ask what became of its transaction.
+    let SeedError::Failed {
+        file,
+        failure: SeedFailure::Unavailable(_),
+    } = &error
+    else {
+        panic!("{error:?}");
+    };
+    assert_eq!(file, "20261116000002_ends.sql");
+    assert!(
+        !error.to_string().contains("nothing was applied"),
+        "{error}"
+    );
+    assert_eq!(
+        count(&container, "SELECT count(*) FROM public.first").await,
+        1
+    );
+}
+
+/// The sessions whose last statement is `sql`, as Postgres counts them.
+async fn count_sessions_running(container: &PostgresContainer, sql: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE query = $1")
+        .bind(sql)
+        .fetch_one(&mut connect(container).await)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_position_after_characters_of_several_bytes_counts_characters() {
+    let container = PostgresContainer::start().await;
+    // `🦀` takes four bytes and `ñ` two; the server counts each as one character.
+    let folder = SeedFolder::new("multibyte").with(
+        "20261116000001_crabs.sql",
+        "SELECT '🦀🦀ñ' AS text; SELEC 1;",
+    );
+
+    let error = seed(&url_of(&container), folder.path()).await.unwrap_err();
+
+    let SeedError::Failed {
+        failure: SeedFailure::Server {
+            sqlstate, position, ..
+        },
+        ..
+    } = error
+    else {
+        panic!("{error:?}");
+    };
+    assert_eq!(sqlstate.as_deref(), Some("42601"));
+    assert_eq!(
+        position,
+        Some(ErrorPosition {
+            line: 1,
+            column: 23
+        })
+    );
 }
 
 #[tokio::test]

@@ -108,42 +108,58 @@ pub(crate) async fn apply(
     outcome
 }
 
+/// The run's transaction, a savepoint before each file, and the commit once every file ran and
+/// left the transaction as it found it (plan, refinements 5 and 16).
+///
+/// The savepoint is always named `barras_seed_file`: the query macros take no name from a
+/// variable, and only the latest savepoint of a name counts.
 async fn apply_in_one_transaction(
     connection: &mut PgConnection,
     files: &[SeedFile],
 ) -> Result<Vec<AppliedSeed>, SeedError> {
     let unusable = |error: sqlx::Error| SeedError::Unavailable(DatabaseUnavailable::from(&error));
     let mut transaction = connection.begin().await.map_err(unusable)?;
-    // `SET LOCAL` as a function: the marker lasts as long as the transaction, so a file that
-    // ends it with `COMMIT` or `ROLLBACK` takes the marker with it (plan, refinement 5).
-    sqlx::query_scalar!("SELECT set_config('barras.seed_run', 'on', true)")
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(unusable)?;
+    // Asked once the transaction is open, the server gives it an id that no later transaction
+    // takes: a file that ends it, then opens another or runs outside any, leaves another id.
+    let run = transaction_id(&mut transaction).await.map_err(unusable)?;
     let mut applied = Vec::new();
     for file in files {
+        sqlx::query!("SAVEPOINT barras_seed_file")
+            .execute(&mut *transaction)
+            .await
+            .map_err(unusable)?;
         let ran = sqlx::raw_sql(AssertSqlSafe(file.sql.as_str()))
             .execute(&mut *transaction)
             .await;
-        let open = transaction_is_open(&mut transaction).await;
-        let name = || file.name.clone();
-        match (ran, open) {
-            // What the file did before it ended the transaction stays, whether it failed after
-            // or not, so that comes first.
-            (_, Ok(false)) => return Err(SeedError::EndedTransaction { file: name() }),
-            (Err(error), _) => {
+        let verdict = match ran {
+            Ok(_) => verdict_after_success(&mut transaction, &run).await,
+            Err(error @ sqlx::Error::Database(_)) => {
+                let failure = SeedFailure::of(&error, Some(&file.sql));
+                verdict_after_failure(&mut transaction, &run, failure).await
+            }
+            // An error that is not the server's leaves the connection where the run cannot tell
+            // its state: after a `COPY … FROM stdin`, the server waits for data that the run never
+            // sends, and any question would wait as long. So nothing more is asked, and the run
+            // closes the connection (plan, refinement 16).
+            Err(error) => Verdict::Lost(DatabaseUnavailable::from(&error)),
+        };
+        let file = file.name.clone();
+        match verdict {
+            Verdict::Applied => {
+                sqlx::query!("RELEASE SAVEPOINT barras_seed_file")
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(unusable)?;
+                applied.push(AppliedSeed { file });
+            }
+            Verdict::Refused(failure) => return Err(SeedError::Failed { file, failure }),
+            Verdict::Ended => return Err(SeedError::EndedTransaction { file }),
+            Verdict::Lost(cause) => {
                 return Err(SeedError::Failed {
-                    file: name(),
-                    failure: SeedFailure::of(&error, Some(&file.sql)),
+                    file,
+                    failure: SeedFailure::Unavailable(cause),
                 });
             }
-            (Ok(_), Err(error)) => {
-                return Err(SeedError::Failed {
-                    file: name(),
-                    failure: SeedFailure::of(&error, None),
-                });
-            }
-            (Ok(_), Ok(true)) => applied.push(AppliedSeed { file: name() }),
         }
     }
     transaction
@@ -153,14 +169,75 @@ async fn apply_in_one_transaction(
     Ok(applied)
 }
 
-/// Whether the run's transaction is still open, by its marker. A transaction that a statement
-/// aborted refuses the question with an error.
-async fn transaction_is_open(connection: &mut PgConnection) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar!(
-        r#"SELECT current_setting('barras.seed_run', true) IS NOT DISTINCT FROM 'on' AS "open!""#
-    )
-    .fetch_one(connection)
-    .await
+/// What became of the run's transaction once a file ran.
+enum Verdict {
+    /// The file ran, and left the run's transaction open.
+    Applied,
+    /// The file failed, and the run's transaction survived it: rolled back with the run, nothing
+    /// of it stays.
+    Refused(SeedFailure),
+    /// The file ended the run's transaction itself, with `COMMIT` or `ROLLBACK`.
+    Ended,
+    /// The run cannot tell: the connection failed, or was left where no question gets an answer.
+    Lost(DatabaseUnavailable),
+}
+
+/// After a file that ran: whether it left the run's transaction open.
+async fn verdict_after_success(transaction: &mut PgConnection, run: &str) -> Verdict {
+    match is_the_run_s(transaction, run).await {
+        Ok(true) => Verdict::Applied,
+        Ok(false) => Verdict::Ended,
+        Err(cause) => Verdict::Lost(cause),
+    }
+}
+
+/// After a file that failed: whether the run's transaction survived it. A transaction that an
+/// error aborted answers nothing but its end or a rollback to a savepoint, so the rollback comes
+/// first. In a transaction the file opened, the savepoint does not exist (3B001), and outside any
+/// transaction there is none to roll back (25P01): either way the file ended the run's. Where the
+/// rollback works, the id still has the last word, since the file may have set a savepoint of the
+/// same name in a transaction of its own.
+async fn verdict_after_failure(
+    transaction: &mut PgConnection,
+    run: &str,
+    failure: SeedFailure,
+) -> Verdict {
+    let rolled_back = sqlx::query!("ROLLBACK TO SAVEPOINT barras_seed_file")
+        .execute(&mut *transaction)
+        .await;
+    match rolled_back {
+        Ok(_) => match is_the_run_s(transaction, run).await {
+            Ok(true) => Verdict::Refused(failure),
+            Ok(false) => Verdict::Ended,
+            Err(cause) => Verdict::Lost(cause),
+        },
+        Err(sqlx::Error::Database(refusal))
+            if matches!(refusal.code().as_deref(), Some("3B001" | "25P01")) =>
+        {
+            Verdict::Ended
+        }
+        Err(error) => Verdict::Lost(DatabaseUnavailable::from(&error)),
+    }
+}
+
+/// Whether the transaction `connection` is in is the run's, whose id is `run`.
+async fn is_the_run_s(
+    connection: &mut PgConnection,
+    run: &str,
+) -> Result<bool, DatabaseUnavailable> {
+    transaction_id(connection)
+        .await
+        .map(|id| id == run)
+        .map_err(|error| DatabaseUnavailable::from(&error))
+}
+
+/// The id of the transaction `connection` is in, given one now if it has none. A statement
+/// outside any transaction runs in one of its own, with an id of its own. Named with its schema,
+/// so that no function a file creates stands in for it.
+async fn transaction_id(connection: &mut PgConnection) -> Result<String, sqlx::Error> {
+    sqlx::query_scalar!(r#"SELECT pg_catalog.pg_current_xact_id()::text AS "id!""#)
+        .fetch_one(connection)
+        .await
 }
 
 impl SeedFailure {
@@ -238,15 +315,20 @@ pub enum SeedError {
     Folder(io::ErrorKind),
     /// A seed file could not be read, such as one that is not UTF-8: nothing was applied.
     File { file: String, kind: io::ErrorKind },
-    /// The database could not be used before the first file ran: nothing was applied.
+    /// The database could not be used outside a seed file, as before the first one ran: nothing
+    /// was applied.
     Unavailable(DatabaseUnavailable),
-    /// A seed file failed, and the run's transaction with it: nothing was applied.
+    /// A seed file failed. Refused by the server, it left the run's transaction to be rolled
+    /// back: nothing was applied. When the connection failed instead, or was left where no
+    /// question gets an answer, as a `COPY … FROM stdin` leaves it, the run closed it, which rolls
+    /// back the run's transaction unless the file had ended that itself.
     Failed { file: String, failure: SeedFailure },
     /// A seed file ended the run's transaction itself, with `COMMIT` or `ROLLBACK`: what it and
     /// the files before it did may have stayed, and `just db-reset` starts again.
     EndedTransaction { file: String },
-    /// Every file ran, and the transaction failed when it was committed, as a deferred
-    /// constraint makes it: nothing was applied.
+    /// Every file ran, and the commit failed. Refused by the server, as a deferred constraint
+    /// makes it: nothing was applied. When the connection failed instead, the seeds may have been
+    /// applied.
     Commit(SeedFailure),
 }
 
@@ -261,7 +343,8 @@ pub enum SeedFailure {
         message: String,
         position: Option<ErrorPosition>,
     },
-    /// The database stopped answering.
+    /// The connection failed, or was left where no question gets an answer: what became of the
+    /// run's transaction cannot be told.
     Unavailable(DatabaseUnavailable),
 }
 
@@ -272,43 +355,66 @@ impl fmt::Display for SeedError {
             Self::Folder(kind) => write!(f, "cannot read the seed folder: {kind}"),
             Self::File { file, kind } => write!(f, "cannot read seed {file}: {kind}"),
             Self::Unavailable(cause) => write!(f, "cannot seed the database: {cause}"),
-            Self::Failed { file, failure } => {
+            Self::Failed {
+                file,
+                failure:
+                    SeedFailure::Server {
+                        sqlstate,
+                        message,
+                        position,
+                    },
+            } => {
                 write!(f, "seed {file} failed")?;
-                write_failure(f, failure)?;
+                write_refusal(f, sqlstate.as_deref(), message, *position)?;
                 f.write_str("; nothing was applied")
             }
+            Self::Failed {
+                file,
+                failure: SeedFailure::Unavailable(cause),
+            } => write!(
+                f,
+                "seed {file} failed: {cause}; the run closed its connection, which rolls back its \
+                 transaction unless the file ended it itself: take out any COMMIT, ROLLBACK or \
+                 COPY, then run just db-reset"
+            ),
             Self::EndedTransaction { file } => write!(
                 f,
                 "seed {file} ended the run's transaction itself, so what it and the seeds before \
                  it did may have stayed: take its COMMIT or ROLLBACK out, then run just db-reset"
             ),
-            Self::Commit(failure) => {
+            Self::Commit(SeedFailure::Server {
+                sqlstate,
+                message,
+                position,
+            }) => {
                 f.write_str("the seeds failed when committed")?;
-                write_failure(f, failure)?;
+                write_refusal(f, sqlstate.as_deref(), message, *position)?;
                 f.write_str("; nothing was applied")
             }
+            Self::Commit(SeedFailure::Unavailable(cause)) => write!(
+                f,
+                "the commit of the seeds did not complete: {cause}; whether they were applied \
+                 cannot be told, so run just db-reset"
+            ),
         }
     }
 }
 
-/// The rest of a sentence that says something failed: with what SQLSTATE, where, and why.
-fn write_failure(f: &mut fmt::Formatter<'_>, failure: &SeedFailure) -> fmt::Result {
-    match failure {
-        SeedFailure::Server {
-            sqlstate,
-            message,
-            position,
-        } => {
-            if let Some(sqlstate) = sqlstate {
-                write!(f, " with SQLSTATE {sqlstate}")?;
-            }
-            if let Some(ErrorPosition { line, column }) = position {
-                write!(f, " at line {line}, column {column}")?;
-            }
-            write!(f, ": {message}")
-        }
-        SeedFailure::Unavailable(cause) => write!(f, ": {cause}"),
+/// The rest of a sentence that says the server refused something: with what SQLSTATE, where,
+/// and why.
+fn write_refusal(
+    f: &mut fmt::Formatter<'_>,
+    sqlstate: Option<&str>,
+    message: &str,
+    position: Option<ErrorPosition>,
+) -> fmt::Result {
+    if let Some(sqlstate) = sqlstate {
+        write!(f, " with SQLSTATE {sqlstate}")?;
     }
+    if let Some(ErrorPosition { line, column }) = position {
+        write!(f, " at line {line}, column {column}")?;
+    }
+    write!(f, ": {message}")
 }
 
 impl std::error::Error for SeedError {}
@@ -507,7 +613,17 @@ mod tests {
                     )),
                 },
                 "seed 20261116000002_demo.sql failed: the connection failed: connection reset; \
-                 nothing was applied",
+                 the run closed its connection, which rolls back its transaction unless the file \
+                 ended it itself: take out any COMMIT, ROLLBACK or COPY, then run just db-reset",
+            ),
+            (
+                SeedError::Failed {
+                    file: "20261116000002_demo.sql".to_owned(),
+                    failure: SeedFailure::Unavailable(DatabaseUnavailable::ProtocolViolated),
+                },
+                "seed 20261116000002_demo.sql failed: the server answered outside the protocol; \
+                 the run closed its connection, which rolls back its transaction unless the file \
+                 ended it itself: take out any COMMIT, ROLLBACK or COPY, then run just db-reset",
             ),
             (
                 SeedError::EndedTransaction {
@@ -528,6 +644,13 @@ mod tests {
                 "the seeds failed when committed with SQLSTATE 23503: insert or update on table \
                  \"child\" violates foreign key constraint \"child_parent_fkey\"; nothing was \
                  applied",
+            ),
+            (
+                SeedError::Commit(SeedFailure::Unavailable(
+                    DatabaseUnavailable::ConnectionFailed(io::ErrorKind::ConnectionReset),
+                )),
+                "the commit of the seeds did not complete: the connection failed: connection \
+                 reset; whether they were applied cannot be told, so run just db-reset",
             ),
         ] {
             assert_eq!(error.to_string(), sentence);

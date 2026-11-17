@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SAVEPOINT barras_seed_file",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "a40abdc709541fc454cbb033bdf342e7cdbe7efa59f9d4c69fbe9de7bdc6e8b0"
+}
