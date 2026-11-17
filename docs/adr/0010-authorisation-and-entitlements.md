@@ -22,3 +22,4 @@ Date: 2026-11-15
 - Cost: an entitlement in a token is as old as the token until the app refreshes it, so the realtime event is part of the design.
 - Definition of done item 2 (ADR-0017) requires the permission and plan feature in each route's OpenAPI metadata, and the end-to-end suite fails on a route without metadata.
 - The app reads entitlements from the session and never decides them (ADR-0002).
+- "Seeded" above means written into every environment by a migration or by the module's code; it is not the `seeds/` of ADR-0030, which holds local development data only and never reaches production.
