@@ -6,6 +6,7 @@ default:
 setup:
     rustup toolchain install
     cargo install --locked cargo-nextest@0.9.152 cargo-deny@0.20.2 cargo-hakari@0.9.39 cargo-llvm-cov@0.9.1 watchexec-cli@2.8.0
+    cargo install --locked sqlx-cli@0.9.0 --no-default-features --features postgres
     lefthook install
 
 # Runs barras-api with the variables of .env; restarts it when a Rust source or a Cargo.toml changes

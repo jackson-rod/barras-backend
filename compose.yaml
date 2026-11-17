@@ -1,0 +1,29 @@
+# The local database (ADR-0007): Postgres 18 for development, started by `docker compose up`.
+# It listens on 127.0.0.1:5433, so that it never clashes with a native server on 5432.
+services:
+  postgres:
+    # The one place that names the image: the testkit's containers and the throwaway database of
+    # `just db-prepare` and `just db-check` read it from this line. Pinned by tag and digest,
+    # written the same way everywhere, since an image pulled by digest is stored under that whole
+    # reference. Debian, not Alpine: its collation comes from glibc, as on a managed Postgres.
+    image: postgres:18.7-trixie@sha256:2ea8630df176ad090ec92136dee850397c5af8781e4bcf2e4162593691c61bbc
+    ports:
+      - "127.0.0.1:5433:5432"
+    environment:
+      POSTGRES_USER: barras
+      POSTGRES_PASSWORD: barras
+      POSTGRES_DB: barras
+    volumes:
+      # The 18 image keeps its data in /var/lib/postgresql/18/docker, and refuses to start with
+      # anything mounted at /var/lib/postgresql/data, where older guides mount it.
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      # Over TCP: while the image initialises a new volume, a temporary server answers on the
+      # Unix socket alone, then stops, so a check through the socket would pass too early.
+      test: ["CMD", "pg_isready", "--host=127.0.0.1", "--port=5432", "--username=barras", "--dbname=barras"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  postgres-data:

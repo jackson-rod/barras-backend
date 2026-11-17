@@ -1,2 +1,10 @@
 [alias]
 xtask = "run --locked --quiet --package xtask --"
+
+# Every cargo command compiles the sqlx query macros from the metadata committed in `.sqlx/`, so
+# no build connects to a database, whatever `DATABASE_URL` or a `.env` file holds: the macros
+# read `.env` at compile time, and `.env` names the local database. Never `force = true`: a
+# value the process already has wins over this one, and `cargo sqlx prepare` runs its builds
+# with `SQLX_OFFLINE=false` to read the queries against the database it is given.
+[env]
+SQLX_OFFLINE = "true"
