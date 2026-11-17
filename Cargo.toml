@@ -38,6 +38,10 @@ serde_urlencoded = "0.7.1"
 syn = { version = "3.0.10", default-features = false }
 thiserror = "2.0.21"
 tempfile = "3.27.0"
+# Pinned exactly, as the spikes of BAR-4 tried it (plan, appendix A.7). `watchdog` removes a
+# test's containers when the test is stopped with SIGTERM or SIGINT. Without the default `ring`,
+# no crypto provider is built: the tests reach Docker through its Unix socket, never over HTTPS.
+testcontainers = { version = "=0.28.0", default-features = false, features = ["watchdog"] }
 time = "0.3.55"
 tokio = "1.54.1"
 tower = { version = "0.5.3", default-features = false }

@@ -8,6 +8,11 @@ publish.workspace = true
 [dependencies]
 # The JSON lines a binary logs outside `local`, parsed.
 serde_json.workspace = true
+# A Postgres container per test.
+testcontainers.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
 
 [lints]
 workspace = true

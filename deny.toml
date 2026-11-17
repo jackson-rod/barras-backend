@@ -45,15 +45,32 @@ allow-wildcard-paths = true
 deny = [
     { crate = "sqlx", wrappers = ["barras-adapter-postgres", "barras-testkit"], reason = "database access lives in the postgres adapter" },
     # `utoipa-axum` depends on axum directly: it builds the axum router and the OpenAPI
-    # document from the same handlers, for the HTTP adapter.
-    { crate = "axum", wrappers = ["barras-adapter-http", "barras-adapter-realtime", "utoipa-axum"], reason = "web framework lives in the HTTP and realtime adapters" },
+    # document from the same handlers, for the HTTP adapter. `tonic` is the Docker client of the
+    # test containers (below).
+    { crate = "axum", wrappers = ["barras-adapter-http", "barras-adapter-realtime", "utoipa-axum", "tonic"], reason = "web framework lives in the HTTP and realtime adapters" },
     { crate = "utoipa-axum", wrappers = ["barras-adapter-http"], reason = "it builds axum routers, so any crate that took it would reach axum past its ban: it lives in the HTTP adapter" },
     # The crates under axum: without these rows a crate could serve HTTP, or call
     # out, past the axum ban. `axum` depends on all three directly, `hyper-util` on
-    # `hyper`, and the HTTP adapter on `hyper-util` for its test client.
+    # `hyper`, and the HTTP adapter on `hyper-util` for its test client. From `bollard` on, each
+    # wrapper is the Docker client of the test containers (below).
     { crate = "axum-core", wrappers = ["barras-adapter-http", "barras-adapter-realtime", "axum"], reason = "the core of the web framework lives in the HTTP and realtime adapters" },
-    { crate = "hyper", wrappers = ["barras-adapter-http", "barras-adapter-realtime", "axum", "hyper-util"], reason = "the HTTP server and client under axum live in the HTTP and realtime adapters" },
-    { crate = "hyper-util", wrappers = ["barras-adapter-http", "barras-adapter-realtime", "axum"], reason = "the HTTP server and client under axum live in the HTTP and realtime adapters" },
+    { crate = "hyper", wrappers = ["barras-adapter-http", "barras-adapter-realtime", "axum", "hyper-util", "bollard", "hyper-named-pipe", "hyper-rustls", "hyper-timeout", "hyperlocal", "tonic"], reason = "the HTTP server and client under axum live in the HTTP and realtime adapters" },
+    { crate = "hyper-util", wrappers = ["barras-adapter-http", "barras-adapter-realtime", "axum", "bollard", "hyper-named-pipe", "hyper-rustls", "hyper-timeout", "hyperlocal", "tonic"], reason = "the HTTP server and client under axum live in the HTTP and realtime adapters" },
+    # The Docker client of the test containers. testcontainers talks to Docker through `bollard`,
+    # which reaches `hyper` and `hyper-util` directly, through the connectors below, and through
+    # `tonic`, its gRPC client for buildkit, which also reaches `axum`. Each crate on that path is
+    # banned with its parents on the path as its wrappers, so that only the testkit reaches any
+    # of them, and no other crate reaches hyper, hyper-util or axum through them.
+    { crate = "testcontainers", wrappers = ["barras-testkit"], reason = "the test containers live in the testkit" },
+    { crate = "bollard", wrappers = ["testcontainers"], reason = "the Docker client of the test containers" },
+    { crate = "bollard-stubs", wrappers = ["bollard"], reason = "the Docker client of the test containers" },
+    { crate = "bollard-buildkit-proto", wrappers = ["bollard", "bollard-stubs"], reason = "the Docker client of the test containers" },
+    { crate = "tonic", wrappers = ["bollard", "bollard-buildkit-proto", "tonic-prost"], reason = "the Docker client of the test containers: a gRPC framework that reaches axum and hyper" },
+    { crate = "tonic-prost", wrappers = ["bollard-buildkit-proto"], reason = "the Docker client of the test containers" },
+    { crate = "hyper-named-pipe", wrappers = ["bollard"], reason = "the Docker client of the test containers: an HTTP connector over hyper" },
+    { crate = "hyper-rustls", wrappers = ["bollard"], reason = "the Docker client of the test containers: an HTTP connector over hyper" },
+    { crate = "hyper-timeout", wrappers = ["tonic"], reason = "the Docker client of the test containers: an HTTP connector over hyper" },
+    { crate = "hyperlocal", wrappers = ["bollard"], reason = "the Docker client of the test containers: an HTTP connector over hyper" },
     { crate = "reqwest", wrappers = ["barras-adapter-providers"], reason = "outbound HTTP lives in the providers adapter" },
     { crate = "redis", wrappers = ["barras-adapter-redis", "barras-testkit"], reason = "Redis access lives in the redis adapter" },
     # Alternatives to the crates the ADRs chose. No crate may use them, not even
