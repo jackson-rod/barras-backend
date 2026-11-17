@@ -161,7 +161,8 @@ async fn a_migration_recorded_as_failed_is_refused_before_anything_is_applied() 
     )
     .await
     .unwrap();
-    // What sqlx records for a migration that failed outside a transaction.
+    // sqlx 0.9.0 only ever inserts `success = TRUE`, so no run of it writes this row: it stands
+    // for one that a person or another tool wrote, which a run must refuse all the same.
     sqlx::query(
         "INSERT INTO public._sqlx_migrations \
          (version, description, success, checksum, execution_time) \
@@ -226,14 +227,51 @@ async fn a_failing_migration_is_named_with_the_server_message_and_the_ones_befor
     assert_eq!(file, "20_probe_20.sql");
     assert_eq!(
         failure,
-        MigrationFailure::Server {
-            sqlstate: Some("42601".to_owned()),
+        MigrationFailure::Sql {
+            sqlstate: "42601".to_owned(),
             message: "syntax error at end of input".to_owned(),
         }
     );
     assert!(table_exists(&container, "probe_10").await);
     assert!(!table_exists(&container, "probe_20").await);
     assert_eq!(history(&container).await, [10]);
+}
+
+#[tokio::test]
+async fn a_failing_migration_whose_message_would_quote_a_table_s_data_is_named_by_its_sqlstate() {
+    let container = PostgresContainer::start().await;
+    let failing = migrations(&[
+        (
+            10,
+            "CREATE TABLE public.probe (value text); \
+             INSERT INTO public.probe VALUES ('hunter2-secret')",
+        ),
+        // The server's message quotes the value that does not convert.
+        (
+            20,
+            "ALTER TABLE public.probe ALTER COLUMN value TYPE int USING value::int",
+        ),
+    ]);
+
+    let error = migrate_with(&url_of(&container), &failing)
+        .await
+        .unwrap_err();
+
+    let MigrateError::Migration { file, failure, .. } = &error else {
+        panic!("{error:?}");
+    };
+    assert_eq!(file, "20_probe_20.sql");
+    assert_eq!(
+        failure,
+        &MigrationFailure::Server {
+            sqlstate: Some("22P02".to_owned())
+        }
+    );
+    assert_eq!(
+        error.to_string(),
+        "migration 20_probe_20.sql failed with SQLSTATE 22P02"
+    );
+    assert!(!format!("{error:?}").contains(PASSWORD), "{error:?}");
 }
 
 #[tokio::test]

@@ -24,7 +24,7 @@ const HISTORY: &str = "public._sqlx_migrations";
 /// Applies the pending migrations this binary carries, in order, each in its own transaction
 /// unless its file starts with sqlx's `-- no-transaction`, and returns them.
 ///
-/// It refuses, before applying anything, when the history records a migration that failed, or
+/// It refuses, before applying anything, when the history marks a migration as failed, or holds
 /// one already applied that differs from its file (edited after it ran) or that the binary does
 /// not carry. sqlx's own run checks an applied migration only when its turn comes, after
 /// applying every older pending one (plan, refinement 1).
@@ -133,8 +133,8 @@ fn history_failure(error: sqlx::migrate::MigrateError) -> MigrateError {
     })
 }
 
-/// A failure of `migration`, after the ones in `applied`. A refusal of its SQL keeps the
-/// server's message, which is about the SQL; any other failure is a fixed sentence.
+/// A failure of `migration`, after the ones in `applied`: the server's answer as
+/// [`server_failure`] keeps it, or a fixed sentence when the server gave none.
 fn migration_failure(
     applied: Vec<AppliedMigration>,
     migration: &Migration,
@@ -143,10 +143,9 @@ fn migration_failure(
     let failure = match error {
         sqlx::migrate::MigrateError::ExecuteMigration(cause, _)
         | sqlx::migrate::MigrateError::Execute(cause) => match cause {
-            sqlx::Error::Database(refusal) => MigrationFailure::Server {
-                sqlstate: sqlstate_of(refusal.as_ref()),
-                message: refusal.message().to_owned(),
-            },
+            sqlx::Error::Database(refusal) => {
+                server_failure(sqlstate_of(refusal.as_ref()), refusal.message())
+            }
             other => MigrationFailure::Unavailable(DatabaseUnavailable::from(other)),
         },
         _ => MigrationFailure::Unavailable(DatabaseUnavailable::DriverFailed),
@@ -155,6 +154,22 @@ fn migration_failure(
         applied,
         file: AppliedMigration::of(migration).file,
         failure,
+    }
+}
+
+/// What a migration's failure keeps of the server's answer: its SQLSTATE, and its message only
+/// for the classes about the SQL itself, 42 and 0A. Any other message can quote the data of a
+/// table, as a value that does not convert does, and migrations run against production (plan,
+/// refinement 11).
+fn server_failure(sqlstate: Option<String>, message: &str) -> MigrationFailure {
+    match sqlstate {
+        Some(sqlstate) if sqlstate.starts_with("42") || sqlstate.starts_with("0A") => {
+            MigrationFailure::Sql {
+                sqlstate,
+                message: message.to_owned(),
+            }
+        }
+        sqlstate => MigrationFailure::Server { sqlstate },
     }
 }
 
@@ -194,14 +209,19 @@ pub enum MigrateError {
     /// sqlx's history table, `public._sqlx_migrations`, or its lock, could not be read or
     /// written: nothing was applied.
     History(DatabaseUnavailable),
-    /// The history records a migration that failed when it last ran: nothing was applied.
+    /// The history marks a migration as failed (`success = false`), which sqlx 0.9 never writes
+    /// on Postgres, though a person or another tool can: nothing was applied.
     Failed { version: i64 },
     /// A migration already applied differs from its file, which was edited after it ran: nothing
     /// was applied.
     Edited { version: i64 },
     /// A migration already applied is not among the binary's: nothing was applied.
     Missing { version: i64 },
-    /// A migration failed, and nothing of it stays. The ones before it in the run stay applied,
+    /// A migration failed. One that runs inside its transaction, as every migration does unless
+    /// its file starts with `-- no-transaction`, leaves nothing behind when its SQL fails. A
+    /// `-- no-transaction` migration can leave part of its work, such as the invalid index of a
+    /// `CREATE INDEX CONCURRENTLY` that failed, which the next run meets again: sqlx records a
+    /// migration only once its SQL has succeeded. The ones before it in the run stay applied,
     /// and the ones after it did not run.
     Migration {
         applied: Vec<AppliedMigration>,
@@ -213,11 +233,14 @@ pub enum MigrateError {
 /// What stopped a migration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MigrationFailure {
-    /// The server refused its SQL: its SQLSTATE, and its message, which is about the SQL.
-    Server {
-        sqlstate: Option<String>,
-        message: String,
-    },
+    /// The server refused the SQL itself, with a SQLSTATE of class 42 (a syntax error or an
+    /// access rule broken) or 0A (a feature it does not support): its SQLSTATE, and its message,
+    /// which is about the SQL.
+    Sql { sqlstate: String, message: String },
+    /// The server failed it in any other way, as when the data of a table breaks a constraint or
+    /// does not convert: its SQLSTATE alone, when it gave one. Such a message can quote that
+    /// data, and migrations run against production (plan, refinement 11).
+    Server { sqlstate: Option<String> },
     /// The database stopped answering.
     Unavailable(DatabaseUnavailable),
 }
@@ -245,17 +268,16 @@ impl fmt::Display for MigrateError {
                  applied"
             ),
             Self::Migration { file, failure, .. } => match failure {
-                MigrationFailure::Server {
-                    sqlstate: Some(sqlstate),
-                    message,
-                } => write!(
+                MigrationFailure::Sql { sqlstate, message } => write!(
                     f,
                     "migration {file} failed with SQLSTATE {sqlstate}: {message}"
                 ),
                 MigrationFailure::Server {
-                    sqlstate: None,
-                    message,
-                } => write!(f, "migration {file} failed: {message}"),
+                    sqlstate: Some(sqlstate),
+                } => write!(f, "migration {file} failed with SQLSTATE {sqlstate}"),
+                MigrationFailure::Server { sqlstate: None } => {
+                    write!(f, "migration {file} failed: the server refused it")
+                }
                 MigrationFailure::Unavailable(cause) => {
                     write!(f, "migration {file} failed: {cause}")
                 }
@@ -433,8 +455,8 @@ mod tests {
                 MigrateError::Migration {
                     applied: vec![first.clone()],
                     file: "20_probe_20.sql".to_owned(),
-                    failure: MigrationFailure::Server {
-                        sqlstate: Some("42601".to_owned()),
+                    failure: MigrationFailure::Sql {
+                        sqlstate: "42601".to_owned(),
                         message: "syntax error at end of input".to_owned(),
                     },
                 },
@@ -443,14 +465,21 @@ mod tests {
             ),
             (
                 MigrateError::Migration {
-                    applied: Vec::new(),
+                    applied: vec![first.clone()],
                     file: "20_probe_20.sql".to_owned(),
                     failure: MigrationFailure::Server {
-                        sqlstate: None,
-                        message: "it went wrong".to_owned(),
+                        sqlstate: Some("22P02".to_owned()),
                     },
                 },
-                "migration 20_probe_20.sql failed: it went wrong",
+                "migration 20_probe_20.sql failed with SQLSTATE 22P02",
+            ),
+            (
+                MigrateError::Migration {
+                    applied: Vec::new(),
+                    file: "20_probe_20.sql".to_owned(),
+                    failure: MigrationFailure::Server { sqlstate: None },
+                },
+                "migration 20_probe_20.sql failed: the server refused it",
             ),
             (
                 MigrateError::Migration {
@@ -465,5 +494,34 @@ mod tests {
         ] {
             assert_eq!(error.to_string(), sentence);
         }
+    }
+
+    #[test]
+    fn only_a_refusal_of_the_sql_itself_keeps_the_server_message() {
+        // What a value that does not convert answers: the message quotes the table's data.
+        let message = "invalid input syntax for type integer: \"hunter2-secret\"";
+        for sqlstate in ["42601", "42P01", "42501", "0A000"] {
+            assert_eq!(
+                server_failure(Some(sqlstate.to_owned()), message),
+                MigrationFailure::Sql {
+                    sqlstate: sqlstate.to_owned(),
+                    message: message.to_owned(),
+                }
+            );
+        }
+        for sqlstate in [
+            "22P02", "23505", "23514", "57014", "40P01", "XX000", "0B000", "04200",
+        ] {
+            assert_eq!(
+                server_failure(Some(sqlstate.to_owned()), message),
+                MigrationFailure::Server {
+                    sqlstate: Some(sqlstate.to_owned())
+                }
+            );
+        }
+        assert_eq!(
+            server_failure(None, message),
+            MigrationFailure::Server { sqlstate: None }
+        );
     }
 }
