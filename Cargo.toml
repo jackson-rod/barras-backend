@@ -18,6 +18,7 @@ publish = false
 [workspace.dependencies]
 axum = { version = "0.8.9", default-features = false }
 barras-adapter-http = { path = "crates/adapters/http" }
+barras-adapter-postgres = { path = "crates/adapters/postgres" }
 barras-bootstrap = { path = "crates/bootstrap" }
 barras-kernel = { path = "crates/kernel" }
 barras-testkit = { path = "crates/testkit" }

@@ -255,6 +255,7 @@ name = "barras-api"
 version = "0.1.0"
 dependencies = [
  "barras-adapter-http",
+ "barras-adapter-postgres",
  "barras-bootstrap",
  "barras-testkit",
  "serde_json",

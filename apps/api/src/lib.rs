@@ -18,7 +18,7 @@ use barras_adapter_http::{
 };
 use barras_bootstrap::{LoggingError, ShutdownSignal, init_logging, install_panic_hook};
 
-pub use config::ApiConfig;
+pub use config::{ApiConfig, DatabaseUrlValue};
 
 /// The binary as it names itself in its metrics and on its internal port.
 const SERVICE: ServiceInfo = ServiceInfo {

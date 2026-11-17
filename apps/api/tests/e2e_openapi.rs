@@ -6,6 +6,7 @@
 use std::fs;
 
 use barras_adapter_http::metadata_problems;
+use barras_adapter_postgres::Pools;
 use barras_api::{ApiConfig, Dependencies, build_app, openapi_json};
 use barras_bootstrap::{AppEnv, Environment, LogLevel};
 use barras_testkit::{env_file, repository_file};
@@ -29,21 +30,26 @@ fn the_committed_openapi_json_is_the_document_the_code_generates() {
     );
 }
 
-#[test]
-fn the_configuration_loads_from_the_values_of_env_example() {
+// A runtime, since each pool starts a task on it; neither opens a connection.
+#[tokio::test]
+async fn the_configuration_loads_from_the_values_of_env_example() {
     let variables = env_file(repository_file(".env.example"));
 
     let config = ApiConfig::from_env(Environment::from_pairs(variables)).unwrap();
 
-    assert_eq!(
-        config,
-        ApiConfig {
-            env: AppEnv::Local,
-            log_level: LogLevel::Info,
-            bind_addr: "127.0.0.1:8080".parse().unwrap(),
-            internal_bind_addr: "127.0.0.1:9080".parse().unwrap(),
-        }
+    assert_eq!(config.env, AppEnv::Local);
+    assert_eq!(config.log_level, LogLevel::Info);
+    assert_eq!(config.bind_addr, "127.0.0.1:8080".parse().unwrap());
+    assert_eq!(config.internal_bind_addr, "127.0.0.1:9080".parse().unwrap());
+    assert_eq!(config.database_pool_size.get(), 10);
+    // A developer machine has no replica: the read URL is the primary's, so one pool serves both.
+    let pools = Pools::new(
+        "barras-api",
+        config.database_url.expose().get(),
+        config.database_read_url.expose().get(),
+        config.database_pool_size,
     );
+    assert!(pools.read_is_primary());
 }
 
 #[test]
