@@ -66,6 +66,12 @@ wildcards = "deny"
 allow-wildcard-paths = true
 deny = [
     { crate = "sqlx", wrappers = ["barras-adapter-postgres", "barras-testkit"], reason = "database access lives in the postgres adapter" },
+    # sqlx's own crates, each with its parents inside sqlx as its wrappers: without these rows a
+    # crate could reach the driver, its pool or its query macros past the sqlx ban.
+    { crate = "sqlx-core", wrappers = ["sqlx", "sqlx-macros", "sqlx-macros-core", "sqlx-postgres"], reason = "the core of sqlx: database access lives in the postgres adapter" },
+    { crate = "sqlx-postgres", wrappers = ["sqlx", "sqlx-macros-core"], reason = "the Postgres driver of sqlx: database access lives in the postgres adapter" },
+    { crate = "sqlx-macros", wrappers = ["sqlx"], reason = "the query macros of sqlx: database access lives in the postgres adapter" },
+    { crate = "sqlx-macros-core", wrappers = ["sqlx-macros"], reason = "the query macros of sqlx: database access lives in the postgres adapter" },
     # `utoipa-axum` depends on axum directly: it builds the axum router and the OpenAPI
     # document from the same handlers, for the HTTP adapter. `tonic` is the Docker client of the
     # test containers (below).
@@ -78,6 +84,10 @@ deny = [
     { crate = "axum-core", wrappers = ["barras-adapter-http", "barras-adapter-realtime", "axum"], reason = "the core of the web framework lives in the HTTP and realtime adapters" },
     { crate = "hyper", wrappers = ["barras-adapter-http", "barras-adapter-realtime", "axum", "hyper-util", "bollard", "hyper-named-pipe", "hyper-rustls", "hyper-timeout", "hyperlocal", "tonic"], reason = "the HTTP server and client under axum live in the HTTP and realtime adapters" },
     { crate = "hyper-util", wrappers = ["barras-adapter-http", "barras-adapter-realtime", "axum", "bollard", "hyper-named-pipe", "hyper-rustls", "hyper-timeout", "hyperlocal", "tonic"], reason = "the HTTP server and client under axum live in the HTTP and realtime adapters" },
+    # HTTP/2, which `hyper` takes for its `http2` feature and `tonic`, the gRPC client of the test
+    # containers, always: without this row a crate could serve or call HTTP/2 past the hyper ban.
+    # No release build takes it: the binaries answer HTTP/1.1 alone.
+    { crate = "h2", wrappers = ["hyper", "tonic"], reason = "HTTP/2 under hyper lives in the HTTP and realtime adapters, and the binaries answer HTTP/1.1 alone" },
     # The Docker client of the test containers. testcontainers talks to Docker through `bollard`,
     # which reaches `hyper` and `hyper-util` directly, through the connectors below, and through
     # `tonic`, its gRPC client for buildkit, which also reaches `axum`. Each crate on that path is

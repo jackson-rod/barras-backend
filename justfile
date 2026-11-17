@@ -343,7 +343,8 @@ _no-stray-profiles:
 # tests and the repository's checks use. cargo unifies the features of every package it builds,
 # so with the testkit the binaries took testcontainers' features, such as hyper-util's http2 and
 # server-auto, and barras-api's public port answered cleartext HTTP/2 (plan, refinement 13).
-# _hack-release-graph compares the release build of this same selection.
+# _hack-release-graph compares the release build of this same selection, and the default-members
+# of Cargo.toml are the same packages, for a cargo command that names none.
 release_packages := "--workspace --exclude barras-testkit --exclude xtask"
 
 build:

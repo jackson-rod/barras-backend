@@ -76,7 +76,7 @@ Every command runs from the repository root through `just`.
 | `just test-doc` | The doctests, with `cargo test --doc`: nextest does not run them, and cargo-llvm-cov cannot measure them on stable |
 | `just test-int` | With cargo-nextest, the test targets named `e2e_` or `int_`; needs Docker running, for the tests that start a Postgres container |
 | `just test-cov` | Every test once under cargo-llvm-cov, into a fresh `target/coverage/lcov.info`; fails on a `.profraw` file outside `target/`; then `cargo xtask check-coverage` holds the thresholds. It runs the `e2e_` and `int_` tests too, so it needs Docker running |
-| `just build` | Release build of the workspace without `barras-testkit` and `xtask`, which only the tests and the checks use: cargo unifies the features of every package it builds, so the testkit's would reach the binaries (ADR-0030) |
+| `just build` | Release build of the workspace without `barras-testkit` and `xtask`, which only the tests and the checks use: cargo unifies the features of every package it builds, so the testkit's would reach the binaries (ADR-0030). A plain `cargo build` leaves them out too: they are not among the `default-members` of the root `Cargo.toml` |
 | `just verify` | `check-arch`, `check-structure`, `hakari-check`, `fmt-check`, `deny`, `lint`, `openapi-check`, `db-check`, `test-cov`, `test-doc`, `build`, in that order, which is CI's: the first five compile no member, so they read the workspace before any build script of the change runs. It needs Docker running, for `db-check` and `test-cov`. It is what CI runs, apart from the branch, commit and pull request checks and the tree check |
 
 - `cargo xtask` subcommands: `check-branch [name]`, `check-commit-msg <file>`, `check-commits <range>`, `check-pr <file>`, `check-arch`, `check-structure` and `check-coverage <lcov-file> [workspace-root]`, whose root is this repository unless a test gives another. Each exits 1 with one line per problem on standard error, and 2 on a command line it does not know; `check-coverage` also prints each crate's figure.
@@ -170,6 +170,8 @@ crates/modules/<module>/        snake_case; plural for collections
 - Every folder directly under `apps/`, `crates/modules/` and `crates/adapters/` that holds a `Cargo.toml`, and `crates/kernel`, `crates/bootstrap`, `crates/testkit`, `crates/workspace-hack` and `crates/xtask`, is listed in `members` (`not-a-member`); a crate in any other folder fails (`unknown-location`) (`check-arch`; ADR-0024).
 - `cargo deny check bans` lets only these crates depend directly on a technology crate; every other crate, apps included, fails, and an app reaches them through its adapter (`deny.toml`; ADR-0024):
   - `sqlx`: `barras-adapter-postgres` and `barras-testkit`.
+  - `sqlx-core`, `sqlx-postgres`, `sqlx-macros` and `sqlx-macros-core`: their parents inside sqlx alone, so that no crate reaches the driver past the ban on `sqlx`.
+  - `h2`: `hyper` and `tonic` alone, so that no crate serves or calls HTTP/2 past the ban on `hyper`; no release build takes it (ADR-0030).
   - `axum`: `barras-adapter-http` and `barras-adapter-realtime`, and the third-party `utoipa-axum` and `tonic`, a crate of the Docker client (below).
   - `axum-core`, `hyper` and `hyper-util`: the HTTP and realtime adapters, and the third-party crates that wrap them (`axum`; `hyper-util` for `hyper`; the crates of the Docker client).
   - `utoipa-axum`: `barras-adapter-http`.
@@ -196,6 +198,7 @@ Reject on sight: a framework type in a module crate; a database row type in a us
 ### Adding a crate or a dependency
 
 - List the crate in `members` of the root `Cargo.toml`. The list is explicit, with no globs (`Cargo.toml`). A crate folder of the table left out of it fails (`not-a-member`, `check-arch`).
+- List it in `default-members` too, unless only the tests or the checks use it, as `barras-testkit` and `xtask`: a plain `cargo build` builds the default members alone, so the features of those two never reach the binaries there (ADR-0030).
 - Its folder decides its layer: `crates/kernel`, `crates/modules/<module>`, `crates/adapters/<name>`, `apps/<name>`, `crates/bootstrap`, `crates/testkit`, `crates/workspace-hack` or `crates/xtask`. A crate anywhere else fails (`unknown-location`, `check-arch`).
 - Its folder also decides its package name: `barras-<module>` for a module, `barras-adapter-<name>` for an adapter, `barras-<name>` for an app (`package-name`, `check-arch`).
 - Give its `Cargo.toml` the fields every member has, under that name:

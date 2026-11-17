@@ -8,6 +8,20 @@ members = [
   "crates/adapters/redis", "crates/adapters/providers",
   "crates/testkit", "crates/workspace-hack", "crates/xtask",
 ]
+# What a cargo command builds when it names no package, such as a plain `cargo build --release`:
+# every member but `barras-testkit` and `xtask`, which only the tests and the repository's checks
+# use. cargo unifies the features of every package it builds, so with the testkit the binaries
+# took testcontainers' features, such as hyper-util's `http2` and `server-auto`, and the public
+# port of barras-api answered cleartext HTTP/2 (plan, refinement 13). The recipes name the
+# packages they build, with `--workspace` or `-p`.
+default-members = [
+  "apps/api", "apps/ingest",
+  "crates/kernel",
+  "crates/bootstrap",
+  "crates/adapters/postgres", "crates/adapters/http", "crates/adapters/realtime",
+  "crates/adapters/redis", "crates/adapters/providers",
+  "crates/workspace-hack",
+]
 
 [workspace.package]
 version = "0.1.0"
