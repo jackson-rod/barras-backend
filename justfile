@@ -43,6 +43,12 @@ _with-env +command:
         echo 'copy .env.example to .env' >&2
         exit 1
     fi
+    # bash 3.2 ends a line it reads at a NUL byte, so whatever follows one on that line would never
+    # be checked: a file that holds one is refused whole.
+    if [[ "$(tr -d '\000' < .env | wc -c)" -ne "$(wc -c < .env)" ]]; then
+        echo '.env holds a NUL byte' >&2
+        exit 1
+    fi
     upper=ABCDEFGHIJKLMNOPQRSTUVWXYZ
     lower=abcdefghijklmnopqrstuvwxyz
     digits=0123456789
@@ -249,7 +255,9 @@ openapi-check:
 # nor API_DATABASE_URL, so that what it holds follows from the migrations and the queries alone.
 
 # Rewrites .sqlx/ from the queries, against a throwaway database with every migration applied
-db-prepare: (_throwaway-db "cargo" "sqlx" "prepare" "--workspace" "--no-dotenv" "--" "--locked")
+# sqlx-cli's own --workspace only places .sqlx/ at the root: the cargo check it runs takes the
+# arguments after --, and without --workspace it checks only the default members.
+db-prepare: (_throwaway-db "cargo" "sqlx" "prepare" "--workspace" "--no-dotenv" "--" "--locked" "--workspace")
 
 # Fails when a migration does not apply to an empty database, or when .sqlx/ is not what the queries and the migrations produce
 db-check: (_throwaway-db "just" "_sqlx-check")
@@ -261,7 +269,7 @@ db-check: (_throwaway-db "just" "_sqlx-check")
 _sqlx-check:
     #!/usr/bin/env bash
     set -euo pipefail
-    cargo sqlx prepare --workspace --check --no-dotenv -- --locked
+    cargo sqlx prepare --workspace --check --no-dotenv -- --locked --workspace
     target="$(cargo metadata --locked --format-version 1 --no-deps | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
     extra="$(comm -23 <(cd .sqlx && ls query-*.json | sort) <(cd "$target/sqlx-prepare-check" && ls query-*.json | sort))"
     if [[ -n "$extra" ]]; then

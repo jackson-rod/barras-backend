@@ -60,6 +60,8 @@ async fn the_configuration_loads_from_the_values_of_env_example() {
     assert_eq!(config.internal_bind_addr, "127.0.0.1:9080".parse().unwrap());
     assert_eq!(config.database_pool_size.get(), 10);
     // A developer machine has no replica: the read URL is the primary's, so one pool serves both.
+    // Asserted on the values as written, since both are then moved to the same closed port.
+    assert_eq!(value("API_DATABASE_READ_URL"), value("API_DATABASE_URL"));
     // The pools are built at a port where nothing listens, rather than at the local database
     // that the file names, though they open no connection until one is needed.
     let closed = closed_port();
