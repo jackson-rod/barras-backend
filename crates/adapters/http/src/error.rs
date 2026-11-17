@@ -53,10 +53,11 @@ impl ApiError {
     pub const SERVICE_UNAVAILABLE: &'static str = "SERVICE_UNAVAILABLE";
     /// The code of [`ApiError::internal`].
     pub const INTERNAL_ERROR: &'static str = "INTERNAL_ERROR";
-    /// The code of the answer to a request that has had none within the time limit, and whose
-    /// body, if it had one, had arrived.
+    /// The code of the answer to a request that has had none within the time limit, unless its
+    /// handler was then waiting for more of its body.
     pub const REQUEST_TIMEOUT: &'static str = "REQUEST_TIMEOUT";
-    /// The code of the answer to a request whose body was still arriving at the time limit.
+    /// The code of the answer to a request whose handler, at the time limit, was waiting for
+    /// more of a body that the client had not finished sending.
     pub const REQUEST_BODY_TIMEOUT: &'static str = "REQUEST_BODY_TIMEOUT";
 
     /// 422 `VALIDATION_FAILED`, with every field that failed in `error.fields`.
@@ -151,8 +152,9 @@ impl ApiError {
         )
     }
 
-    /// 408 `REQUEST_BODY_TIMEOUT`: the request's body was still arriving at the time limit of a
-    /// request. The client's slowness, not the server's, so it is not logged as a failure.
+    /// 408 `REQUEST_BODY_TIMEOUT`: at the time limit of a request, its handler was waiting for
+    /// more of a body that the client had not finished sending. The client's slowness, not the
+    /// server's, so it is not logged as a failure.
     pub(crate) fn request_body_timeout() -> Self {
         Self::client(
             StatusCode::REQUEST_TIMEOUT,

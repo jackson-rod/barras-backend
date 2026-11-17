@@ -1,23 +1,32 @@
 //! The time limit of a request (spec §6.4): an answer that has not started five seconds after
 //! the request arrived, the reading of its body included, is a 503 `REQUEST_TIMEOUT` that is
 //! logged, counted and carries the request id, and its handler is dropped, a handler that panics
-//! as it is dropped included. A request whose body is still arriving then is the client's
-//! slowness instead: a 408 `REQUEST_BODY_TIMEOUT` that closes the connection and logs no
-//! failure. A body that streams out after the head is not limited. Every test pauses tokio's
-//! clock, so none of them waits.
+//! as it is dropped included. It is the client's slowness instead only when the handler is then
+//! waiting for more of a body that the client is still sending, not when the handler never reads
+//! the body or stops reading it: a 408 `REQUEST_BODY_TIMEOUT` that closes the connection, over a
+//! real socket too, and logs no failure. A body that streams out after the head is not limited.
+//! Every test pauses tokio's clock, so none of them waits.
 
+use std::convert::Infallible;
+use std::io;
+use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
-use axum::body::{Body, Bytes, to_bytes};
-use axum::extract::{Path, State};
+use axum::body::{Body, Bytes, HttpBody, to_bytes};
+use axum::extract::{FromRequestParts, Path, State};
 use axum::http::header::CONTENT_TYPE;
+use axum::http::request::Parts;
 use axum::http::{Request, StatusCode};
 use axum::response::{IntoResponse, Response};
+use http_body::Frame;
 use http_body_util::{BodyExt, Full};
 use serde_json::{Value, json};
-use tokio::time::Instant;
+use tokio::net::TcpStream;
+use tokio::time::{Instant, Interval, timeout};
 use tower::ServiceExt;
 use tracing::Level;
 use utoipa_axum::routes;
@@ -29,6 +38,7 @@ use crate::middleware::REQUEST_TIME_LIMIT;
 use crate::testing::{TestClient, TestRequest};
 use crate::{
     Access, ApiError, ApiResult, ApiRouter, ApiSuccess, HttpApp, Metrics, NoData, SuccessEnvelope,
+    bind, serve_api,
 };
 
 /// A wait far over the limit, for the handler that must not be waited for.
@@ -123,6 +133,43 @@ async fn fragile() -> ApiResult<NoData> {
     Ok(ApiSuccess::ok("Answered late", NoData))
 }
 
+/// Takes a minute to read from the head of a request, as an extractor that awaits a slow lookup
+/// might, before the handler's body is read.
+struct SlowToExtract;
+
+impl<S: Sync> FromRequestParts<S> for SlowToExtract {
+    type Rejection = Infallible;
+
+    async fn from_request_parts(_parts: &mut Parts, _state: &S) -> Result<Self, Infallible> {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        Ok(Self)
+    }
+}
+
+/// Read the body once an extractor of the head has taken a minute.
+#[utoipa::path(
+    post,
+    path = "/slow-extractor",
+    tag = "fixtures",
+    responses((status = 200, description = "Answered late", body = SuccessEnvelope<NoData>)),
+)]
+async fn after_a_slow_extractor(_slow: SlowToExtract, _body: Bytes) -> ApiResult<NoData> {
+    Ok(ApiSuccess::ok("Answered late", NoData))
+}
+
+/// Read the first chunk of the body, then answer once a minute has passed, the rest unread.
+#[utoipa::path(
+    post,
+    path = "/first-chunk",
+    tag = "fixtures",
+    responses((status = 200, description = "Answered late", body = SuccessEnvelope<NoData>)),
+)]
+async fn first_chunk(mut body: Body) -> ApiResult<NoData> {
+    let _first = body.frame().await;
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    Ok(ApiSuccess::ok("Answered late", NoData))
+}
+
 /// Answer at once with a body that ends only once `ms` milliseconds have passed.
 #[utoipa::path(
     get,
@@ -159,6 +206,62 @@ fn slow_body(request_id: &str) -> Request<Body> {
         .unwrap()
 }
 
+/// A body whose client sends five bytes every two seconds and never finishes, as a client on a
+/// slow link sends a long body.
+struct Trickle(Interval);
+
+impl HttpBody for Trickle {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+        let chunk = Frame::data(Bytes::from_static(b"12345"));
+        self.0.poll_tick(cx).map(|_| Some(Ok(chunk)))
+    }
+}
+
+/// The address of `app`, served on real sockets until the test ends.
+async fn served(app: HttpApp) -> SocketAddr {
+    let any_port = SocketAddr::from(([127, 0, 0, 1], 0));
+    let public = bind("public", any_port).await.unwrap();
+    let internal = bind("internal", any_port).await.unwrap();
+    let addr = public.local_addr().unwrap();
+    tokio::spawn(serve_api(app, public, internal, std::future::pending()));
+    addr
+}
+
+/// Writes `text` to `stream` at once.
+async fn send(stream: &TcpStream, text: &str) {
+    stream.writable().await.unwrap();
+    assert_eq!(stream.try_write(text.as_bytes()).unwrap(), text.len());
+}
+
+/// Adds to `received` what `stream` has delivered, waiting for it when nothing has come yet:
+/// how many bytes, 0 once the stream has ended.
+async fn read_some(stream: &TcpStream, received: &mut Vec<u8>) -> usize {
+    let mut buffer = [0; 1024];
+    loop {
+        stream.readable().await.unwrap();
+        match stream.try_read(&mut buffer) {
+            Ok(read) => {
+                received.extend_from_slice(&buffer[..read]);
+                return read;
+            }
+            // The socket said it was readable before it was: wait for it again.
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => panic!("reading the answer: {error}"),
+        }
+    }
+}
+
+/// Adds to `received` all that `stream` delivers until it ends.
+async fn read_to_the_end(stream: &TcpStream, received: &mut Vec<u8>) {
+    while read_some(stream, received).await > 0 {}
+}
+
 /// The fixture app with the routes of these tests, its waiting runs counted in `runs` and its
 /// answers in `metrics`.
 fn app_with(runs: Runs, metrics: Metrics) -> HttpApp {
@@ -166,6 +269,8 @@ fn app_with(runs: Runs, metrics: Metrics) -> HttpApp {
         .route(routes!(wait, wait_after_the_body), Access::public(), &[])
         .route(routes!(fragile), Access::public(), &[])
         .route(routes!(stream), Access::public(), &[])
+        .route(routes!(after_a_slow_extractor), Access::public(), &[])
+        .route(routes!(first_chunk), Access::public(), &[])
         .with_state(runs);
     HttpApp::builder(metrics)
         .routes(fixture_routes().merge(routes))
@@ -326,6 +431,64 @@ async fn a_body_still_arriving_at_the_limit_logs_no_failure_and_is_counted_at_40
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_body_still_trickling_in_while_the_handler_reads_it_gets_the_408() {
+    let app = app_with(Runs::default(), fixture_metrics());
+    // Chunks at 0, 2 and 4 seconds: at the limit, the length route has read each one and waits
+    // for the next.
+    let trickle = Trickle(tokio::time::interval(Duration::from_secs(2)));
+    let request = Request::post("/api/v1/length")
+        .body(Body::new(trickle))
+        .unwrap();
+    let started = Instant::now();
+
+    let Ok(response) = app.router().oneshot(request).await;
+
+    assert_eq!(started.elapsed(), REQUEST_TIME_LIMIT);
+    assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    assert_eq!(response.headers()["connection"], "close");
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"], json!({ "code": "REQUEST_BODY_TIMEOUT" }));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_client_that_stops_sending_its_body_gets_the_408_then_the_connection_closes() {
+    let addr = served(app_with(Runs::default(), fixture_metrics())).await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    // Five bytes of the ten that the head announces, and never the rest.
+    let head = "POST /api/v1/length HTTP/1.1\r\nhost: barras\r\nx-request-id: stalled\r\n\
+                content-length: 10\r\n\r\n";
+    send(&stream, &format!("{head}12345")).await;
+    let started = Instant::now();
+    let mut received = Vec::new();
+
+    // No timer bounds this wait: on a paused clock, every wait for the sockets jumps to the next
+    // deadline, and until the server has read the request, that would be this timer's.
+    read_some(&stream, &mut received).await;
+    let answered = started.elapsed();
+    // The rest of the answer, then the end of the stream, which a server that still waits for
+    // the rest of the body never sends.
+    let closed = timeout(
+        Duration::from_secs(1),
+        read_to_the_end(&stream, &mut received),
+    )
+    .await;
+
+    assert_eq!(answered, REQUEST_TIME_LIMIT);
+    assert!(closed.is_ok(), "the server kept the connection open");
+    let text = String::from_utf8(received).unwrap();
+    let (head, body) = text.split_once("\r\n\r\n").unwrap();
+    let mut lines = head.lines();
+    assert_eq!(lines.next(), Some("HTTP/1.1 408 Request Timeout"), "{head}");
+    let headers: Vec<&str> = lines.collect();
+    assert!(headers.contains(&"connection: close"), "{head}");
+    assert!(headers.contains(&"x-request-id: stalled"), "{head}");
+    let body: Value = serde_json::from_str(body).unwrap();
+    assert_eq!(body["code"], 408);
+    assert_eq!(body["error"], json!({ "code": "REQUEST_BODY_TIMEOUT" }));
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_body_sent_whole_then_a_slow_handler_gets_the_503() {
     for request in [
         TestRequest::new("POST", OVER_THE_LIMIT).body("12345"),
@@ -343,8 +506,42 @@ async fn a_body_sent_whole_then_a_slow_handler_gets_the_503() {
 
 #[tokio::test(start_paused = true)]
 async fn a_request_without_a_body_and_a_slow_handler_gets_the_503() {
-    // The waiting handler never reads the body: one that is empty from the start has arrived.
     let response = client().get(OVER_THE_LIMIT).await;
+
+    assert_error(&response, 503, ApiError::REQUEST_TIMEOUT);
+    assert_eq!(response.header("connection"), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_small_body_that_a_slow_handler_never_reads_gets_the_503() {
+    // A GET whose body was sent whole, to the waiting handler, which never reads it.
+    let request = TestRequest::new("GET", OVER_THE_LIMIT).body("12345");
+
+    let response = client().send(request).await;
+
+    assert_error(&response, 503, ApiError::REQUEST_TIMEOUT);
+    assert_eq!(response.header("connection"), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_slow_extractor_that_runs_before_the_body_is_read_gets_the_503() {
+    let request = TestRequest::new("POST", "/api/v1/slow-extractor").body("12345");
+
+    let response = client().send(request).await;
+
+    assert_error(&response, 503, ApiError::REQUEST_TIMEOUT);
+    assert_eq!(response.header("connection"), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_handler_that_reads_a_chunk_of_a_whole_body_then_stalls_gets_the_503() {
+    // Streamed, the body tells its end only to a poll after its one chunk, which the handler
+    // never makes, so it stays unread to its end although it was sent whole.
+    let request = TestRequest::new("POST", "/api/v1/first-chunk")
+        .body("12345")
+        .streamed();
+
+    let response = client().send(request).await;
 
     assert_error(&response, 503, ApiError::REQUEST_TIMEOUT);
     assert_eq!(response.header("connection"), None);
