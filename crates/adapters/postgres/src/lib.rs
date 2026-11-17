@@ -17,12 +17,14 @@ mod database_url;
 mod guard;
 mod migrate;
 mod pools;
+mod seed;
 mod unavailable;
 
 pub use database_url::{DatabaseUrl, UrlProblem};
 pub use guard::{NotLocal, ensure_local};
 pub use migrate::{AppliedMigration, MigrateError, MigrationFailure, migrate, migrate_with};
 pub use pools::Pools;
+pub use seed::{AppliedSeed, ErrorPosition, SeedError, SeedFailure, seed};
 pub use unavailable::DatabaseUnavailable;
 
 // Taken for its features, not code; named so that cargo never reports it as an unused dependency.
