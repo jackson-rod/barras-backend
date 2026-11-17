@@ -11,6 +11,7 @@ mod logging;
 mod panic_hook;
 mod report;
 mod runtime;
+mod secret;
 // SIGTERM is a Unix signal, and Barras builds and runs only on Unix.
 #[cfg(unix)]
 mod shutdown;
@@ -23,6 +24,7 @@ pub use logging::{LoggingError, build_subscriber, init_logging};
 pub use panic_hook::install_panic_hook;
 pub use report::{report_failure, report_usage};
 pub use runtime::{RuntimeError, build_runtime};
+pub use secret::Secret;
 #[cfg(unix)]
 pub use shutdown::ShutdownSignal;
 pub use with_sources::with_sources;

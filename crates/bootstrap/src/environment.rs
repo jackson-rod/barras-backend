@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fmt;
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
 
 /// Where the binary runs. It decides the log format: readable lines on `Local`, JSON
 /// everywhere else.
@@ -67,6 +68,29 @@ impl FromEnvValue for SocketAddr {
 
     fn from_env_value(raw: &str) -> Option<Self> {
         raw.parse().ok()
+    }
+}
+
+impl FromEnvValue for NonZeroU32 {
+    const EXPECTED: &'static str = "a whole number from 1 to 4294967295";
+
+    fn from_env_value(raw: &str) -> Option<Self> {
+        // The standard parser takes a leading `+` too, and a whole number written here has no
+        // sign. It refuses the rest: blanks, `0` and anything above `u32::MAX`.
+        if !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        raw.parse().ok()
+    }
+}
+
+/// For a value with no structure of its own to check. It takes any text: an empty one never
+/// gets here, since it counts as missing, and one that is not Unicode is refused before.
+impl FromEnvValue for String {
+    const EXPECTED: &'static str = "any text";
+
+    fn from_env_value(raw: &str) -> Option<Self> {
+        Some(raw.to_owned())
     }
 }
 
@@ -268,18 +292,6 @@ mod tests {
             .collect()
     }
 
-    /// Accepts any text, so that only the decoding of a value can refuse it.
-    #[derive(Debug, PartialEq)]
-    struct AnyText(String);
-
-    impl FromEnvValue for AnyText {
-        const EXPECTED: &'static str = "any text";
-
-        fn from_env_value(raw: &str) -> Option<Self> {
-            Some(Self(raw.to_owned()))
-        }
-    }
-
     #[test]
     fn values_are_read_into_their_types() {
         struct Config {
@@ -384,6 +396,72 @@ mod tests {
     }
 
     #[test]
+    fn a_whole_number_is_read_from_its_decimal_digits() {
+        for (raw, number) in [
+            ("1", 1),
+            ("10", 10),
+            // Leading zeros are digits too, and never mean octal.
+            ("010", 10),
+            ("4294967295", u32::MAX),
+        ] {
+            let expected = NonZeroU32::new(number);
+            assert_eq!(NonZeroU32::from_env_value(raw), expected, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn a_whole_number_is_digits_only_with_no_sign_and_no_blanks() {
+        for raw in [
+            "+1", "-1", "+0", "-0", " 1", "1 ", "1\n", "\t1", "1 000", "1_000", "1,000", "1.0",
+            "1e3", "0x10", "ten", "",
+            // ARABIC-INDIC DIGIT ONE: only the ASCII digits count.
+            "\u{661}",
+        ] {
+            assert_eq!(NonZeroU32::from_env_value(raw), None, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn zero_is_not_a_whole_number_from_1() {
+        for raw in ["0", "00", "0000000000"] {
+            assert_eq!(NonZeroU32::from_env_value(raw), None, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn a_whole_number_above_the_largest_u32_is_not_valid() {
+        for raw in [
+            "4294967296",
+            "18446744073709551616",
+            "99999999999999999999999",
+        ] {
+            assert_eq!(NonZeroU32::from_env_value(raw), None, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn a_string_is_any_text_as_given() {
+        for raw in [
+            "barras",
+            "postgres://barras:barras@127.0.0.1:5433/barras",
+            " spaced ",
+            "two\nlines",
+            "ñandú",
+        ] {
+            assert_eq!(String::from_env_value(raw).as_deref(), Some(raw), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn an_empty_string_is_missing_rather_than_empty() {
+        let mut env = Environment::from_pairs([("DATABASE_USER", "")]);
+        let user = env.required::<String>("DATABASE_USER");
+        assert_eq!(user, None);
+        let error = env.finish(user).unwrap_err();
+        assert_eq!(summary(&error), [("DATABASE_USER", Missing)]);
+    }
+
+    #[test]
     fn the_expected_values_are_spelled_out() {
         assert_eq!(AppEnv::EXPECTED, "one of local, staging, production");
         assert_eq!(LogLevel::EXPECTED, "one of trace, debug, info, warn, error");
@@ -391,6 +469,8 @@ mod tests {
             SocketAddr::EXPECTED,
             "a socket address such as 127.0.0.1:8080"
         );
+        assert_eq!(NonZeroU32::EXPECTED, "a whole number from 1 to 4294967295");
+        assert_eq!(String::EXPECTED, "any text");
     }
 
     #[test]
@@ -440,9 +520,9 @@ mod tests {
             ("DATABASE_PASSWORD", not_unicode),
             ("DATABASE_USER", OsString::from("barras")),
         ]);
-        let user = env.required::<AnyText>("DATABASE_USER");
-        let password = env.required::<AnyText>("DATABASE_PASSWORD");
-        assert_eq!(user, Some(AnyText("barras".to_owned())));
+        let user = env.required::<String>("DATABASE_USER");
+        let password = env.required::<String>("DATABASE_PASSWORD");
+        assert_eq!(user.as_deref(), Some("barras"));
 
         let error = env.finish(user.zip(password)).unwrap_err();
 
