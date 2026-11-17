@@ -7,6 +7,7 @@ use std::path::Path;
 use regex::Regex;
 
 use crate::error::XtaskError;
+use crate::walk::{EntryKind, kind_at};
 
 const README: &str = "README.md";
 
@@ -17,8 +18,9 @@ fn pattern(source: &str) -> Result<Regex, XtaskError> {
     })
 }
 
-/// Sorted (name, is_directory) pairs, hidden entries left out, directly inside `dir`, so messages come out in a stable order.
-pub(crate) fn entries(dir: &Path) -> Result<Vec<(String, bool)>, XtaskError> {
+/// Sorted (name, kind) pairs, hidden entries left out, directly inside `dir`, so messages come
+/// out in a stable order. A symlink is never followed: its kind is `Symlink`, wherever it points.
+pub(crate) fn entries(dir: &Path) -> Result<Vec<(String, EntryKind)>, XtaskError> {
     let mut found = Vec::new();
     for entry in fs::read_dir(dir).map_err(XtaskError::io(dir))? {
         let entry = entry.map_err(XtaskError::io(dir))?;
@@ -27,14 +29,21 @@ pub(crate) fn entries(dir: &Path) -> Result<Vec<(String, bool)>, XtaskError> {
         if name.starts_with('.') {
             continue;
         }
-        let is_dir = entry
-            .file_type()
-            .map_err(XtaskError::io(&entry.path()))?
-            .is_dir();
-        found.push((name, is_dir));
+        let kind = EntryKind::of(entry.file_type().map_err(XtaskError::io(&entry.path()))?);
+        found.push((name, kind));
     }
     found.sort();
     Ok(found)
+}
+
+/// What an entry of `kind` is, in a message.
+fn described(kind: EntryKind) -> &'static str {
+    match kind {
+        EntryKind::File => "a file",
+        EntryKind::Folder => "a folder",
+        EntryKind::Symlink => "a symlink",
+        EntryKind::Special => "a FIFO, a socket or a device",
+    }
 }
 
 fn read(path: &Path) -> Result<String, XtaskError> {
@@ -51,8 +60,8 @@ pub fn check_adrs(adr_dir: &Path) -> Result<Vec<String>, XtaskError> {
     let mut numbers = BTreeSet::new();
     let mut duplicates = BTreeSet::new();
 
-    for (file, is_dir) in entries(adr_dir)? {
-        if is_dir || file == README {
+    for (file, kind) in entries(adr_dir)? {
+        if kind == EntryKind::Folder || file == README {
             continue;
         }
         let Some(captures) = name_rule.captures(&file) else {
@@ -113,8 +122,8 @@ pub fn check_adrs(adr_dir: &Path) -> Result<Vec<String>, XtaskError> {
 pub fn check_modules(modules_dir: &Path) -> Result<Vec<String>, XtaskError> {
     let name_rule = pattern(r"^[a-z][a-z0-9]*(_[a-z0-9]+)*$")?;
     let mut problems = Vec::new();
-    for (module, is_dir) in entries(modules_dir)? {
-        if !is_dir {
+    for (module, kind) in entries(modules_dir)? {
+        if kind != EntryKind::Folder {
             continue;
         }
         let root = modules_dir.join(&module);
@@ -132,7 +141,7 @@ pub fn check_modules(modules_dir: &Path) -> Result<Vec<String>, XtaskError> {
                 problems.push(format!("{module}: {required} is missing"));
             } else if !entries(&dir)?
                 .iter()
-                .any(|(file, is_dir)| !is_dir && file.ends_with(".rs"))
+                .any(|(file, kind)| *kind != EntryKind::Folder && file.ends_with(".rs"))
             {
                 // git does not track an empty folder: it would pass here and fail in CI.
                 problems.push(format!("{module}: {required} has no .rs file"));
@@ -146,8 +155,11 @@ pub fn check_modules(modules_dir: &Path) -> Result<Vec<String>, XtaskError> {
             if !dir.is_dir() {
                 continue;
             }
-            for (file, is_dir) in entries(&dir)? {
-                if is_dir || !file.ends_with(".rs") || exempt.contains(&file.as_str()) {
+            for (file, kind) in entries(&dir)? {
+                if kind == EntryKind::Folder
+                    || !file.ends_with(".rs")
+                    || exempt.contains(&file.as_str())
+                {
                     continue;
                 }
                 if !read(&dir.join(&file))?.contains("#[cfg(test)]") {
@@ -171,17 +183,45 @@ pub fn check_seeds(seeds_dir: &Path) -> Result<Vec<String>, XtaskError> {
     check_versioned_sql(seeds_dir, "seeds")
 }
 
-/// Every entry of `dir`, a folder of SQL files that run in the order of the version their names
-/// start with, is named `YYYYMMDDHHMMSS_snake_case.sql`, and no two share a version. A name that
-/// breaks the rule is reported for that alone: it is no such file, so it shares no version.
+/// `dir` holds SQL files that run in the order of the version their names start with. It must be
+/// a folder, each entry of it a regular file named `YYYYMMDDHHMMSS_snake_case.sql`, and no two
+/// entries may share a version. An entry is reported for the first rule it breaks, and for that
+/// alone: it is no such file, so it shares no version.
 fn check_versioned_sql(dir: &Path, folder: &str) -> Result<Vec<String>, XtaskError> {
-    let name_rule = pattern(r"^(\d{14})_[a-z0-9_]+\.sql$")?;
+    // Not followed: sqlx and the seed runner follow a symlink in the folder's place, so the files
+    // that run would be another folder's, outside the repository too.
+    let kind = EntryKind::of(
+        fs::symlink_metadata(dir)
+            .map_err(XtaskError::io(dir))?
+            .file_type(),
+    );
+    if kind != EntryKind::Folder {
+        return Ok(vec![format!(
+            "{folder}: must be a folder, not {}",
+            described(kind)
+        )]);
+    }
+    // ASCII digits: `\d` takes a digit of any script, and sqlx reads a version as an i64.
+    let name_rule = pattern(r"^([0-9]{14})_[a-z0-9_]+\.sql$")?;
     let mut problems = Vec::new();
     let mut by_version: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for (name, _) in entries(dir)? {
+    // Every name is printed as `{:?}` prints it: a newline or an escape sequence in one would
+    // otherwise forge a line of the output or rewrite the terminal.
+    for (name, kind) in entries(dir)? {
+        let path = format!("{folder}/{name}");
+        // sqlx and the seed runner follow a symlink, so the SQL that runs could be any file,
+        // outside the repository too; and they skip whatever else is not a file, so the
+        // migration or the seed it stands for would never run.
+        if kind != EntryKind::File {
+            problems.push(format!(
+                "{path:?}: must be a regular file, not {}",
+                described(kind)
+            ));
+            continue;
+        }
         let Some(version) = name_rule.captures(&name).map(|c| c[1].to_owned()) else {
             problems.push(format!(
-                "{folder}/{name}: name must match YYYYMMDDHHMMSS_snake_case.sql"
+                "{path:?}: name must match YYYYMMDDHHMMSS_snake_case.sql"
             ));
             continue;
         };
@@ -189,6 +229,7 @@ fn check_versioned_sql(dir: &Path, folder: &str) -> Result<Vec<String>, XtaskErr
     }
     for (version, names) in by_version {
         if names.len() > 1 {
+            let names: Vec<String> = names.iter().map(|name| format!("{name:?}")).collect();
             problems.push(format!(
                 "{folder}: version {version} is used by more than one file: {}",
                 names.join(", ")
@@ -210,15 +251,15 @@ pub fn check_structure(repo_root: &Path) -> Result<Vec<String>, XtaskError> {
     if modules.is_dir() {
         problems.extend(check_modules(&modules)?);
     }
-    let migrations = repo_root.join("migrations");
-    if migrations.is_dir() {
-        problems.extend(check_migrations(&migrations)?);
+    // Whatever stands at either name is checked, not only a folder: `is_dir` would follow a
+    // symlink, and pass over a file or a FIFO.
+    if kind_at(repo_root, Path::new("migrations"))?.is_some() {
+        problems.extend(check_migrations(&repo_root.join("migrations"))?);
     }
     // A missing folder holds no seed, as the seed runner reads it: the first seed comes with the
     // first module that needs local data.
-    let seeds = repo_root.join("seeds");
-    if seeds.is_dir() {
-        problems.extend(check_seeds(&seeds)?);
+    if kind_at(repo_root, Path::new("seeds"))?.is_some() {
+        problems.extend(check_seeds(&repo_root.join("seeds"))?);
     }
     Ok(problems)
 }
@@ -363,10 +404,10 @@ mod tests {
         assert_eq!(
             check_migrations(dir.path()).unwrap(),
             [
-                "migrations/20261115120000_create_users.sql.bak: name must match \
+                "\"migrations/20261115120000_create_users.sql.bak\": name must match \
                  YYYYMMDDHHMMSS_snake_case.sql",
                 "migrations: version 20261115120000 is used by more than one file: \
-                 20261115120000_create_users.sql, 20261115120000_create_wallets.sql",
+                 \"20261115120000_create_users.sql\", \"20261115120000_create_wallets.sql\"",
             ]
         );
     }
@@ -381,10 +422,10 @@ mod tests {
         assert_eq!(
             check_seeds(dir.path()).unwrap(),
             [
-                "seeds/20261116000002_DemoWallets.sql: name must match \
+                "\"seeds/20261116000002_DemoWallets.sql\": name must match \
                  YYYYMMDDHHMMSS_snake_case.sql",
-                "seeds/README.md: name must match YYYYMMDDHHMMSS_snake_case.sql",
-                "seeds/demo_user.sql: name must match YYYYMMDDHHMMSS_snake_case.sql",
+                "\"seeds/README.md\": name must match YYYYMMDDHHMMSS_snake_case.sql",
+                "\"seeds/demo_user.sql\": name must match YYYYMMDDHHMMSS_snake_case.sql",
             ]
         );
     }
@@ -400,8 +441,8 @@ mod tests {
             check_seeds(dir.path()).unwrap(),
             [
                 "seeds: version 20261116000001 is used by more than one file: \
-                 20261116000001_demo_goals.sql, 20261116000001_demo_user.sql, \
-                 20261116000001_demo_wallets.sql"
+                 \"20261116000001_demo_goals.sql\", \"20261116000001_demo_user.sql\", \
+                 \"20261116000001_demo_wallets.sql\""
             ]
         );
     }
@@ -415,7 +456,130 @@ mod tests {
         write(root, "seeds/demo_user.sql", "");
         assert_eq!(
             check_structure(root).unwrap(),
-            ["seeds/demo_user.sql: name must match YYYYMMDDHHMMSS_snake_case.sql"]
+            ["\"seeds/demo_user.sql\": name must match YYYYMMDDHHMMSS_snake_case.sql"]
+        );
+    }
+
+    #[test]
+    fn a_version_is_written_in_ascii_digits() {
+        // `\d` takes a digit of any script, as these full-width and Arabic-Indic ones; sqlx
+        // reads a version as an i64, from ASCII digits alone.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "２０２６１１１５１２００００_create_users.sql",
+            "",
+        );
+        write(dir.path(), "٢٠٢٦١١١٥١٢٠٠٠٠_create_goals.sql", "");
+        write(dir.path(), "20261115120001_create_wallets.sql", "");
+        assert_eq!(
+            check_migrations(dir.path()).unwrap(),
+            [
+                "\"migrations/٢٠٢٦١١١٥١٢٠٠٠٠_create_goals.sql\": name must match \
+                 YYYYMMDDHHMMSS_snake_case.sql",
+                "\"migrations/２０２６１１１５１２００００_create_users.sql\": name must match \
+                 YYYYMMDDHHMMSS_snake_case.sql",
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_name_is_printed_escaped_so_that_it_cannot_shape_the_output() {
+        // Printed as it is, the newline would start a line of its own, a forged problem, and
+        // the escape sequence would turn the terminal red.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "20261116000001_demo_user.sql\n\u{1b}[31mseeds: all good",
+            "",
+        );
+        let found = check_seeds(dir.path()).unwrap();
+        assert_eq!(
+            found,
+            [
+                "\"seeds/20261116000001_demo_user.sql\\n\\u{1b}[31mseeds: all good\": name must \
+                 match YYYYMMDDHHMMSS_snake_case.sql"
+            ]
+        );
+        assert!(
+            found.iter().all(|line| !line.contains(['\n', '\u{1b}'])),
+            "{found:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_entry_that_is_not_a_regular_file_is_refused_for_that_alone() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        write(elsewhere.path(), "outside.sql", "");
+        write(dir.path(), "20261115120000_create_users.sql", "");
+        // It is no migration, so it shares no version: the regular file above stands alone.
+        symlink(
+            elsewhere.path().join("outside.sql"),
+            dir.path().join("20261115120000_create_users_again.sql"),
+        )
+        .unwrap();
+        symlink(
+            elsewhere.path(),
+            dir.path().join("20261115120001_linked.sql"),
+        )
+        .unwrap();
+        fs::create_dir(dir.path().join("20261115120002_folder.sql")).unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(dir.path().join("20261115120003_pipe.sql"))
+            .status()
+            .unwrap();
+        assert!(made.success());
+        // Hidden entries stay out of the check, whatever they are.
+        symlink(
+            elsewhere.path(),
+            dir.path().join(".20261115120004_hidden.sql"),
+        )
+        .unwrap();
+        assert_eq!(
+            check_migrations(dir.path()).unwrap(),
+            [
+                "\"migrations/20261115120000_create_users_again.sql\": must be a regular file, \
+                 not a symlink",
+                "\"migrations/20261115120001_linked.sql\": must be a regular file, not a symlink",
+                "\"migrations/20261115120002_folder.sql\": must be a regular file, not a folder",
+                "\"migrations/20261115120003_pipe.sql\": must be a regular file, not a FIFO, a \
+                 socket or a device",
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_migrations_or_seeds_that_is_not_a_folder_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let elsewhere = tempfile::tempdir().unwrap();
+        write(elsewhere.path(), "20261115120000_create_users.sql", "");
+        write(root, "docs/adr/README.md", "[0001](0001-a.md)\n");
+        write(root, "docs/adr/0001-a.md", &adr(1, "A"));
+        std::os::unix::fs::symlink(elsewhere.path(), root.join("migrations")).unwrap();
+        write(root, "seeds", "");
+        assert_eq!(
+            check_structure(root).unwrap(),
+            [
+                "migrations: must be a folder, not a symlink",
+                "seeds: must be a folder, not a file",
+            ]
+        );
+        // Through the link, every entry would pass: the check must not follow it.
+        assert_eq!(
+            check_migrations(elsewhere.path()).unwrap(),
+            Vec::<String>::new()
+        );
+        fs::remove_file(root.join("seeds")).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), root.join("seeds")).unwrap();
+        assert_eq!(
+            check_seeds(&root.join("seeds")).unwrap(),
+            ["seeds: must be a folder, not a symlink"]
         );
     }
 
