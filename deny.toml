@@ -11,6 +11,14 @@ all-features = true
 yanked = "deny"
 unmaintained = "all"
 unsound = "all"
+# Each advisory ignored says why, and since when.
+ignore = [
+    # astral-tokio-tar 0.6, which testcontainers 0.28.0, the latest release, depends on: its
+    # maintainers ended it on 2026-11-03, and no release of testcontainers takes another tar
+    # crate. It builds the archives of the files a test copies into a container, which no test
+    # does, and it is built only into tests, which talk to the containers they start.
+    { id = "RUSTSEC-2026-0440", reason = "unmaintained, under testcontainers in test builds only, with no release that drops it; ignored since 2026-11-16" },
+]
 
 [licenses]
 version = 2
