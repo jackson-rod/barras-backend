@@ -1,7 +1,8 @@
 //! The real `barras-api` binary, started as an operator starts it (spec §8, §9.2): it refuses to
 //! start without its configuration, naming each variable and never a value; it serves the public
-//! API and the internal port on the addresses it is given, logs JSON outside `local`, and stops
-//! with status 0 on SIGTERM; `openapi` prints the document and reads no variable, and
+//! API and the internal port on the addresses it is given, reports its database in readiness
+//! without ever showing a credential (BAR-4 spec §6.3), logs JSON outside `local`, and stops with
+//! status 0 on SIGTERM; `openapi` prints the document and reads no variable, and
 //! `openapi --check` fails on a stale file. Neither a closed standard error nor a worker count
 //! for tokio in the environment turns a run into a panic.
 //!
@@ -9,11 +10,15 @@
 //! process can take it first, and the test reads the ports from the `listening` line. A binary
 //! that was started is always ended within a deadline, by `terminate` or `run_within`, never
 //! dropped: a drop kills it, and a killed binary writes no coverage profile.
+//!
+//! No test reaches the local database that `.env.example` names: a binary that serves gets a
+//! container of its test's own, or a port where nothing listens.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // integration test crate: every item is test code
 
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::path::Path;
+use std::process::Command;
 use std::time::Duration;
 
 use barras_adapter_http::testing::{TestResponse, fetch};
@@ -22,7 +27,8 @@ use barras_testkit::process::{
     BinaryCommand, RunningBinary, address_in, closed_pipe, describe, is_listening, json_lines,
     text, with_example_values,
 };
-use barras_testkit::repository_file;
+use barras_testkit::{PostgresContainer, repository_file};
+use serde_json::Value;
 
 const BINARY: &str = env!("CARGO_BIN_EXE_barras-api");
 
@@ -33,6 +39,17 @@ const PATIENCE: Duration = Duration::from_secs(30);
 /// A free port of the loopback interface, which the system picks when the binary binds it.
 const ANY_PORT: &str = "127.0.0.1:0";
 
+/// The password of every database URL a test gives the binary, which no output may show.
+const PASSWORD: &str = "hunter2-secret";
+
+/// What a probe of a database that cannot be reached answers. The pool gives up on a connection
+/// after two seconds and the probe on an answer after two seconds too, so whichever of the two
+/// the runtime's timer ends first gives the sentence; each is one of a fixed set.
+const NO_ANSWER_IN_TIME: [&str; 2] = [
+    "no connection within 2 seconds",
+    "did not answer within 2 seconds",
+];
+
 /// `GET path` on `addr`, from a test that has no runtime of its own.
 fn get(addr: SocketAddr, path: &str) -> TestResponse {
     tokio::runtime::Builder::new_current_thread()
@@ -42,6 +59,54 @@ fn get(addr: SocketAddr, path: &str) -> TestResponse {
         .block_on(fetch(addr, path))
 }
 
+/// A port of this machine where nothing listens.
+fn closed_port() -> u16 {
+    TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// A database URL at a port where nothing listens: the pools are built without connecting, so
+/// the binary serves with it, and its readiness says the database is down.
+fn unreachable_database() -> String {
+    format!(
+        "postgres://barras:{PASSWORD}@127.0.0.1:{}/barras",
+        closed_port()
+    )
+}
+
+/// The binary with the values of `.env.example`, and both database URLs at `database` instead of
+/// the local database the file names.
+fn with_database(database: &str) -> BinaryCommand {
+    with_example_values(BINARY)
+        .env("API_DATABASE_URL", database)
+        .env("API_DATABASE_READ_URL", database)
+}
+
+/// What `psql`, run inside the container, prints for `sql`, trimmed. A test reads the database
+/// through the container: only the postgres adapter and the testkit may take a driver.
+fn psql(container: &PostgresContainer, sql: &str) -> String {
+    let output = Command::new("docker")
+        .args([
+            "exec",
+            container.id(),
+            "psql",
+            "--username=barras",
+            "--dbname=barras",
+        ])
+        .args(["--tuples-only", "--no-align", "--command", sql])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "psql {sql}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    text(&output.stdout).trim().to_owned()
+}
+
 /// A binary that listens on both its addresses.
 struct Serving {
     binary: RunningBinary,
@@ -49,12 +114,13 @@ struct Serving {
     internal: SocketAddr,
 }
 
-/// Starts the binary with the values of `.env.example`, `variables` over them and any free port
-/// for both addresses, and waits until it logs where it listens.
-fn serve(variables: &[(&str, &str)]) -> Serving {
+/// Starts the binary with the values of `.env.example`, both database URLs at `database` and
+/// `variables` over them, and any free port for both addresses, and waits until it logs where it
+/// listens.
+fn serve(database: &str, variables: &[(&str, &str)]) -> Serving {
     let binary = variables
         .iter()
-        .fold(with_example_values(BINARY), |command, (name, value)| {
+        .fold(with_database(database), |command, (name, value)| {
             command.env(name, value)
         })
         .env("API_BIND_ADDR", ANY_PORT)
@@ -93,7 +159,7 @@ fn an_empty_environment_stops_the_binary_naming_every_variable() {
 
 #[test]
 fn a_log_level_that_is_not_valid_stops_the_binary_before_it_listens() {
-    let output = with_example_values(BINARY)
+    let output = with_database(&unreachable_database())
         .env("LOG_LEVEL", "loud")
         .env("API_BIND_ADDR", ANY_PORT)
         .env("API_INTERNAL_BIND_ADDR", ANY_PORT)
@@ -110,15 +176,24 @@ fn a_log_level_that_is_not_valid_stops_the_binary_before_it_listens() {
     assert_eq!(text(&output.stdout), "");
 }
 
-#[test]
-fn the_values_of_env_example_serve_the_public_api_and_the_internal_port() {
-    let serving = serve(&[]);
+// A runtime of the test's own, which the container must be dropped in, so each request is sent
+// with `fetch` on it.
+#[tokio::test]
+async fn with_the_database_up_the_binary_is_ready_and_its_internal_port_lists_each_pool() {
+    let container = PostgresContainer::start().await;
+    // Another spelling of the same database, so that the read pool is a pool of its own.
+    let read = container.url().replace("postgres://", "postgresql://");
+    let serving = serve(container.url(), &[("API_DATABASE_READ_URL", &read)]);
 
-    let ready = get(serving.public, "/api/v1/health");
-    let live = get(serving.public, "/api/v1/health/live");
-    let metrics_on_public = get(serving.public, "/metrics");
-    let health = get(serving.internal, "/health");
-    let metrics = get(serving.internal, "/metrics");
+    let ready = fetch(serving.public, "/api/v1/health").await;
+    let live = fetch(serving.public, "/api/v1/health/live").await;
+    let metrics_on_public = fetch(serving.public, "/metrics").await;
+    let health = fetch(serving.internal, "/health").await;
+    let metrics = fetch(serving.internal, "/metrics").await;
+    let connections = psql(
+        &container,
+        "SELECT count(*) FROM pg_stat_activity WHERE application_name = 'barras-api'",
+    );
     let output = serving.binary.terminate(PATIENCE);
 
     assert_eq!(ready.status, 200);
@@ -133,6 +208,30 @@ fn the_values_of_env_example_serve_the_public_api_and_the_internal_port() {
     assert_eq!(health.status, 200);
     assert_eq!(health.json()["service"], "barras-api");
     assert_eq!(health.json()["status"], "ok");
+    let dependencies = health.json()["dependencies"].clone();
+    let reported: Vec<(&str, &Value, &str)> = dependencies
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|dependency| {
+            let name = dependency["name"].as_str().unwrap();
+            (
+                name,
+                &dependency["critical"],
+                dependency["status"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    let critical = Value::Bool(true);
+    assert_eq!(
+        reported,
+        [
+            ("postgres", &critical, "up"),
+            ("postgres-read", &critical, "up")
+        ]
+    );
+    // The connection each pool's check opened, named after the binary, and kept for the next.
+    assert_eq!(connections, "2");
     assert_eq!(metrics.status, 200);
     let metrics = text(metrics.bytes());
     let build_info = format!(
@@ -146,8 +245,44 @@ fn the_values_of_env_example_serve_the_public_api_and_the_internal_port() {
 }
 
 #[test]
+fn with_the_database_at_a_closed_port_readiness_is_503_and_no_output_shows_the_password() {
+    let serving = serve(&unreachable_database(), &[("APP_ENV", "staging")]);
+
+    let ready = get(serving.public, "/api/v1/health");
+    // Within the second that the public request's run is given again.
+    let health = get(serving.internal, "/health");
+    let output = serving.binary.terminate(PATIENCE);
+
+    assert_eq!(ready.status, 503);
+    assert_eq!(ready.error_code().as_deref(), Some("SERVICE_UNAVAILABLE"));
+    let public = text(ready.bytes());
+    assert!(!public.contains("postgres"), "{public}");
+    assert_eq!(health.status, 503);
+    let dependencies = health.json()["dependencies"].clone();
+    assert_eq!(dependencies.as_array().unwrap().len(), 1, "{dependencies}");
+    assert_eq!(dependencies[0]["name"], "postgres");
+    assert_eq!(dependencies[0]["status"], "down");
+    let error = dependencies[0]["error"].as_str().unwrap();
+    assert!(NO_ANSWER_IN_TIME.contains(&error), "{error}");
+    // The log names the probe and its sentence, as the public answer never does.
+    let lines = json_lines(&output.stdout);
+    let failed = lines
+        .iter()
+        .find(|line| line["fields"]["message"] == "request failed")
+        .unwrap();
+    let detail = failed["fields"]["detail"].as_str().unwrap();
+    let named = NO_ANSWER_IN_TIME
+        .map(|sentence| format!("critical dependencies are down: postgres ({sentence})"));
+    assert!(named.iter().any(|named| named == detail), "{detail}");
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    for printed in [&output.stdout, &output.stderr] {
+        assert!(!text(printed).contains(PASSWORD), "{}", describe(&output));
+    }
+}
+
+#[test]
 fn sigterm_stops_the_binary_with_status_0() {
-    let serving = serve(&[]);
+    let serving = serve(&unreachable_database(), &[]);
 
     let output = serving.binary.terminate(PATIENCE);
 
@@ -157,12 +292,12 @@ fn sigterm_stops_the_binary_with_status_0() {
 
 #[test]
 fn outside_local_every_line_of_the_log_is_json_from_listening_to_stopped() {
-    let serving = serve(&[("APP_ENV", "staging")]);
+    let serving = serve(&unreachable_database(), &[("APP_ENV", "staging")]);
 
-    let ready = get(serving.public, "/api/v1/health");
+    let live = get(serving.public, "/api/v1/health/live");
     let output = serving.binary.terminate(PATIENCE);
 
-    assert_eq!(ready.status, 200);
+    assert_eq!(live.status, 200);
     assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
     let lines = json_lines(&output.stdout);
     let messages: Vec<&str> = lines
@@ -179,7 +314,7 @@ fn outside_local_every_line_of_the_log_is_json_from_listening_to_stopped() {
 
 #[test]
 fn a_worker_count_for_tokio_in_the_environment_is_never_read() {
-    let serving = serve(&[("TOKIO_WORKER_THREADS", "abc")]);
+    let serving = serve(&unreachable_database(), &[("TOKIO_WORKER_THREADS", "abc")]);
 
     let live = get(serving.public, "/api/v1/health/live");
     let output = serving.binary.terminate(PATIENCE);
@@ -194,7 +329,7 @@ fn an_address_already_taken_stops_the_binary_and_the_log_says_why() {
     let taken = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let public = taken.local_addr().unwrap();
 
-    let output = with_example_values(BINARY)
+    let output = with_database(&unreachable_database())
         .env("APP_ENV", "staging")
         .env("API_BIND_ADDR", public.to_string())
         .env("API_INTERNAL_BIND_ADDR", ANY_PORT)
