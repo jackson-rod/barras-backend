@@ -13,6 +13,10 @@ tracing.workspace = true
 url.workspace = true
 workspace-hack.workspace = true
 
+[features]
+# `AppliedMigration::new`, for the tests of the crates that tell what a migration run applied.
+testing = []
+
 [dev-dependencies]
 barras-testkit.workspace = true
 # The statement logs, written as JSON lines and read back.

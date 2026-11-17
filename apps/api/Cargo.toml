@@ -17,6 +17,8 @@ workspace-hack.workspace = true
 [dev-dependencies]
 # The test client; the feature is on only here, so it never reaches the binary.
 barras-adapter-http = { workspace = true, features = ["testing"] }
+# A migration a run applied, made by hand; the feature is on only here, as above.
+barras-adapter-postgres = { workspace = true, features = ["testing"] }
 barras-testkit.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
 

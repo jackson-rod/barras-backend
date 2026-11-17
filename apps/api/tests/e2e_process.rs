@@ -484,6 +484,9 @@ fn a_command_line_it_does_not_know_prints_the_usage_and_exits_with_status_2() {
         &["migrate", "now"],
         &["seed"],
         &["reset", "seeds", "more-seeds"],
+        &["reset", "--help"],
+        &["reset", "-h"],
+        &["seed", "-h"],
     ] {
         let output = args
             .iter()

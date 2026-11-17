@@ -135,8 +135,11 @@ impl DatabaseUrlValue {
 }
 
 impl FromEnvValue for DatabaseUrlValue {
+    // What the rule refuses besides a missing part too, so that a URL refused for one of those
+    // never seems to meet the line that names it.
     const EXPECTED: &'static str = "a postgres:// URL that names its user, password, host, port \
-                                    and database, and no query string";
+                                    and database, without a query string, an IPv6 address in \
+                                    brackets or several hosts";
 
     fn from_env_value(raw: &str) -> Option<Self> {
         // The trait answers only whether the text is a value, so the adapter's reason goes with
@@ -268,13 +271,15 @@ mod tests {
 
     #[test]
     fn a_database_url_the_adapter_refuses_is_named_with_what_is_expected_and_never_shown() {
-        // The adapter's rule refuses each one for a reason of its own; the line is the same.
+        // The adapter's rule refuses each one for a reason of its own; the line is the same, and
+        // names each shape refused that a URL naming all five parts can still have.
         for refused in [
             database_url("127.0.0.1"),
             format!("postgres://barras@127.0.0.1:5433/barras?password={PASSWORD}"),
             format!("{}?sslmode=disable", database_url("127.0.0.1:5433")),
             database_url("127.0.0.1:5433").replace("postgres://", "mysql://"),
             database_url("[::1]:5433"),
+            database_url("127.0.0.1,10.0.0.1:5433"),
             format!("not a URL {PASSWORD}"),
         ] {
             let error =
@@ -283,7 +288,8 @@ mod tests {
             assert_eq!(
                 error.to_string(),
                 "API_DATABASE_URL is not valid: expected a postgres:// URL that names its user, \
-                 password, host, port and database, and no query string",
+                 password, host, port and database, without a query string, an IPv6 address in \
+                 brackets or several hosts",
                 "{refused}"
             );
             assert!(!format!("{error:?}").contains("hunter2"), "{refused}");

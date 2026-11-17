@@ -41,11 +41,18 @@ impl<'a> Command<'a> {
             ["openapi"] => Self::PrintOpenApi,
             ["openapi", "--check", file] => Self::CheckOpenApi(file),
             ["migrate"] => Self::Migrate,
-            ["seed", folder] => Self::Seed(folder),
-            ["reset", folder] => Self::Reset(folder),
+            ["seed", folder] if !is_option(folder) => Self::Seed(folder),
+            ["reset", folder] if !is_option(folder) => Self::Reset(folder),
             _ => Self::Usage,
         }
     }
+}
+
+/// Whether `word`, where a folder goes, is an option such as `--help` or `-h` instead: read as a
+/// folder, `reset --help` would rebuild the database. A folder whose name starts with `-` is
+/// still reached as `./-name`.
+fn is_option(word: &str) -> bool {
+    word.starts_with('-')
 }
 
 /// Does what `args`, the arguments after the binary's name, ask for, and returns the exit status.
@@ -155,6 +162,15 @@ mod tests {
     }
 
     #[test]
+    fn a_folder_with_a_dash_after_its_first_character_is_still_a_folder() {
+        let seed = args(&["seed", "demo-seeds"]);
+        let reset = args(&["reset", "./-seeds"]);
+
+        assert_eq!(Command::parse(&seed), Command::Seed("demo-seeds"));
+        assert_eq!(Command::parse(&reset), Command::Reset("./-seeds"));
+    }
+
+    #[test]
     fn any_other_command_line_is_answered_with_the_usage() {
         for words in [
             &["serve"][..],
@@ -171,6 +187,12 @@ mod tests {
             &["reset", "seeds", "--force"],
             &["seeds", "seed"],
             &["Migrate"],
+            // An option where the folder goes: taken for a folder, `reset --help` would rebuild
+            // the database.
+            &["reset", "--help"],
+            &["reset", "-h"],
+            &["seed", "-h"],
+            &["seed", "--help"],
         ] {
             assert_eq!(Command::parse(&args(words)), Command::Usage, "{words:?}");
         }

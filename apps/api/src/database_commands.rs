@@ -12,7 +12,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
-use barras_adapter_postgres::{AppliedMigration, AppliedSeed, MigrateError, Reset};
+use barras_adapter_postgres::{AppliedMigration, AppliedSeed, MigrateError, Reset, ResetError};
 use barras_bootstrap::{AppEnv, Environment, build_runtime, report_failure, with_sources};
 
 use crate::config::{LocalDatabaseConfig, MigrateConfig};
@@ -68,8 +68,7 @@ pub(crate) fn reset(seeds: &Path) -> ExitCode {
     run(async move {
         match barras_adapter_postgres::reset(config.database_url.expose().get(), seeds).await {
             Ok(reset) => (reset_lines(&reset), Ok(())),
-            // Its error says what state the database was left in.
-            Err(error) => (Vec::new(), Err(error)),
+            Err(error) => (reset_kept(&error), Err(error)),
         }
     })
 }
@@ -114,6 +113,16 @@ fn applied_before(error: &MigrateError) -> Vec<String> {
         MigrateError::Migration { applied: done, .. } => {
             applied("migration", done.iter().map(AppliedMigration::file))
         }
+        _ => Vec::new(),
+    }
+}
+
+/// What a reset that failed did that stays: the migrations applied before one that failed, as
+/// [`applied_before`] tells them for `migrate`. The error of any other step says alone what state
+/// the database was left in.
+fn reset_kept(error: &ResetError) -> Vec<String> {
+    match error {
+        ResetError::Migrate(error) => applied_before(error),
         _ => Vec::new(),
     }
 }
@@ -173,7 +182,7 @@ fn write_lines(mut out: impl Write, lines: &[String]) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use barras_adapter_postgres::MigrationFailure;
+    use barras_adapter_postgres::{MigrationFailure, SeedError};
 
     use super::*;
 
@@ -226,6 +235,42 @@ mod tests {
 
         for stopped in [failed_first, refused] {
             assert_eq!(applied_before(&stopped), Vec::<String>::new(), "{stopped}");
+        }
+    }
+
+    #[test]
+    fn a_reset_whose_later_migration_failed_tells_each_migration_applied_before_it() {
+        let failed = ResetError::Migrate(MigrateError::Migration {
+            applied: vec![
+                AppliedMigration::new(20261117024143, "create_schema_barras"),
+                AppliedMigration::new(20261201000000, "x"),
+            ],
+            file: "20261202000000_y.sql".to_owned(),
+            failure: MigrationFailure::Server {
+                sqlstate: Some("23505".to_owned()),
+            },
+        });
+
+        assert_eq!(
+            reset_kept(&failed),
+            [
+                "applied migration 20261117024143_create_schema_barras.sql",
+                "applied migration 20261201000000_x.sql",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_reset_that_failed_at_another_step_tells_no_line() {
+        // Its sentence alone says what state the database was left in: as it was, or created and
+        // migrated.
+        for failed in [
+            ResetError::NameTooLong,
+            ResetError::Seed(SeedError::EndedTransaction {
+                file: "20261116000001_demo.sql".to_owned(),
+            }),
+        ] {
+            assert_eq!(reset_kept(&failed), Vec::<String>::new(), "{failed}");
         }
     }
 

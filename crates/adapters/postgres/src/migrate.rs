@@ -204,10 +204,14 @@ pub struct AppliedMigration {
 impl AppliedMigration {
     fn of(migration: &Migration) -> Self {
         // sqlx reads the description from the file's name, each `_` turned into a space.
-        let description = migration.description.replace(' ', "_");
+        Self::named(migration.version, &migration.description.replace(' ', "_"))
+    }
+
+    /// The migration of `version` from the file `<version>_<description>.sql`.
+    fn named(version: i64, description: &str) -> Self {
         Self {
-            version: migration.version,
-            file: format!("{}_{description}.sql", migration.version),
+            version,
+            file: format!("{version}_{description}.sql"),
         }
     }
 
@@ -219,6 +223,16 @@ impl AppliedMigration {
     /// The name of its file in `migrations/`.
     pub fn file(&self) -> &str {
         &self.file
+    }
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl AppliedMigration {
+    /// The migration of `version` from the file `<version>_<description>.sql`, as a run reports
+    /// it: for the tests of a crate that tells what a run applied, which have no run to get one
+    /// from.
+    pub fn new(version: i64, description: &str) -> Self {
+        Self::named(version, description)
     }
 }
 
@@ -391,6 +405,15 @@ mod tests {
 
         assert_eq!(applied.version(), 20261116120000);
         assert_eq!(applied.file(), "20261116120000_probe_20261116120000.sql");
+    }
+
+    #[test]
+    fn a_migration_made_for_a_test_is_the_one_a_run_reports() {
+        let run = AppliedMigration::of(&migration(20261116120000, "SELECT 1"));
+
+        let made = AppliedMigration::new(20261116120000, "probe_20261116120000");
+
+        assert_eq!(made, run);
     }
 
     #[test]

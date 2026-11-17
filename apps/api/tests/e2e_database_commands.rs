@@ -4,7 +4,8 @@
 //! files of a folder in name order; `reset` rebuilds the database with only the migrations and the
 //! seeds. Each reads only its variables and names every one missing or not valid at once; `seed`
 //! and `reset` refuse, before any connection, outside `local` and for a database on another
-//! machine; and no output shows a password.
+//! machine, and take an option where their folder goes for a request for the usage; and no
+//! output shows a password.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // integration test crate: every item is test code
 
 use std::fs;
@@ -33,7 +34,8 @@ const PASSWORD: &str = "hunter2-secret";
 
 /// What a database URL must look like, as the problem line of either variable says it.
 const URL_EXPECTED: &str = "expected a postgres:// URL that names its user, password, host, \
-                            port and database, and no query string";
+                            port and database, without a query string, an IPv6 address in \
+                            brackets or several hosts";
 
 /// Runs `barras-api` with `args` to its end, with `variables` as its whole environment; the last
 /// value given for a name wins.
@@ -277,6 +279,39 @@ async fn reset_rebuilds_the_database_with_only_the_migrations_and_the_seeds() {
         "barras.demo,public._sqlx_migrations"
     );
     assert_eq!(psql(&container, "SELECT count(*) FROM barras.demo"), "2");
+}
+
+#[tokio::test]
+async fn an_option_where_the_folder_goes_prints_the_usage_and_changes_nothing() {
+    let container = PostgresContainer::start().await;
+    psql(&container, "CREATE TABLE public.left_over (id int)");
+    // Everything a reset needs, so that only the command line stops one.
+    let variables = [("APP_ENV", "local"), ("API_DATABASE_URL", container.url())];
+
+    let outputs: Vec<_> = [["reset", "--help"], ["reset", "-h"], ["seed", "-h"]]
+        .into_iter()
+        .map(|args| (args, run(&args, &variables)))
+        .collect();
+
+    // Read as a folder, `--help` would have had the database dropped, the table with it.
+    let tables = "SELECT string_agg(table_schema || '.' || table_name, ',' \
+                  ORDER BY table_schema, table_name) FROM information_schema.tables \
+                  WHERE table_schema NOT IN ('pg_catalog', 'information_schema')";
+    assert_eq!(psql(&container, tables), "public.left_over");
+    for (args, output) in outputs {
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{args:?}: {}",
+            describe(&output)
+        );
+        let stderr = text(&output.stderr);
+        assert!(
+            stderr.starts_with("usage: barras-api"),
+            "{args:?}: {stderr}"
+        );
+        assert_eq!(text(&output.stdout), "", "{args:?}");
+    }
 }
 
 #[test]
