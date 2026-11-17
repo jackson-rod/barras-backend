@@ -3,10 +3,13 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 default:
     @just --list
 
+# sqlx-cli takes its history table's name from sqlx.toml, and only with its sqlx-toml feature:
+# without it, every sqlx-cli command refuses to run beside that file.
+
 setup:
     rustup toolchain install
     cargo install --locked cargo-nextest@0.9.152 cargo-deny@0.20.2 cargo-hakari@0.9.39 cargo-llvm-cov@0.9.1 watchexec-cli@2.8.0
-    cargo install --locked sqlx-cli@0.9.0 --no-default-features --features postgres
+    cargo install --locked sqlx-cli@0.9.0 --no-default-features --features postgres,sqlx-toml
     lefthook install
 
 # Runs barras-api with the variables of .env; restarts it when a Rust source or a Cargo.toml changes
@@ -170,16 +173,24 @@ _sqlx-check:
         exit 1
     fi
 
-# A Postgres from the image of compose.yaml, on a port of 127.0.0.1 that Docker picks, with fsync
-# off since its data never outlives it, and every migration applied: runs the given command with
-# DATABASE_URL set to it, then removes the container, whatever happened. The label
-# barras-throwaway=1 finds one that a killed run left behind.
+# A Postgres from the image of compose.yaml's postgres service, on a port of 127.0.0.1 that Docker
+# picks, with fsync off since its data never outlives it, and every migration applied: runs the
+# given command with DATABASE_URL set to it, then removes the container, whatever happened. The
+# label barras-throwaway=1 finds one that a killed run left behind.
 [positional-arguments]
 _throwaway-db +command:
     #!/usr/bin/env bash
     set -euo pipefail
-    image="$(awk '$1 == "image:" { print $2; count++ } END { exit count != 1 }' compose.yaml | tr -d "\"'")" \
-        || { echo 'compose.yaml must name one image, on one image: line' >&2; exit 1; }
+    # Read by the service, as the testkit reads it, so that another service changes nothing; and
+    # from compose.yaml alone, as the testkit does: --file leaves out a compose.override.yaml and
+    # a COMPOSE_FILE variable.
+    image="$(docker compose --file compose.yaml config --images postgres)"
+    # Pinned as the testkit requires: a digest, and a tag after the name's last slash.
+    named="${image%@sha256:*}"
+    if [[ $named == "$image" || ${named##*/} != *:* ]]; then
+        echo 'the postgres service of compose.yaml must name its image pinned by tag and digest' >&2
+        exit 1
+    fi
     container="$(docker create --label barras-throwaway=1 --publish 127.0.0.1::5432 \
         --env POSTGRES_USER=barras --env POSTGRES_PASSWORD=barras --env POSTGRES_DB=barras \
         "$image" postgres -c fsync=off)"

@@ -3,7 +3,8 @@
 services:
   postgres:
     # The one place that names the image: the testkit's containers and the throwaway database of
-    # `just db-prepare` and `just db-check` read it from this line. Pinned by tag and digest,
+    # `just db-prepare` and `just db-check` read it from this line, by the service's name, so a
+    # service added beside this one changes nothing for them. Pinned by tag and digest,
     # written the same way everywhere, since an image pulled by digest is stored under that whole
     # reference. Debian, not Alpine: its collation comes from glibc, as on a managed Postgres.
     image: postgres:18.7-trixie@sha256:2ea8630df176ad090ec92136dee850397c5af8781e4bcf2e4162593691c61bbc

@@ -1,4 +1,4 @@
-//! A Postgres container per test, from the image that `compose.yaml` names.
+//! A Postgres container per test, from the image of the `postgres` service of `compose.yaml`.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -42,10 +42,10 @@ pub struct PostgresContainer {
 }
 
 impl PostgresContainer {
-    /// Starts a container from the image `compose.yaml` names, with `fsync` off, since its data
-    /// never outlives it, and waits until it accepts connections. Its port is published on
-    /// `127.0.0.1` only, at a port Docker picks. The test fails when Docker is not running: a
-    /// test that skipped itself would hide a failure.
+    /// Starts a container from the image of the `postgres` service of `compose.yaml`, with `fsync`
+    /// off, since its data never outlives it, and waits until it accepts connections. Its port is
+    /// published on `127.0.0.1` only, at a port Docker picks. The test fails when Docker is not
+    /// running: a test that skipped itself would hide a failure.
     pub async fn start() -> Self {
         let compose = fs::read_to_string(repository_file("compose.yaml"))
             .unwrap_or_else(|error| panic!("cannot read compose.yaml: {error}"));
@@ -132,21 +132,41 @@ fn publish_on_loopback_only(config: &mut HostConfig) {
     config.port_bindings = Some(HashMap::from([(PORT.to_string(), Some(vec![binding]))]));
 }
 
-/// The image `compose.yaml` names, as testcontainers takes it: the name, and the tag with its
-/// digest. The file names it on one `image:` line, pinned by tag and digest, as the throwaway
-/// database of the justfile reads it too.
+/// The image of the `postgres` service of `compose.yaml`, as testcontainers takes it: the name,
+/// and the tag with its digest. The service names it on one `image:` line, pinned by tag and
+/// digest; the throwaway database of the justfile reads the same service's image. Read by the
+/// service, so that another service beside it, with an image of its own, changes nothing.
 fn image_reference(compose: &str) -> (String, String) {
-    let references: Vec<&str> = compose
+    // Each line that holds something, with its indentation, which is how YAML nests a key.
+    let lines: Vec<Line<'_>> = compose
         .lines()
         .filter_map(|line| {
-            let value = line.trim_start().strip_prefix("image:")?;
+            let text = line.trim_start();
+            (!text.is_empty() && !text.starts_with('#')).then(|| (line.len() - text.len(), text))
+        })
+        .collect();
+    let service = inside(&lines, "services", 0).and_then(|services| {
+        let level = services.first()?.0;
+        inside(services, "postgres", level)
+    });
+    let Some(service) = service else {
+        panic!("compose.yaml must have a `postgres` service under `services:`");
+    };
+    // The service's own keys, not those nested deeper inside one of them.
+    let level = service.first().map_or(0, |&(indent, _)| indent);
+    let references: Vec<&str> = service
+        .iter()
+        .filter(|&&(indent, _)| indent == level)
+        .filter_map(|&(_, text)| {
+            let value = text.strip_prefix("image:")?;
             let word = value.split_whitespace().next().unwrap_or_default();
             Some(word.trim_matches(['"', '\'']))
         })
         .collect();
     let [reference] = references[..] else {
         panic!(
-            "compose.yaml must name one image, on one `image:` line; it has {}",
+            "the postgres service of compose.yaml must name its image on one `image:` line; it \
+             has {}",
             references.len()
         );
     };
@@ -164,6 +184,28 @@ fn image_reference(compose: &str) -> (String, String) {
             "the image of compose.yaml must be pinned by tag and digest, as in name:tag@sha256:…"
         )
     })
+}
+
+/// A line of a compose file that holds something: its indentation, and its text after it.
+type Line<'a> = (usize, &'a str);
+
+/// The lines of the mapping that `key:`, written at `indent`, opens among `lines`: those after
+/// it that are indented deeper, up to the first that is not.
+fn inside<'l, 'a>(lines: &'l [Line<'a>], key: &str, indent: usize) -> Option<&'l [Line<'a>]> {
+    let opens = |text: &str| {
+        text.strip_prefix(key)
+            .and_then(|rest| rest.strip_prefix(':'))
+            .map(str::trim_start)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('#'))
+    };
+    let start = 1 + lines
+        .iter()
+        .position(|&(at, text)| at == indent && opens(text))?;
+    let length = lines[start..]
+        .iter()
+        .take_while(|&&(at, _)| at > indent)
+        .count();
+    Some(&lines[start..start + length])
 }
 
 /// What a test that cannot start its container fails with. testcontainers reports a Docker
@@ -225,14 +267,78 @@ mod tests {
         );
     }
 
+    /// A Postgres service and a Redis one, as BAR-5 adds it, each with its image, in either
+    /// order, and other keys before, between and after them.
+    fn compose_with_redis(redis_first: bool) -> String {
+        let postgres = format!(
+            "  postgres: # the local database\n    image: postgres:18.7-trixie@{DIGEST}\n    \
+             ports:\n      - \"127.0.0.1:5433:5432\"\n    healthcheck:\n      interval: 1s\n"
+        );
+        let redis = format!(
+            "  redis:\n    image: redis:8.4-trixie@{DIGEST}\n    ports:\n      - \
+             \"127.0.0.1:6380:6379\"\n"
+        );
+        let (first, second) = if redis_first {
+            (redis, postgres)
+        } else {
+            (postgres, redis)
+        };
+        format!(
+            "name: barras\nservices:\n{first}\n  # another service\n{second}volumes:\n  data:\n"
+        )
+    }
+
     #[test]
-    #[should_panic(expected = "compose.yaml must name one image")]
+    fn the_image_is_the_postgres_service_s_beside_another_service() {
+        for redis_first in [true, false] {
+            let compose = compose_with_redis(redis_first);
+
+            assert_eq!(
+                image_reference(&compose),
+                ("postgres".to_owned(), format!("18.7-trixie@{DIGEST}")),
+                "{compose}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_image_line_outside_the_service_s_own_keys_is_not_read() {
+        // Deeper inside the service, and in a top-level key after `services:`.
+        let compose = format!(
+            "services:\n  postgres:\n    labels:\n      image: not-this:1@{DIGEST}\n    image: \
+             postgres:18.7-trixie@{DIGEST}\nx-other:\n  image: nor-this:1@{DIGEST}\n"
+        );
+
+        assert_eq!(
+            image_reference(&compose),
+            ("postgres".to_owned(), format!("18.7-trixie@{DIGEST}"))
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "compose.yaml must have a `postgres` service")]
+    fn a_compose_file_without_a_postgres_service_fails_the_test() {
+        image_reference(&format!(
+            "services:\n  redis:\n    image: redis:8.4-trixie@{DIGEST}\n"
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "compose.yaml must have a `postgres` service")]
+    fn a_postgres_key_outside_services_is_not_the_service() {
+        image_reference(&format!(
+            "x-services:\n  postgres:\n    image: postgres:18.7-trixie@{DIGEST}\n"
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "must name its image on one `image:` line; it has 0")]
     fn a_compose_file_without_an_image_fails_the_test() {
         image_reference(&compose_with("    build: ."));
     }
 
     #[test]
-    #[should_panic(expected = "compose.yaml must name one image")]
+    #[should_panic(expected = "must name its image on one `image:` line; it has 2")]
     fn a_compose_file_with_two_images_fails_the_test() {
         image_reference(&compose_with(&format!(
             "    image: postgres:18.7-trixie@{DIGEST}\n    image: postgres:17@{DIGEST}"

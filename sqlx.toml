@@ -1,0 +1,14 @@
+# What sqlx-cli reads from the folder it runs in, the repository root: `just setup` installs it
+# with its `sqlx-toml` feature, without which it refuses to run next to this file.
+#
+# sqlx names its history table without a schema, and Postgres looks for such a name in the schema
+# named like the user before `public`. Once the first migration has created the schema `barras`,
+# the local database's user, `barras` too, would make `sqlx migrate info` and `sqlx migrate run`
+# read and create `barras._sqlx_migrations`, an empty history in which every migration is pending
+# again. So sqlx-cli names the table with its schema, as `barras-api migrate` does (`HISTORY` in
+# crates/adapters/postgres/src/migrate.rs, whose tests fail when the two names differ).
+#
+# Only sqlx-cli reads this file: the query macros and `sqlx::migrate!` read a `sqlx.toml` in the
+# folder of the crate that uses them, and the postgres adapter has none.
+[migrate]
+table-name = "public._sqlx_migrations"

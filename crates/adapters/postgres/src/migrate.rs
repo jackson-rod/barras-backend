@@ -17,7 +17,8 @@ static MIGRATIONS: Migrator = sqlx::migrate!("../../../migrations");
 /// outright. sqlx names the table alone, and Postgres looks for it in the schema named like the
 /// user before `public`, so once the first migration has created `barras`, a user named
 /// `barras`, as the local database's is, would get a new, empty history there and see every
-/// migration as pending again.
+/// migration as pending again. sqlx-cli takes the same name from the repository's `sqlx.toml`,
+/// and a test fails when the two differ.
 const HISTORY: &str = "public._sqlx_migrations";
 
 /// Applies the pending migrations this binary carries, in order, each in its own transaction
@@ -306,6 +307,39 @@ mod tests {
             "{embedded:?}"
         );
         assert_eq!(embedded, on_disk);
+    }
+
+    /// The `table-name` lines of the `[migrate]` table of a `sqlx.toml`, each value without its
+    /// quotes. The file holds plain `key = "value"` lines, so reading it line by line is enough.
+    fn history_tables_named_in(sqlx_toml: &str) -> Vec<&str> {
+        let mut table = "";
+        let mut names = Vec::new();
+        for line in sqlx_toml.lines().map(str::trim) {
+            if let Some(header) = line.strip_prefix('[') {
+                table = header.split(']').next().unwrap_or_default().trim();
+            } else if let Some((key, value)) = line.split_once('=')
+                && table == "migrate"
+                && key.trim() == "table-name"
+            {
+                let quoted = value
+                    .trim()
+                    .strip_prefix('"')
+                    .and_then(|rest| rest.split_once('"'));
+                names.push(quoted.map_or(value.trim(), |(name, _)| name));
+            }
+        }
+        names
+    }
+
+    #[test]
+    fn sqlx_cli_names_the_history_table_as_the_binary_does() {
+        // sqlx-cli reads the name from the repository's `sqlx.toml`; were the two to differ,
+        // `sqlx migrate info` would read one history and `barras-api migrate` write another.
+        let sqlx_toml = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../sqlx.toml");
+        let sqlx_toml = fs::read_to_string(&sqlx_toml)
+            .unwrap_or_else(|error| panic!("cannot read {}: {error}", sqlx_toml.display()));
+
+        assert_eq!(history_tables_named_in(&sqlx_toml), [HISTORY]);
     }
 
     #[test]
