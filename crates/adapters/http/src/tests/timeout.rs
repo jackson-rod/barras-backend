@@ -1,8 +1,10 @@
 //! The time limit of a request (spec §6.4): an answer that has not started five seconds after
 //! the request arrived, the reading of its body included, is a 503 `REQUEST_TIMEOUT` that is
 //! logged, counted and carries the request id, and its handler is dropped, a handler that panics
-//! as it is dropped included; a body that streams out after the head is not limited. Every test
-//! pauses tokio's clock, so none of them waits.
+//! as it is dropped included. A request whose body is still arriving then is the client's
+//! slowness instead: a 408 `REQUEST_BODY_TIMEOUT` that closes the connection and logs no
+//! failure. A body that streams out after the head is not limited. Every test pauses tokio's
+//! clock, so none of them waits.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -17,9 +19,12 @@ use http_body_util::{BodyExt, Full};
 use serde_json::{Value, json};
 use tokio::time::Instant;
 use tower::ServiceExt;
+use tracing::Level;
 use utoipa_axum::routes;
 
-use super::support::{assert_error, fixture_metrics, fixture_routes, send_logged_json};
+use super::support::{
+    assert_error, fixture_metrics, fixture_routes, logged_json, send_logged_json,
+};
 use crate::middleware::REQUEST_TIME_LIMIT;
 use crate::testing::{TestClient, TestRequest};
 use crate::{
@@ -83,6 +88,19 @@ async fn wait(State(runs): State<Runs>, Path(ms): Path<u64>) -> ApiResult<NoData
     Ok(ApiSuccess::ok("Answered late", NoData))
 }
 
+/// Read the body to its end, then answer once `ms` milliseconds have passed.
+#[utoipa::path(
+    post,
+    path = "/wait/{ms}",
+    tag = "fixtures",
+    params(("ms" = u64, Path, description = "How long to wait once the body is read, in milliseconds")),
+    responses((status = 200, description = "Answered late", body = SuccessEnvelope<NoData>)),
+)]
+async fn wait_after_the_body(Path(ms): Path<u64>, _body: Bytes) -> ApiResult<NoData> {
+    tokio::time::sleep(Duration::from_millis(ms)).await;
+    Ok(ApiSuccess::ok("Answered late", NoData))
+}
+
 /// Panics as it is dropped, as a value whose clean-up fails might.
 struct PanicsWhenDropped;
 
@@ -132,11 +150,20 @@ fn ending_after(first: &'static str, after: Duration) -> Body {
     Body::new(Full::new(Bytes::from_static(first.as_bytes())).with_trailers(end))
 }
 
-/// The fixture app with the three routes of these tests, its waiting runs counted in `runs` and
-/// its answers in `metrics`.
+/// A request to the length route whose body sends five bytes at once and ends six seconds later,
+/// past the limit. `TestRequest` sends a body whole, so this request goes to the router itself.
+fn slow_body(request_id: &str) -> Request<Body> {
+    Request::post("/api/v1/length")
+        .header("x-request-id", request_id)
+        .body(ending_after("12345", Duration::from_secs(6)))
+        .unwrap()
+}
+
+/// The fixture app with the routes of these tests, its waiting runs counted in `runs` and its
+/// answers in `metrics`.
 fn app_with(runs: Runs, metrics: Metrics) -> HttpApp {
     let routes = ApiRouter::new()
-        .route(routes!(wait), Access::public(), &[])
+        .route(routes!(wait, wait_after_the_body), Access::public(), &[])
         .route(routes!(fragile), Access::public(), &[])
         .route(routes!(stream), Access::public(), &[])
         .with_state(runs);
@@ -265,22 +292,62 @@ async fn a_handler_panicking_when_dropped_is_logged_once_as_failed_with_the_pani
 #[tokio::test(start_paused = true)]
 async fn a_body_the_client_sends_slowly_counts_against_the_limit() {
     let app = app_with(Runs::default(), fixture_metrics());
-    // Five bytes at once; the end of the body six seconds later. `TestRequest` sends a body
-    // whole, so this request goes to the router itself.
-    let request = Request::post("/api/v1/length")
-        .header("x-request-id", "slow-body")
-        .body(ending_after("12345", Duration::from_secs(6)))
-        .unwrap();
     let started = Instant::now();
 
-    let Ok(response) = app.router().oneshot(request).await;
+    let Ok(response) = app.router().oneshot(slow_body("slow-body")).await;
 
     assert_eq!(started.elapsed(), REQUEST_TIME_LIMIT);
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
     assert_eq!(response.headers()["x-request-id"], "slow-body");
+    assert_eq!(response.headers()["connection"], "close");
+    assert_eq!(response.headers()["content-type"], "application/json");
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let body: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(body["error"], json!({ "code": "REQUEST_TIMEOUT" }));
+    assert_eq!(body["success"], false);
+    assert_eq!(body["code"], 408);
+    assert_eq!(body["error"], json!({ "code": "REQUEST_BODY_TIMEOUT" }));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_body_still_arriving_at_the_limit_logs_no_failure_and_is_counted_at_408() {
+    let metrics = fixture_metrics();
+    let app = app_with(Runs::default(), metrics.clone());
+    let sent = app.router().oneshot(slow_body("slow-body-log"));
+
+    let (Ok(response), lines) = logged_json(Level::TRACE, sent).await;
+
+    assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    assert_eq!(events(&lines), [("INFO", "request finished")]);
+    assert_eq!(lines[0]["fields"]["status"], 408);
+    assert_eq!(lines[0]["spans"][0]["request_id"], "slow-body-log");
+    let text = metrics.render().unwrap();
+    let counted = r#"http_requests_total{method="POST",path="/api/v1/length",status="408"} 1"#;
+    assert!(text.contains(counted), "{text}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_body_sent_whole_then_a_slow_handler_gets_the_503() {
+    for request in [
+        TestRequest::new("POST", OVER_THE_LIMIT).body("12345"),
+        // A stream tells its end only by giving no more, never by its length.
+        TestRequest::new("POST", OVER_THE_LIMIT)
+            .body("12345")
+            .streamed(),
+    ] {
+        let response = client().send(request).await;
+
+        assert_error(&response, 503, ApiError::REQUEST_TIMEOUT);
+        assert_eq!(response.header("connection"), None);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_request_without_a_body_and_a_slow_handler_gets_the_503() {
+    // The waiting handler never reads the body: one that is empty from the start has arrived.
+    let response = client().get(OVER_THE_LIMIT).await;
+
+    assert_error(&response, 503, ApiError::REQUEST_TIMEOUT);
+    assert_eq!(response.header("connection"), None);
 }
 
 #[tokio::test(start_paused = true)]

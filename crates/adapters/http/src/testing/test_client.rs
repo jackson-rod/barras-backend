@@ -25,12 +25,13 @@ use crate::openapi::{X_COMMON_ERROR_CODES, X_ERROR_CODES, operations};
 /// that a route's own code at one of these statuses, such as an `Unavailable` module error at
 /// 503, and a common code at the status of another, such as the `INTERNAL_ERROR` the safety net
 /// makes of a layer's bare 503, both need the status documented. Sorted.
-const COMMON_ANSWERS: [(&str, u16); 8] = [
+const COMMON_ANSWERS: [(&str, u16); 9] = [
     (ApiError::INTERNAL_ERROR, 500),
     (ApiError::MALFORMED_REQUEST, 400),
     (ApiError::METHOD_NOT_ALLOWED, 405),
     (ApiError::NOT_ACCEPTABLE, 406),
     (ApiError::PAYLOAD_TOO_LARGE, 413),
+    (ApiError::REQUEST_BODY_TIMEOUT, 408),
     (ApiError::REQUEST_TIMEOUT, 503),
     (ApiError::ROUTE_NOT_FOUND, 404),
     (ApiError::UNSUPPORTED_MEDIA_TYPE, 415),
@@ -419,6 +420,7 @@ mod tests {
             ApiError::not_acceptable(),
             ApiError::internal("a handler panicked".to_owned()),
             ApiError::request_timeout("no answer within 5 seconds".to_owned()),
+            ApiError::request_body_timeout(),
         ];
         let mut answers: Vec<(&str, u16)> = common
             .iter()

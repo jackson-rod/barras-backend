@@ -11,6 +11,9 @@ axum = { workspace = true, features = ["http1", "matched-path", "tokio"] }
 barras-kernel.workspace = true
 form_urlencoded = { workspace = true, features = ["alloc"] }
 garde.workspace = true
+# `Frame` and `SizeHint`, which axum does not re-export, for the request body that the timeout
+# layer watches.
+http-body.workspace = true
 # The client of `testing::fetch`.
 hyper-util = { workspace = true, optional = true, features = ["client-legacy", "http1", "tokio"] }
 prometheus.workspace = true

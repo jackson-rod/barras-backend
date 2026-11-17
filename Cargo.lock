@@ -116,6 +116,7 @@ dependencies = [
  "barras-kernel",
  "form_urlencoded",
  "garde",
+ "http-body",
  "http-body-util",
  "hyper-util",
  "prometheus",

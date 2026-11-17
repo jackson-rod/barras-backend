@@ -23,6 +23,7 @@ pub const COMMON_ERROR_CODES: &[&str] = &[
     ApiError::METHOD_NOT_ALLOWED,
     ApiError::NOT_ACCEPTABLE,
     ApiError::PAYLOAD_TOO_LARGE,
+    ApiError::REQUEST_BODY_TIMEOUT,
     ApiError::REQUEST_TIMEOUT,
     ApiError::ROUTE_NOT_FOUND,
     ApiError::UNSUPPORTED_MEDIA_TYPE,
@@ -415,7 +416,7 @@ mod tests {
     }
 
     #[test]
-    fn the_common_codes_are_the_eight_of_the_spec_sorted() {
+    fn the_common_codes_are_the_nine_of_the_spec_sorted() {
         assert_eq!(
             COMMON_ERROR_CODES,
             [
@@ -424,6 +425,7 @@ mod tests {
                 "METHOD_NOT_ALLOWED",
                 "NOT_ACCEPTABLE",
                 "PAYLOAD_TOO_LARGE",
+                "REQUEST_BODY_TIMEOUT",
                 "REQUEST_TIMEOUT",
                 "ROUTE_NOT_FOUND",
                 "UNSUPPORTED_MEDIA_TYPE",
@@ -443,6 +445,7 @@ mod tests {
             ApiError::not_acceptable().code(),
             ApiError::internal("handler panicked".to_owned()).code(),
             ApiError::request_timeout("no answer within 5 seconds".to_owned()).code(),
+            ApiError::request_body_timeout().code(),
         ];
         answered.sort_unstable();
 

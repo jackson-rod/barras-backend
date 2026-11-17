@@ -53,8 +53,11 @@ impl ApiError {
     pub const SERVICE_UNAVAILABLE: &'static str = "SERVICE_UNAVAILABLE";
     /// The code of [`ApiError::internal`].
     pub const INTERNAL_ERROR: &'static str = "INTERNAL_ERROR";
-    /// The code of the answer to a request that has had none within the time limit.
+    /// The code of the answer to a request that has had none within the time limit, and whose
+    /// body, if it had one, had arrived.
     pub const REQUEST_TIMEOUT: &'static str = "REQUEST_TIMEOUT";
+    /// The code of the answer to a request whose body was still arriving at the time limit.
+    pub const REQUEST_BODY_TIMEOUT: &'static str = "REQUEST_BODY_TIMEOUT";
 
     /// 422 `VALIDATION_FAILED`, with every field that failed in `error.fields`.
     pub fn validation(fields: FieldErrors) -> Self {
@@ -145,6 +148,16 @@ impl ApiError {
             StatusCode::SERVICE_UNAVAILABLE,
             Self::REQUEST_TIMEOUT,
             detail,
+        )
+    }
+
+    /// 408 `REQUEST_BODY_TIMEOUT`: the request's body was still arriving at the time limit of a
+    /// request. The client's slowness, not the server's, so it is not logged as a failure.
+    pub(crate) fn request_body_timeout() -> Self {
+        Self::client(
+            StatusCode::REQUEST_TIMEOUT,
+            Self::REQUEST_BODY_TIMEOUT,
+            "Request body took too long to arrive",
         )
     }
 
@@ -613,13 +626,14 @@ mod tests {
 
     #[test]
     fn a_client_error_writes_no_log() {
-        let cases: [MakeError; 3] = [
+        let cases: [MakeError; 4] = [
             || ApiError::from(SaveFailed::with_secret_cause(ErrorKind::Conflict)),
             || {
                 let message = vec!["is required".to_owned()];
                 ApiError::validation(FieldErrors::from([("email".to_owned(), message)]))
             },
             ApiError::route_not_found,
+            ApiError::request_body_timeout,
         ];
         for make in cases {
             let (response, lines) = respond_logged(make);
@@ -696,6 +710,11 @@ mod tests {
                 ApiError::request_timeout("no answer within 5 seconds".to_owned()),
                 503,
                 "REQUEST_TIMEOUT",
+            ),
+            (
+                ApiError::request_body_timeout(),
+                408,
+                "REQUEST_BODY_TIMEOUT",
             ),
         ] {
             assert_eq!(error.status().as_u16(), status, "{code}");
@@ -793,6 +812,7 @@ mod tests {
                 ApiError::SERVICE_UNAVAILABLE,
                 ApiError::INTERNAL_ERROR,
                 ApiError::REQUEST_TIMEOUT,
+                ApiError::REQUEST_BODY_TIMEOUT,
             ],
             [
                 "VALIDATION_FAILED",
@@ -805,6 +825,7 @@ mod tests {
                 "SERVICE_UNAVAILABLE",
                 "INTERNAL_ERROR",
                 "REQUEST_TIMEOUT",
+                "REQUEST_BODY_TIMEOUT",
             ]
         );
     }
