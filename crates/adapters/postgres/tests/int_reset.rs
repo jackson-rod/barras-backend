@@ -5,51 +5,22 @@
 
 use std::fs;
 use std::io;
-use std::net::TcpListener;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use barras_adapter_postgres::{
     AppliedMigration, AppliedSeed, DatabaseUnavailable, DatabaseUrl, MigrateError,
     MigrationFailure, NotLocal, ResetError, SeedError, SeedFailure, migrate, reset,
 };
-use barras_testkit::{LoopbackRelay, PostgresContainer};
+use barras_testkit::{LoopbackRelay, PostgresContainer, SeedFolder, closed_port};
 use sqlx::postgres::PgConnectOptions;
 use sqlx::{Connection, PgConnection};
 
 /// What a test keeps secret; no error may show it.
 const PASSWORD: &str = "hunter2-secret";
 
-/// A folder of seed files that one test writes in the target folder, removed when it ends.
-struct SeedFolder(PathBuf);
-
-impl SeedFolder {
-    fn new(test: &str) -> Self {
-        let path = Path::new(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("int_reset-{test}-{}", std::process::id()));
-        // A run killed before its end leaves its folder behind, and process ids come back.
-        if path.exists() {
-            fs::remove_dir_all(&path).unwrap();
-        }
-        fs::create_dir_all(&path).unwrap();
-        Self(path)
-    }
-
-    fn with(self, name: &str, content: impl AsRef<[u8]>) -> Self {
-        fs::write(self.0.join(name), content).unwrap();
-        self
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for SeedFolder {
-    fn drop(&mut self) {
-        // A folder left behind only takes room in the target folder, and a test that unwinds
-        // must not panic a second time.
-        let _ = fs::remove_dir_all(&self.0);
-    }
+/// A folder of seed files that the test `test` writes in the target folder.
+fn seed_folder(test: &str) -> SeedFolder {
+    SeedFolder::new(env!("CARGO_TARGET_TMPDIR"), &format!("int_reset-{test}"))
 }
 
 fn url_of(container: &PostgresContainer) -> DatabaseUrl {
@@ -97,15 +68,6 @@ fn seeds_of(applied: &[AppliedSeed]) -> Vec<&str> {
     applied.iter().map(AppliedSeed::file).collect()
 }
 
-/// A port of this machine where nothing listens.
-fn closed_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 #[tokio::test]
 async fn reset_rebuilds_a_database_with_an_extra_table_and_another_session_open() {
     let container = PostgresContainer::start().await;
@@ -127,7 +89,7 @@ async fn reset_rebuilds_a_database_with_an_extra_table_and_another_session_open(
         .execute(&mut other)
         .await
         .unwrap();
-    let seeds = SeedFolder::new("rebuild").with(
+    let seeds = seed_folder("rebuild").with(
         "20261116000001_demo.sql",
         "CREATE TABLE barras.demo (id int PRIMARY KEY);\nINSERT INTO barras.demo VALUES (1), (2);",
     );
@@ -161,7 +123,7 @@ async fn a_server_behind_a_loopback_relay_that_is_not_the_local_one_keeps_its_da
         .await
         .unwrap();
     let relay = LoopbackRelay::start(&elsewhere).await;
-    let seeds = SeedFolder::new("relay").with(
+    let seeds = seed_folder("relay").with(
         "20261116000001_demo.sql",
         "CREATE TABLE barras.demo (id int);",
     );
@@ -193,7 +155,7 @@ async fn a_server_that_answers_a_later_connection_of_the_same_port_is_refused_an
         .await
         .unwrap();
     let relay = LoopbackRelay::start_alternating(&local, &elsewhere).await;
-    let folder = SeedFolder::new("alternating");
+    let folder = seed_folder("alternating");
 
     let outcome = reset(
         &DatabaseUrl::parse(relay.url()).unwrap(),
@@ -229,7 +191,7 @@ async fn reset_reaches_the_local_server_through_localhost_at_every_step() {
     // guard judged.
     let container = PostgresContainer::start().await;
     let through_localhost = container.url().replace("@127.0.0.1:", "@localhost:");
-    let seeds = SeedFolder::new("localhost").with(
+    let seeds = seed_folder("localhost").with(
         "20261116000001_demo.sql",
         "CREATE TABLE barras.demo (id int);",
     );
@@ -253,7 +215,7 @@ async fn reset_reaches_the_local_server_through_localhost_at_every_step() {
 async fn reset_creates_a_database_that_does_not_exist_yet() {
     let container = PostgresContainer::start().await;
     let fresh = url_with_database(&container, "fresh");
-    let folder = SeedFolder::new("fresh");
+    let folder = seed_folder("fresh");
 
     let rebuilt = reset(
         &DatabaseUrl::parse(&fresh).unwrap(),
@@ -278,7 +240,7 @@ async fn reset_rebuilds_the_maintenance_database_itself_from_another_one() {
         .execute(&mut connect(&postgres).await)
         .await
         .unwrap();
-    let folder = SeedFolder::new("maintenance");
+    let folder = seed_folder("maintenance");
 
     let rebuilt = reset(
         &DatabaseUrl::parse(&postgres).unwrap(),
@@ -300,7 +262,7 @@ async fn a_seed_file_that_cannot_be_read_leaves_the_database_as_it_was() {
         .await
         .unwrap();
     // `é` in Latin-1, which is not UTF-8.
-    let seeds = SeedFolder::new("unreadable").with("20261116000001_latin1.sql", b"SELECT '\xe9';");
+    let seeds = seed_folder("unreadable").with("20261116000001_latin1.sql", b"SELECT '\xe9';");
 
     let error = reset(&url_of(&container), seeds.path()).await.unwrap_err();
 
@@ -321,7 +283,7 @@ async fn a_failing_seed_leaves_the_database_created_again_and_migrated() {
         .execute(&mut connect(container.url()).await)
         .await
         .unwrap();
-    let seeds = SeedFolder::new("failing").with(
+    let seeds = seed_folder("failing").with(
         "20261116000001_demo.sql",
         "CREATE TABLE barras.demo (id int);\nINSERT INTO barras.nowhere VALUES (1);",
     );
@@ -354,7 +316,7 @@ async fn a_database_the_user_may_not_drop_is_left_as_it_was() {
     let visitor = container
         .url()
         .replace("barras:barras@", "visitor:visitor@");
-    let folder = SeedFolder::new("not-owner");
+    let folder = seed_folder("not-owner");
 
     let error = reset(&DatabaseUrl::parse(&visitor).unwrap(), folder.path())
         .await
@@ -388,7 +350,7 @@ async fn a_database_dropped_that_the_user_may_not_create_again_is_gone() {
         .unwrap();
     let visited =
         url_with_database(&container, "visited").replace("barras:barras@", "visitor:visitor@");
-    let folder = SeedFolder::new("not-creator");
+    let folder = seed_folder("not-creator");
 
     let error = reset(&DatabaseUrl::parse(&visited).unwrap(), folder.path())
         .await
@@ -422,7 +384,7 @@ async fn a_database_that_did_not_exist_and_may_not_be_created_is_not_said_to_be_
         .unwrap();
     let fresh =
         url_with_database(&container, "fresh").replace("barras:barras@", "visitor:visitor@");
-    let folder = SeedFolder::new("not-creator-fresh");
+    let folder = seed_folder("not-creator-fresh");
 
     let error = reset(&DatabaseUrl::parse(&fresh).unwrap(), folder.path())
         .await
@@ -457,7 +419,7 @@ async fn a_failing_migration_is_not_said_to_leave_the_database_empty() {
         .unwrap();
     // No session may be connected to the template of a database being created.
     template.close().await.unwrap();
-    let folder = SeedFolder::new("failing-migration");
+    let folder = seed_folder("failing-migration");
 
     let error = reset(
         &DatabaseUrl::parse(&url_with_database(&container, "fresh")).unwrap(),
@@ -497,7 +459,7 @@ async fn a_failing_migration_is_not_said_to_leave_the_database_empty() {
 #[tokio::test]
 async fn reset_creates_and_drops_databases_whose_names_need_quoting() {
     let container = PostgresContainer::start().await;
-    let folder = SeedFolder::new("quoted");
+    let folder = seed_folder("quoted");
     // 63 bytes, the most Postgres keeps of a name, in 32 characters.
     let longest = format!("{}x", "ñ".repeat(31));
     let longest_encoded = format!("{}x", "%C3%B1".repeat(31));
@@ -547,7 +509,7 @@ async fn a_server_that_does_not_answer_is_named_in_a_fixed_sentence() {
         closed_port()
     ))
     .unwrap();
-    let folder = SeedFolder::new("unreachable");
+    let folder = seed_folder("unreachable");
 
     let error = reset(&url, folder.path()).await.unwrap_err();
 

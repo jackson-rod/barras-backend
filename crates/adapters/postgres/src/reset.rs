@@ -286,13 +286,9 @@ mod tests {
     /// A URL of a database named `database`, at a port of this machine where nothing listens: a
     /// reset that connected would fail for that.
     fn url_naming(database: &str) -> DatabaseUrl {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
         DatabaseUrl::parse(&format!(
-            "postgres://barras:hunter2-secret@127.0.0.1:{port}/{database}"
+            "postgres://barras:hunter2-secret@127.0.0.1:{}/{database}",
+            barras_testkit::closed_port()
         ))
         .unwrap()
     }

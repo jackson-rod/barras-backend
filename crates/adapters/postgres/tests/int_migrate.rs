@@ -4,14 +4,13 @@
 
 use std::borrow::Cow;
 use std::fs;
-use std::net::TcpListener;
 use std::path::Path;
 use std::time::Duration;
 
 use barras_adapter_postgres::{
     DatabaseUnavailable, DatabaseUrl, MigrateError, MigrationFailure, migrate, migrate_with,
 };
-use barras_testkit::PostgresContainer;
+use barras_testkit::{PostgresContainer, closed_port};
 use sqlx::migrate::{Migration, MigrationType, Migrator};
 use sqlx::{Connection, PgConnection, SqlSafeStr};
 
@@ -57,15 +56,6 @@ async fn history(container: &PostgresContainer) -> Vec<i64> {
         .fetch_all(&mut connect(container).await)
         .await
         .unwrap()
-}
-
-/// A port of this machine where nothing listens.
-fn closed_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 #[tokio::test]

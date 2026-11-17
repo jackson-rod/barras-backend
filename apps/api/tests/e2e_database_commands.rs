@@ -11,13 +11,13 @@
 use std::fs;
 use std::io;
 use std::net::{Ipv4Addr, TcpListener};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Output;
 use std::time::{Duration, Instant};
 
 use barras_api::{ApiConfig, LocalDatabaseConfig, MigrateConfig};
 use barras_testkit::process::{BinaryCommand, describe, text};
-use barras_testkit::{PostgresContainer, repository_file};
+use barras_testkit::{PostgresContainer, SeedFolder, repository_file};
 
 const BINARY: &str = env!("CARGO_BIN_EXE_barras-api");
 
@@ -79,45 +79,23 @@ fn every_migration_applied() -> Vec<String> {
         .collect()
 }
 
-/// A folder of seed files that one test writes in the target folder, removed when it ends.
-struct SeedFolder(PathBuf);
-
-impl SeedFolder {
-    fn new(test: &str) -> Self {
-        let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
-            "e2e_database_commands-{test}-{}",
-            std::process::id()
-        ));
-        // A run killed before its end leaves its folder behind, and process ids come back.
-        if path.exists() {
-            fs::remove_dir_all(&path).unwrap();
-        }
-        fs::create_dir_all(&path).unwrap();
-        Self(path)
-    }
-
-    fn with(self, name: &str, content: &str) -> Self {
-        fs::write(self.0.join(name), content).unwrap();
-        self
-    }
-
-    fn path(&self) -> &str {
-        self.0.to_str().unwrap()
-    }
+/// A folder of seed files that the test `test` writes in the target folder.
+fn seed_folder(test: &str) -> SeedFolder {
+    SeedFolder::new(
+        env!("CARGO_TARGET_TMPDIR"),
+        &format!("e2e_database_commands-{test}"),
+    )
 }
 
-impl Drop for SeedFolder {
-    fn drop(&mut self) {
-        // A folder left behind only takes room in the target folder, and a test that unwinds
-        // must not panic a second time.
-        let _ = fs::remove_dir_all(&self.0);
-    }
+/// `path` as an argument of the command line; the target folder's path is UTF-8.
+fn arg(path: &Path) -> &str {
+    path.to_str().unwrap()
 }
 
 /// A folder holding one seed file. With none to apply, `seed` connects to nothing even where it
 /// may run, so a refusal of it would prove nothing about connecting.
 fn one_seed(test: &str) -> SeedFolder {
-    SeedFolder::new(test).with(
+    seed_folder(test).with(
         "20261116000001_demo.sql",
         "CREATE TABLE barras.demo (id int);",
     )
@@ -172,7 +150,7 @@ async fn seed_loads_the_sql_files_of_the_folder_in_name_order() {
     let container = PostgresContainer::start().await;
     let migrated = run(&["migrate"], &[("API_DATABASE_URL", container.url())]);
     assert_eq!(migrated.status.code(), Some(0), "{}", describe(&migrated));
-    let seeds = SeedFolder::new("seed")
+    let seeds = seed_folder("seed")
         .with(
             "20261116000002_rows.sql",
             "INSERT INTO barras.demo (id, name) VALUES (1, 'first'), (2, 'second');",
@@ -182,14 +160,14 @@ async fn seed_loads_the_sql_files_of_the_folder_in_name_order() {
             "CREATE TABLE barras.demo (id int PRIMARY KEY, name text NOT NULL);",
         )
         .with("README.md", "Not a seed: only the .sql files are.");
-    let missing = SeedFolder::new("seed-missing");
-    let missing = format!("{}/no-such-folder", missing.path());
+    let missing = seed_folder("seed-missing");
+    let missing = missing.path().join("no-such-folder");
     let mut variables = not_valid_but(&[("APP_ENV", "local")]);
     variables.push(("API_DATABASE_URL", container.url()));
 
-    let none = run(&["seed", &missing], &variables);
-    let seeded = run(&["seed", seeds.path()], &variables);
-    let again = run(&["seed", seeds.path()], &variables);
+    let none = run(&["seed", arg(&missing)], &variables);
+    let seeded = run(&["seed", arg(seeds.path())], &variables);
+    let again = run(&["seed", arg(seeds.path())], &variables);
 
     assert_eq!(none.status.code(), Some(0), "{}", describe(&none));
     assert_eq!(text(&none.stdout), "no seed to apply\n");
@@ -220,7 +198,7 @@ async fn reset_rebuilds_the_database_with_only_the_migrations_and_the_seeds() {
     let migrated = run(&["migrate"], &[("API_DATABASE_URL", container.url())]);
     assert_eq!(migrated.status.code(), Some(0), "{}", describe(&migrated));
     container.psql("CREATE TABLE public.left_over (id int)");
-    let seeds = SeedFolder::new("reset").with(
+    let seeds = seed_folder("reset").with(
         "20261116000001_demo.sql",
         "CREATE TABLE barras.demo (id int PRIMARY KEY);\nINSERT INTO barras.demo VALUES (1), (2);",
     );
@@ -230,9 +208,9 @@ async fn reset_rebuilds_the_database_with_only_the_migrations_and_the_seeds() {
     let (server, _) = container.url().rsplit_once('/').unwrap();
     let fresh = format!("{server}/fresh");
 
-    let output = run(&["reset", seeds.path()], &variables);
+    let output = run(&["reset", arg(seeds.path())], &variables);
     let created = run(
-        &["reset", seeds.path()],
+        &["reset", arg(seeds.path())],
         &[("APP_ENV", "local"), ("API_DATABASE_URL", &fresh)],
     );
 
@@ -371,7 +349,7 @@ fn seed_and_reset_refuse_outside_local_before_any_connection() {
         for app_env in ["staging", "production"] {
             let started = Instant::now();
             let output = run(
-                &[command, seeds.path()],
+                &[command, arg(seeds.path())],
                 &[("APP_ENV", app_env), ("API_DATABASE_URL", &url)],
             );
 
@@ -398,7 +376,7 @@ fn seed_and_reset_refuse_a_database_on_another_machine_before_any_connection() {
     for (command, refused) in [("seed", "seeding refused"), ("reset", "reset refused")] {
         let started = Instant::now();
         let output = run(
-            &[command, seeds.path()],
+            &[command, arg(seeds.path())],
             &[("APP_ENV", "local"), ("API_DATABASE_URL", &url)],
         );
 

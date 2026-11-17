@@ -27,7 +27,7 @@ use barras_testkit::process::{
     BinaryCommand, RunningBinary, address_in, closed_pipe, describe, is_listening, json_lines,
     text, with_example_values,
 };
-use barras_testkit::{PostgresContainer, repository_file};
+use barras_testkit::{PostgresContainer, closed_port, repository_file};
 use serde_json::Value;
 
 const BINARY: &str = env!("CARGO_BIN_EXE_barras-api");
@@ -62,15 +62,6 @@ fn get(addr: SocketAddr, path: &str) -> TestResponse {
         .build()
         .unwrap()
         .block_on(fetch(addr, path))
-}
-
-/// A port of this machine where nothing listens.
-fn closed_port() -> u16 {
-    TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 /// A database URL at a port where nothing listens: the pools are built without connecting, so

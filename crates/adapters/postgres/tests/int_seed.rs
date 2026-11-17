@@ -6,51 +6,21 @@
 
 use std::fs;
 use std::io;
-use std::net::TcpListener;
-use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use barras_adapter_postgres::{
     AppliedSeed, DatabaseUnavailable, DatabaseUrl, ErrorPosition, NotLocal, SeedError, SeedFailure,
     seed,
 };
-use barras_testkit::{LoopbackRelay, PostgresContainer};
+use barras_testkit::{LoopbackRelay, PostgresContainer, SeedFolder, closed_port};
 use sqlx::{Connection, PgConnection};
 
 /// What a test keeps secret; no error may show it.
 const PASSWORD: &str = "hunter2-secret";
 
-/// A folder of seed files that one test writes in the target folder, removed when it ends.
-struct SeedFolder(PathBuf);
-
-impl SeedFolder {
-    fn new(test: &str) -> Self {
-        let path = Path::new(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("int_seed-{test}-{}", std::process::id()));
-        // A run killed before its end leaves its folder behind, and process ids come back.
-        if path.exists() {
-            fs::remove_dir_all(&path).unwrap();
-        }
-        fs::create_dir_all(&path).unwrap();
-        Self(path)
-    }
-
-    fn with(self, name: &str, content: impl AsRef<[u8]>) -> Self {
-        fs::write(self.0.join(name), content).unwrap();
-        self
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for SeedFolder {
-    fn drop(&mut self) {
-        // A folder left behind only takes room in the target folder, and a test that unwinds
-        // must not panic a second time.
-        let _ = fs::remove_dir_all(&self.0);
-    }
+/// A folder of seed files that the test `test` writes in the target folder.
+fn seed_folder(test: &str) -> SeedFolder {
+    SeedFolder::new(env!("CARGO_TARGET_TMPDIR"), &format!("int_seed-{test}"))
 }
 
 fn url_of(container: &PostgresContainer) -> DatabaseUrl {
@@ -87,20 +57,11 @@ fn files(applied: &[AppliedSeed]) -> Vec<&str> {
     applied.iter().map(AppliedSeed::file).collect()
 }
 
-/// A port of this machine where nothing listens.
-fn closed_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 #[tokio::test]
 async fn every_sql_file_of_the_folder_applies_in_name_order_and_other_files_are_ignored() {
     let container = PostgresContainer::start().await;
     // Written out of order, as a folder lists its files in no order of its own.
-    let folder = SeedFolder::new("order")
+    let folder = seed_folder("order")
         .with(
             "20261116000003_third.sql",
             "INSERT INTO public.ran (file) VALUES ('third');",
@@ -147,7 +108,7 @@ async fn every_sql_file_of_the_folder_applies_in_name_order_and_other_files_are_
 #[tokio::test]
 async fn a_failing_file_leaves_nothing_of_the_files_before_it_and_is_named_with_its_line() {
     let container = PostgresContainer::start().await;
-    let folder = SeedFolder::new("failing")
+    let folder = seed_folder("failing")
         .with(
             "20261116000001_first.sql",
             "CREATE TABLE public.first (id int PRIMARY KEY);\nINSERT INTO public.first VALUES (1);",
@@ -199,7 +160,7 @@ async fn a_second_run_on_a_seeded_database_fails_and_changes_nothing() {
     )
     .await;
     // The first file succeeds on every run; the second conflicts with what the first run left.
-    let folder = SeedFolder::new("twice")
+    let folder = seed_folder("twice")
         .with(
             "20261116000001_visit.sql",
             "INSERT INTO public.visits DEFAULT VALUES;",
@@ -235,7 +196,7 @@ async fn a_server_that_is_not_the_local_one_is_refused_behind_a_loopback_relay_o
 {
     let elsewhere = PostgresContainer::start_as_another_server().await;
     let relay = LoopbackRelay::start(&elsewhere).await;
-    let folder = SeedFolder::new("elsewhere").with(
+    let folder = seed_folder("elsewhere").with(
         "20261116000001_demo.sql",
         "CREATE TABLE public.demo (id int);",
     );
@@ -253,7 +214,7 @@ async fn a_relay_to_the_local_server_is_allowed() {
     // The guard judges the server that answers, not the way to it.
     let container = PostgresContainer::start().await;
     let relay = LoopbackRelay::start(&container).await;
-    let folder = SeedFolder::new("relayed").with(
+    let folder = seed_folder("relayed").with(
         "20261116000001_demo.sql",
         "CREATE TABLE public.demo (id int);",
     );
@@ -272,7 +233,7 @@ async fn through_localhost_the_seeds_reach_the_server_at_an_address_it_resolves_
     // run tries the addresses the guard judged in turn, as a connection to the name would.
     let container = PostgresContainer::start().await;
     let through_localhost = container.url().replace("@127.0.0.1:", "@localhost:");
-    let folder = SeedFolder::new("localhost").with(
+    let folder = seed_folder("localhost").with(
         "20261116000001_demo.sql",
         "CREATE TABLE public.demo (id int);",
     );
@@ -296,7 +257,7 @@ async fn a_missing_folder_or_one_without_seed_files_applies_nothing_and_connects
         closed_port()
     ))
     .unwrap();
-    let without_seeds = SeedFolder::new("empty").with("README.md", "The seeds come with BAR-15.");
+    let without_seeds = seed_folder("empty").with("README.md", "The seeds come with BAR-15.");
     let missing = without_seeds.path().join("missing");
 
     assert_eq!(seed(&url, &missing).await, Ok(Vec::new()));
@@ -306,7 +267,7 @@ async fn a_missing_folder_or_one_without_seed_files_applies_nothing_and_connects
 #[tokio::test]
 async fn a_file_that_commits_is_named_and_the_run_says_to_reset() {
     let container = PostgresContainer::start().await;
-    let folder = SeedFolder::new("commit")
+    let folder = seed_folder("commit")
         .with(
             "20261116000001_first.sql",
             "CREATE TABLE public.first (id int);",
@@ -337,7 +298,7 @@ async fn a_file_that_commits_is_named_and_the_run_says_to_reset() {
 #[tokio::test]
 async fn a_file_that_commits_and_then_fails_is_named_for_ending_the_transaction() {
     let container = PostgresContainer::start().await;
-    let folder = SeedFolder::new("commit-then-fail")
+    let folder = seed_folder("commit-then-fail")
         .with(
             "20261116000001_first.sql",
             "CREATE TABLE public.first (id int);",
@@ -367,7 +328,7 @@ async fn a_file_that_ends_the_transaction_in_any_other_way_is_named_too() {
         // A transaction open again is not the run's.
         (2, "COMMIT;\nBEGIN;"),
     ] {
-        let folder = SeedFolder::new(&format!("ending-{number}"))
+        let folder = seed_folder(&format!("ending-{number}"))
             .with("20261116000001_ends.sql", format!("SELECT 1;\n{ending}"));
 
         let error = seed(&url_of(&container), folder.path()).await.unwrap_err();
@@ -388,7 +349,7 @@ async fn a_file_that_ends_the_transaction_in_any_other_way_is_named_too() {
 /// applied, since the row it committed stays.
 async fn assert_named_for_ending_the_transaction(test: &str, second: &str) {
     let container = PostgresContainer::start().await;
-    let folder = SeedFolder::new(test)
+    let folder = seed_folder(test)
         .with(
             "20261116000001_first.sql",
             "CREATE TABLE public.first (id int);",
@@ -475,7 +436,7 @@ async fn a_file_that_fails_under_a_savepoint_named_as_the_run_s_in_its_own_trans
 #[tokio::test]
 async fn a_file_may_roll_back_to_savepoints_of_its_own() {
     let container = PostgresContainer::start().await;
-    let folder = SeedFolder::new("own-savepoints")
+    let folder = seed_folder("own-savepoints")
         .with(
             "20261116000001_first.sql",
             "CREATE TABLE public.first (id int);\nSAVEPOINT mine;\n\
@@ -506,7 +467,7 @@ async fn a_file_that_leaves_the_connection_waiting_for_copy_data_fails_at_once()
     // run asked after it.
     let container = PostgresContainer::start().await;
     let file = "CREATE TABLE public.copied (id int);\nCOPY public.copied FROM stdin;";
-    let folder = SeedFolder::new("copy").with("20261116000001_copy.sql", file);
+    let folder = seed_folder("copy").with("20261116000001_copy.sql", file);
 
     let error = tokio::time::timeout(
         Duration::from_secs(5),
@@ -543,7 +504,7 @@ async fn a_file_that_leaves_the_connection_waiting_for_copy_data_fails_at_once()
 #[tokio::test]
 async fn a_file_that_ends_its_own_session_after_a_commit_is_never_said_to_have_applied_nothing() {
     let container = PostgresContainer::start().await;
-    let folder = SeedFolder::new("terminate")
+    let folder = seed_folder("terminate")
         .with(
             "20261116000001_first.sql",
             "CREATE TABLE public.first (id int);",
@@ -588,7 +549,7 @@ async fn count_sessions_running(container: &PostgresContainer, sql: &str) -> i64
 async fn a_position_after_characters_of_several_bytes_counts_characters() {
     let container = PostgresContainer::start().await;
     // `🦀` takes four bytes and `ñ` two; the server counts each as one character.
-    let folder = SeedFolder::new("multibyte").with(
+    let folder = seed_folder("multibyte").with(
         "20261116000001_crabs.sql",
         "SELECT '🦀🦀ñ' AS text; SELEC 1;",
     );
@@ -617,7 +578,7 @@ async fn a_position_after_characters_of_several_bytes_counts_characters() {
 #[tokio::test]
 async fn a_constraint_checked_at_commit_fails_the_run_and_leaves_nothing() {
     let container = PostgresContainer::start().await;
-    let folder = SeedFolder::new("deferred").with(
+    let folder = seed_folder("deferred").with(
         "20261116000001_orphan.sql",
         "CREATE TABLE public.parent (id int PRIMARY KEY);
          CREATE TABLE public.child (
@@ -647,7 +608,7 @@ async fn a_file_that_cannot_be_read_stops_the_run_before_it_connects() {
         closed_port()
     ))
     .unwrap();
-    let folder = SeedFolder::new("latin1")
+    let folder = seed_folder("latin1")
         .with("20261116000001_first.sql", "SELECT 1;")
         // `é` in Latin-1, which is not UTF-8.
         .with("20261116000002_latin1.sql", b"SELECT '\xe9';");
@@ -670,7 +631,7 @@ async fn a_database_that_does_not_answer_is_named_in_a_fixed_sentence() {
         closed_port()
     ))
     .unwrap();
-    let folder = SeedFolder::new("unreachable").with("20261116000001_first.sql", "SELECT 1;");
+    let folder = seed_folder("unreachable").with("20261116000001_first.sql", "SELECT 1;");
 
     let error = seed(&url, folder.path()).await.unwrap_err();
 
@@ -692,7 +653,7 @@ async fn a_refused_password_is_named_by_its_sqlstate_alone() {
     let wrong = container
         .url()
         .replace("barras:barras@", &format!("barras:{PASSWORD}@"));
-    let folder = SeedFolder::new("password").with("20261116000001_first.sql", "SELECT 1;");
+    let folder = seed_folder("password").with("20261116000001_first.sql", "SELECT 1;");
 
     let error = seed(&DatabaseUrl::parse(&wrong).unwrap(), folder.path())
         .await

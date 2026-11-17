@@ -7,12 +7,12 @@
 use std::fs;
 
 use barras_adapter_http::metadata_problems;
-use barras_adapter_postgres::Pools;
+use barras_adapter_postgres::{DatabaseUrl, Pools};
 use barras_api::{
     ApiConfig, Dependencies, LocalDatabaseConfig, MigrateConfig, build_app, openapi_json,
 };
 use barras_bootstrap::{AppEnv, Environment, LogLevel};
-use barras_testkit::{env_file, repository_file};
+use barras_testkit::{closed_port, env_file, repository_file};
 
 #[test]
 fn every_operation_of_the_document_has_the_metadata_of_the_contract() {
@@ -33,12 +33,26 @@ fn the_committed_openapi_json_is_the_document_the_code_generates() {
     );
 }
 
+/// The URL `url` names, at `port` of the same host instead of its own.
+fn at_port(url: &str, port: u16) -> DatabaseUrl {
+    let (server, database) = url.rsplit_once('/').unwrap();
+    let (host, _) = server.rsplit_once(':').unwrap();
+    DatabaseUrl::parse(&format!("{host}:{port}/{database}")).unwrap()
+}
+
 // A runtime, since each pool starts a task on it; neither opens a connection.
 #[tokio::test]
 async fn the_configuration_loads_from_the_values_of_env_example() {
     let variables = env_file(repository_file(".env.example"));
+    let value = |name: &str| {
+        let (_, value) = variables
+            .iter()
+            .find(|(written, _)| written == name)
+            .unwrap();
+        value.clone()
+    };
 
-    let config = ApiConfig::from_env(Environment::from_pairs(variables)).unwrap();
+    let config = ApiConfig::from_env(Environment::from_pairs(variables.clone())).unwrap();
 
     assert_eq!(config.env, AppEnv::Local);
     assert_eq!(config.log_level, LogLevel::Info);
@@ -46,10 +60,13 @@ async fn the_configuration_loads_from_the_values_of_env_example() {
     assert_eq!(config.internal_bind_addr, "127.0.0.1:9080".parse().unwrap());
     assert_eq!(config.database_pool_size.get(), 10);
     // A developer machine has no replica: the read URL is the primary's, so one pool serves both.
+    // The pools are built at a port where nothing listens, rather than at the local database
+    // that the file names, though they open no connection until one is needed.
+    let closed = closed_port();
     let pools = Pools::new(
         "barras-api",
-        config.database_url.expose().get(),
-        config.database_read_url.expose().get(),
+        &at_port(&value("API_DATABASE_URL"), closed),
+        &at_port(&value("API_DATABASE_READ_URL"), closed),
         config.database_pool_size,
     );
     assert!(pools.read_is_primary());

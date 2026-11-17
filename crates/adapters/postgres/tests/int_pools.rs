@@ -4,13 +4,12 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // an integration test: a step that fails must fail the test
 
 use std::io::{self, Write};
-use std::net::TcpListener;
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use barras_adapter_postgres::{DatabaseUnavailable, DatabaseUrl, Pools};
-use barras_testkit::PostgresContainer;
+use barras_testkit::{PostgresContainer, closed_port};
 use serde_json::Value;
 use sqlx::{Connection, PgConnection};
 
@@ -40,15 +39,6 @@ async fn named_connections(container: &PostgresContainer) -> i64 {
         .fetch_one(&mut PgConnection::connect(container.url()).await.unwrap())
         .await
         .unwrap()
-}
-
-/// A port of this machine where nothing listens.
-fn closed_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 #[tokio::test]
@@ -110,6 +100,18 @@ async fn each_connection_names_itself_and_carries_the_statement_timeout() {
 async fn a_statement_longer_than_five_seconds_is_cancelled_by_postgres() {
     let container = PostgresContainer::start().await;
     let pools = pools_of(&container);
+    // A connection opened, and back in the pool, before the clock starts, so that the statement
+    // takes it and the time measured is the statement's alone. sqlx gives a connection back to
+    // its pool in a task of its own.
+    pools.check_primary().await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while pools.primary().num_idle() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the checked connection never went back to the pool"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     let started = Instant::now();
 
     let error = sqlx::query("SELECT pg_sleep(6)")
