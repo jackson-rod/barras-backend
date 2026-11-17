@@ -9,9 +9,10 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 
 use barras_adapter_postgres::{
-    AppliedSeed, DatabaseUnavailable, DatabaseUrl, ErrorPosition, SeedError, SeedFailure, seed,
+    AppliedSeed, DatabaseUnavailable, DatabaseUrl, ErrorPosition, NotLocal, SeedError, SeedFailure,
+    seed,
 };
-use barras_testkit::PostgresContainer;
+use barras_testkit::{LoopbackRelay, PostgresContainer};
 use sqlx::{Connection, PgConnection};
 
 /// What a test keeps secret; no error may show it.
@@ -225,6 +226,64 @@ async fn a_second_run_on_a_seeded_database_fails_and_changes_nothing() {
         count(&container, "SELECT count(*) FROM public.demo").await,
         1
     );
+}
+
+#[tokio::test]
+async fn a_server_that_is_not_the_local_one_is_refused_behind_a_loopback_relay_or_on_its_own_port()
+{
+    let elsewhere = PostgresContainer::start_as_another_server().await;
+    let relay = LoopbackRelay::start(&elsewhere).await;
+    let folder = SeedFolder::new("elsewhere").with(
+        "20261116000001_demo.sql",
+        "CREATE TABLE public.demo (id int);",
+    );
+
+    for url in [relay.url(), elsewhere.url()] {
+        let refused = seed(&DatabaseUrl::parse(url).unwrap(), folder.path()).await;
+
+        assert_eq!(refused, Err(SeedError::NotLocal(NotLocal::OtherServer)));
+    }
+    assert!(!table_exists(&elsewhere, "demo").await);
+}
+
+#[tokio::test]
+async fn a_relay_to_the_local_server_is_allowed() {
+    // The guard judges the server that answers, not the way to it.
+    let container = PostgresContainer::start().await;
+    let relay = LoopbackRelay::start(&container).await;
+    let folder = SeedFolder::new("relayed").with(
+        "20261116000001_demo.sql",
+        "CREATE TABLE public.demo (id int);",
+    );
+
+    let applied = seed(&DatabaseUrl::parse(relay.url()).unwrap(), folder.path())
+        .await
+        .unwrap();
+
+    assert_eq!(files(&applied), ["20261116000001_demo.sql"]);
+    assert!(table_exists(&container, "demo").await);
+}
+
+#[tokio::test]
+async fn through_localhost_the_seeds_reach_the_server_at_an_address_it_resolves_to() {
+    // The container listens on 127.0.0.1 alone, and `localhost` may resolve to `::1` first: the
+    // run tries the addresses the guard judged in turn, as a connection to the name would.
+    let container = PostgresContainer::start().await;
+    let through_localhost = container.url().replace("@127.0.0.1:", "@localhost:");
+    let folder = SeedFolder::new("localhost").with(
+        "20261116000001_demo.sql",
+        "CREATE TABLE public.demo (id int);",
+    );
+
+    let applied = seed(
+        &DatabaseUrl::parse(&through_localhost).unwrap(),
+        folder.path(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(files(&applied), ["20261116000001_demo.sql"]);
+    assert!(table_exists(&container, "demo").await);
 }
 
 #[tokio::test]

@@ -9,10 +9,10 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 
 use barras_adapter_postgres::{
-    AppliedMigration, AppliedSeed, DatabaseUnavailable, DatabaseUrl, ResetError, SeedError,
-    SeedFailure, migrate, reset,
+    AppliedMigration, AppliedSeed, DatabaseUnavailable, DatabaseUrl, NotLocal, ResetError,
+    SeedError, SeedFailure, migrate, reset,
 };
-use barras_testkit::PostgresContainer;
+use barras_testkit::{LoopbackRelay, PostgresContainer};
 use sqlx::postgres::PgConnectOptions;
 use sqlx::{Connection, PgConnection};
 
@@ -149,6 +149,59 @@ async fn reset_rebuilds_a_database_with_an_extra_table_and_another_session_open(
     assert_eq!(ids, [1, 2]);
     // Ended, not waited for.
     assert!(sqlx::raw_sql("SELECT 1").execute(&mut other).await.is_err());
+}
+
+#[tokio::test]
+async fn a_server_behind_a_loopback_relay_that_is_not_the_local_one_keeps_its_database() {
+    // What a developer reaches staging through, with `ssh -L` or `kubectl port-forward`: a port
+    // of this machine, which the guard allows, before a server that is not the local one.
+    let elsewhere = PostgresContainer::start_as_another_server().await;
+    sqlx::raw_sql("CREATE TABLE public.precious (id int); INSERT INTO public.precious VALUES (1);")
+        .execute(&mut connect(elsewhere.url()).await)
+        .await
+        .unwrap();
+    let relay = LoopbackRelay::start(&elsewhere).await;
+    let seeds = SeedFolder::new("relay").with(
+        "20261116000001_demo.sql",
+        "CREATE TABLE barras.demo (id int);",
+    );
+
+    let error = reset(&DatabaseUrl::parse(relay.url()).unwrap(), seeds.path())
+        .await
+        .unwrap_err();
+
+    assert_eq!(error, ResetError::NotLocal(NotLocal::OtherServer));
+    let sentence = error.to_string();
+    assert!(sentence.contains("cluster_name"), "{sentence}");
+    assert!(!sentence.contains(relay.url()), "{sentence}");
+    assert_eq!(tables(elsewhere.url()).await, ["public.precious"]);
+}
+
+#[tokio::test]
+async fn reset_reaches_the_local_server_through_localhost_at_every_step() {
+    // The container listens on 127.0.0.1 alone, and `localhost` may resolve to `::1` first: the
+    // maintenance database, the migrations and the seeds are each reached at an address the
+    // guard judged.
+    let container = PostgresContainer::start().await;
+    let through_localhost = container.url().replace("@127.0.0.1:", "@localhost:");
+    let seeds = SeedFolder::new("localhost").with(
+        "20261116000001_demo.sql",
+        "CREATE TABLE barras.demo (id int);",
+    );
+
+    let rebuilt = reset(
+        &DatabaseUrl::parse(&through_localhost).unwrap(),
+        seeds.path(),
+    )
+    .await
+    .unwrap();
+
+    assert!(rebuilt.dropped());
+    assert_eq!(seeds_of(rebuilt.seeds()), ["20261116000001_demo.sql"]);
+    assert_eq!(
+        tables(container.url()).await,
+        ["barras.demo", "public._sqlx_migrations"]
+    );
 }
 
 #[tokio::test]

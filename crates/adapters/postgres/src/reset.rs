@@ -3,34 +3,31 @@
 use std::fmt;
 use std::path::Path;
 
-use sqlx::postgres::PgConnectOptions;
 use sqlx::{AssertSqlSafe, Connection, PgConnection};
 
+use crate::guard::{LocalDatabase, ServerCheckFailed, ensure_local_server};
+use crate::migrate::migrate_local;
 use crate::seed::{apply, read_seed_files};
 use crate::{
     AppliedMigration, AppliedSeed, DatabaseUnavailable, DatabaseUrl, MigrateError, NotLocal,
-    SeedError, ensure_local, migrate,
+    SeedError, ensure_local,
 };
 
 /// Rebuilds the database `url` names, on this machine only, and returns what each step did.
 ///
 /// The guard comes first ([`ensure_local`]). Then the seed files of `seeds` are read, so that
 /// one that cannot be read leaves the database as it was. Then, from the server's maintenance
-/// database, the database is dropped, every other session on it ended, and created again,
-/// empty. Then every migration this binary carries is applied ([`migrate`]), and the seed files
-/// after them, in one transaction, as [`seed`](crate::seed) applies them.
+/// database, once the server has shown that it is the local one, the database is dropped, every
+/// other session on it ended, and created again, empty. Then every migration this binary carries
+/// is applied ([`migrate`](crate::migrate)), and the seed files after them, in one transaction,
+/// as [`seed`](crate::seed) applies them. Every step connects to the address the guard judged.
 pub async fn reset(url: &DatabaseUrl, seeds: &Path) -> Result<Reset, ResetError> {
-    ensure_local(url).map_err(ResetError::NotLocal)?;
+    let local = ensure_local(url).map_err(ResetError::NotLocal)?;
     let files = read_seed_files(seeds).map_err(ResetError::SeedsUnreadable)?;
-    let options = url.connect_options();
-    // A URL of the rule names its database; without one, Postgres takes the user's name.
-    let database = options
-        .get_database()
-        .unwrap_or(options.get_username())
-        .to_owned();
-    let dropped = recreate(&options, &database).await?;
-    let migrations = migrate(url).await.map_err(ResetError::Migrate)?;
-    let seeds = apply(url, &files).await.map_err(ResetError::Seed)?;
+    let database = local.database().to_owned();
+    let dropped = recreate(&local, &database).await?;
+    let migrations = migrate_local(&local).await.map_err(ResetError::Migrate)?;
+    let seeds = apply(&local, &files).await.map_err(ResetError::Seed)?;
     Ok(Reset {
         database,
         dropped,
@@ -42,17 +39,25 @@ pub async fn reset(url: &DatabaseUrl, seeds: &Path) -> Result<Reset, ResetError>
 /// Drops `database` when it exists, ending every other session on it, and creates it again,
 /// empty, on a connection of its own to the server's maintenance database, which is closed
 /// afterwards whatever happened. Returns whether `database` existed.
-async fn recreate(options: &PgConnectOptions, database: &str) -> Result<bool, ResetError> {
+///
+/// The server is asked who it is before the drop, which no later step can undo: the steps after
+/// it reach the same address, and the seeds ask again, as they do on their own.
+async fn recreate(local: &LocalDatabase, database: &str) -> Result<bool, ResetError> {
     // As createdb does: `postgres`, unless that is the database rebuilt.
     let maintenance = if database == "postgres" {
         "template1"
     } else {
         "postgres"
     };
-    let mut connection = PgConnection::connect_with(&options.clone().database(maintenance))
+    let mut connection = local
+        .with_database(maintenance)
+        .connect()
         .await
         .map_err(|error| ResetError::Unavailable(DatabaseUnavailable::from(&error)))?;
-    let outcome = drop_and_create(&mut connection, database).await;
+    let outcome = match ensure_local_server(&mut connection).await {
+        Ok(()) => drop_and_create(&mut connection, database).await,
+        Err(failure) => Err(ResetError::from(failure)),
+    };
     if let Err(error) = connection.close().await {
         // A connection that cannot close cleanly is dropped instead, which closes its socket:
         // the session ends either way, so the outcome stands.
@@ -142,7 +147,8 @@ impl Reset {
 /// Why a reset stopped, and what state it left the database in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResetError {
-    /// The database may be on another machine: nothing was read or touched.
+    /// The database may be on another machine, by its address or by the server that answered
+    /// there: the database was left as it was.
     NotLocal(NotLocal),
     /// The seed files could not be read: the database was left as it was.
     SeedsUnreadable(SeedError),
@@ -190,6 +196,15 @@ impl fmt::Display for ResetError {
 }
 
 impl std::error::Error for ResetError {}
+
+impl From<ServerCheckFailed> for ResetError {
+    fn from(failure: ServerCheckFailed) -> Self {
+        match failure {
+            ServerCheckFailed::NotLocal(reason) => Self::NotLocal(reason),
+            ServerCheckFailed::Unavailable(cause) => Self::Unavailable(cause),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

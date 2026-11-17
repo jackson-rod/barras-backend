@@ -174,9 +174,11 @@ _sqlx-check:
     fi
 
 # A Postgres from the image of compose.yaml's postgres service, on a port of 127.0.0.1 that Docker
-# picks, with fsync off since its data never outlives it, and every migration applied: runs the
-# given command with DATABASE_URL set to it, then removes the container, whatever happened. The
-# label barras-throwaway=1 finds one that a killed run left behind.
+# picks, with fsync off since its data never outlives it, the cluster name every local Postgres
+# starts with (LOCAL_CLUSTER_NAME in crates/adapters/postgres/src/guard.rs, whose tests read this
+# file), and every migration applied: runs the given command with DATABASE_URL set to it, then
+# removes the container, whatever happened. The label barras-throwaway=1 finds one that a killed
+# run left behind.
 [positional-arguments]
 _throwaway-db +command:
     #!/usr/bin/env bash
@@ -193,7 +195,7 @@ _throwaway-db +command:
     fi
     container="$(docker create --label barras-throwaway=1 --publish 127.0.0.1::5432 \
         --env POSTGRES_USER=barras --env POSTGRES_PASSWORD=barras --env POSTGRES_DB=barras \
-        "$image" postgres -c fsync=off)"
+        "$image" postgres -c fsync=off -c cluster_name=barras-local)"
     # Set before the container starts, so that nothing leaves it running; a signal ends the
     # script through it too, once the command it runs has been stopped.
     trap 'docker rm --force --volumes "$container" >/dev/null' EXIT

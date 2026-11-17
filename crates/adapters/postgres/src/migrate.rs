@@ -5,6 +5,7 @@ use std::fmt;
 use sqlx::migrate::{Migrate, Migration, Migrator};
 use sqlx::{Connection, PgConnection};
 
+use crate::guard::LocalDatabase;
 use crate::unavailable::sqlstate_of;
 use crate::{DatabaseUnavailable, DatabaseUrl};
 
@@ -43,9 +44,29 @@ pub async fn migrate_with(
     url: &DatabaseUrl,
     migrations: &Migrator,
 ) -> Result<Vec<AppliedMigration>, MigrateError> {
-    let mut connection = PgConnection::connect_with(&url.connect_options())
+    let connection = PgConnection::connect_with(&url.connect_options())
         .await
         .map_err(|error| MigrateError::Unavailable(DatabaseUnavailable::from(&error)))?;
+    run(connection, migrations).await
+}
+
+/// [`migrate`] on a database the guard judged local, at the address it judged, as `reset`
+/// migrates the database it created again.
+pub(crate) async fn migrate_local(
+    local: &LocalDatabase,
+) -> Result<Vec<AppliedMigration>, MigrateError> {
+    let connection = local
+        .connect()
+        .await
+        .map_err(|error| MigrateError::Unavailable(DatabaseUnavailable::from(&error)))?;
+    run(connection, &MIGRATIONS).await
+}
+
+/// The run of [`migrate`] on `connection`, which is closed afterwards whatever happened.
+async fn run(
+    mut connection: PgConnection,
+    migrations: &Migrator,
+) -> Result<Vec<AppliedMigration>, MigrateError> {
     let outcome = apply_pending(&mut connection, migrations).await;
     if let Err(error) = connection.close().await {
         // A connection that cannot close cleanly is dropped instead, which closes its socket:

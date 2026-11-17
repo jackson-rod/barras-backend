@@ -1,10 +1,13 @@
 //! The Postgres container of a test, checked through the Docker command line: where it listens,
-//! how it runs, and that it goes away with the test.
+//! how it runs, and that it goes away with the test; and the relay that reaches one through a
+//! port of this machine.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // an integration test: a step that fails must fail the test
 
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::process::Command;
 
-use barras_testkit::PostgresContainer;
+use barras_testkit::{LoopbackRelay, PostgresContainer};
 
 /// What `docker` printed, trimmed; the test fails when the command does.
 fn docker(args: &[&str]) -> String {
@@ -62,6 +65,47 @@ async fn a_container_serves_an_empty_barras_database_on_a_loopback_port() {
         ),
         "0"
     );
+}
+
+#[tokio::test]
+async fn a_container_starts_as_the_local_server_unless_it_stands_for_another() {
+    let local = PostgresContainer::start().await;
+    let elsewhere = PostgresContainer::start_as_another_server().await;
+
+    assert_eq!(query(&local, "SHOW cluster_name"), "barras-local");
+    assert_eq!(query(&elsewhere, "SHOW cluster_name"), "");
+    assert_eq!(query(&elsewhere, "SHOW fsync"), "off");
+}
+
+#[tokio::test]
+async fn a_relay_answers_for_its_target_on_a_loopback_port() {
+    let target = PostgresContainer::start_as_another_server().await;
+    let relay = LoopbackRelay::start(&target).await;
+
+    let published = docker(&["port", relay.id(), "5432/tcp"]);
+    let port = published.strip_prefix("127.0.0.1:").unwrap();
+    assert_eq!(
+        relay.url(),
+        format!("postgres://barras:barras@127.0.0.1:{port}/barras")
+    );
+    assert_eq!(published.lines().count(), 1, "{published}");
+    assert_eq!(
+        docker(&[
+            "inspect",
+            "--format",
+            r#"{{index .Config.Labels "barras-test"}}"#,
+            relay.id()
+        ]),
+        "1"
+    );
+    // The first message of the protocol, which asks for TLS: a Postgres without it answers `N`.
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+    stream
+        .write_all(&[0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f])
+        .unwrap();
+    let mut answer = [0];
+    stream.read_exact(&mut answer).unwrap();
+    assert_eq!(&answer, b"N");
 }
 
 #[tokio::test]

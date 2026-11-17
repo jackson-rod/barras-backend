@@ -8,6 +8,12 @@ services:
     # written the same way everywhere, since an image pulled by digest is stored under that whole
     # reference. Debian, not Alpine: its collation comes from glibc, as on a managed Postgres.
     image: postgres:18.7-trixie@sha256:2ea8630df176ad090ec92136dee850397c5af8781e4bcf2e4162593691c61bbc
+    # The name `barras-api seed` and `reset` require of a server before they change it, since a
+    # port of this machine can be a relay to another one. A server takes it only when it starts.
+    # The testkit's containers and the justfile's throwaway database start with it too
+    # (LOCAL_CLUSTER_NAME in crates/adapters/postgres/src/guard.rs, whose tests fail when this
+    # file or the justfile names another).
+    command: ["postgres", "-c", "cluster_name=barras-local"]
     ports:
       - "127.0.0.1:5433:5432"
     environment:

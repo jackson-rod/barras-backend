@@ -8,6 +8,7 @@ use std::path::Path;
 use sqlx::postgres::{PgDatabaseError, PgErrorPosition};
 use sqlx::{AssertSqlSafe, Connection, PgConnection};
 
+use crate::guard::{LocalDatabase, ServerCheckFailed, ensure_local_server};
 use crate::unavailable::sqlstate_of;
 use crate::{DatabaseUnavailable, DatabaseUrl, NotLocal, ensure_local};
 
@@ -20,12 +21,13 @@ use crate::{DatabaseUnavailable, DatabaseUrl, NotLocal, ensure_local};
 /// one runs, and with nothing to apply nothing connects.
 ///
 /// The guard comes first ([`ensure_local`]): seeds are local development data, so a database
-/// that may be on another machine is refused before the folder is read. The run has a
-/// connection of its own, without the pools' statement timeout.
+/// that may be on another machine is refused before the folder is read. The run connects to the
+/// address the guard judged, on a connection of its own without the pools' statement timeout,
+/// and refuses a server that did not start as the local one before the first file runs.
 pub async fn seed(url: &DatabaseUrl, folder: &Path) -> Result<Vec<AppliedSeed>, SeedError> {
-    ensure_local(url).map_err(SeedError::NotLocal)?;
+    let local = ensure_local(url).map_err(SeedError::NotLocal)?;
     let files = read_seed_files(folder)?;
-    apply(url, &files).await
+    apply(&local, &files).await
 }
 
 /// A seed file, read whole before the run connects.
@@ -77,20 +79,24 @@ fn seed_files(names: Vec<String>) -> Vec<String> {
     seeds
 }
 
-/// Applies `files` in order, in one transaction on a connection of its own, which is closed
-/// afterwards whatever happened: a run that failed ends with its session, and the server rolls
-/// back what it left open.
+/// Applies `files` in order, in one transaction on a connection of its own to the local server,
+/// which is closed afterwards whatever happened: a run that failed ends with its session, and the
+/// server rolls back what it left open.
 pub(crate) async fn apply(
-    url: &DatabaseUrl,
+    local: &LocalDatabase,
     files: &[SeedFile],
 ) -> Result<Vec<AppliedSeed>, SeedError> {
     if files.is_empty() {
         return Ok(Vec::new());
     }
-    let mut connection = PgConnection::connect_with(&url.connect_options())
+    let mut connection = local
+        .connect()
         .await
         .map_err(|error| SeedError::Unavailable(DatabaseUnavailable::from(&error)))?;
-    let outcome = apply_in_one_transaction(&mut connection, files).await;
+    let outcome = match ensure_local_server(&mut connection).await {
+        Ok(()) => apply_in_one_transaction(&mut connection, files).await,
+        Err(failure) => Err(SeedError::from(failure)),
+    };
     if let Err(error) = connection.close().await {
         // A connection that cannot close cleanly is dropped instead, which closes its socket:
         // the session ends either way, so the outcome stands.
@@ -225,7 +231,8 @@ pub struct ErrorPosition {
 /// Why a seed run stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SeedError {
-    /// The database may be on another machine: nothing was read or applied.
+    /// The database may be on another machine, by its address or by the server that answered
+    /// there: nothing was applied.
     NotLocal(NotLocal),
     /// The folder could not be read: nothing was applied.
     Folder(io::ErrorKind),
@@ -305,6 +312,15 @@ fn write_failure(f: &mut fmt::Formatter<'_>, failure: &SeedFailure) -> fmt::Resu
 }
 
 impl std::error::Error for SeedError {}
+
+impl From<ServerCheckFailed> for SeedError {
+    fn from(failure: ServerCheckFailed) -> Self {
+        match failure {
+            ServerCheckFailed::NotLocal(reason) => Self::NotLocal(reason),
+            ServerCheckFailed::Unavailable(cause) => Self::Unavailable(cause),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

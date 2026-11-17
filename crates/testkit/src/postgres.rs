@@ -1,8 +1,10 @@
-//! A Postgres container per test, from the image of the `postgres` service of `compose.yaml`.
+//! A Postgres container per test, from the image of the `postgres` service of `compose.yaml`, and
+//! a relay that reaches one through a port of this machine.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
+use std::net::SocketAddr;
 
 use testcontainers::bollard::models::{HostConfig, PortBinding};
 use testcontainers::core::{ContainerPort, WaitFor};
@@ -17,15 +19,57 @@ const USER: &str = "barras";
 const PASSWORD: &str = "barras";
 const DATABASE: &str = "barras";
 
-/// Where Postgres listens inside the container.
+/// Where Postgres listens inside the container, and the relay inside its own.
 const PORT: ContainerPort = ContainerPort::Tcp(5432);
 
 /// The label every test container carries, which finds one that a test killed with SIGKILL
 /// left behind.
 const LABEL: (&str, &str) = ("barras-test", "1");
 
+/// Docker's default network, named outright: a relay finds its target there by the name of the
+/// target's network mode, which an engine may otherwise report as `default`, a name no network
+/// answers to.
+const NETWORK: &str = "bridge";
+
 /// What Postgres prints once it accepts connections.
 const READY: &str = "database system is ready to accept connections";
+
+/// The setting the local database starts with, which `seed` and `reset` of the postgres adapter
+/// require of a server before they change anything on it (plan, refinement 15). The adapter
+/// holds the name, as `LOCAL_CLUSTER_NAME`, and fails a test when `compose.yaml` names another;
+/// the testkit cannot take it from there, since the adapter takes the testkit as a
+/// dev-dependency, so the adapter's `int_` tests are what fail when this one differs.
+const LOCAL_CLUSTER_SETTING: &str = "cluster_name=barras-local";
+
+/// The relay, in Perl, which the Postgres image carries: it listens on port 5432 and copies the
+/// bytes of each connection both ways to the address of its first argument, in a process per
+/// connection, as `ssh -L` does.
+const RELAY: &str = r#"
+use IO::Select;
+use IO::Socket::INET;
+$SIG{CHLD} = "IGNORE";
+my $listener = IO::Socket::INET->new(LocalPort => 5432, Listen => 16, ReuseAddr => 1)
+    or die "cannot listen: $!";
+print STDERR "relay ready\n";
+while (1) {
+    my $client = $listener->accept or next;
+    if (fork) { close $client; next; }
+    my $server = IO::Socket::INET->new(PeerAddr => $ARGV[0]) or exit 1;
+    my $both = IO::Select->new($client, $server);
+    while (1) {
+        for my $from ($both->can_read) {
+            my $to = $from == $client ? $server : $client;
+            my $read = sysread($from, my $bytes, 65536) or exit 0;
+            for (my $sent = 0; $sent < $read;) {
+                $sent += syswrite($to, $bytes, $read - $sent, $sent) // exit 0;
+            }
+        }
+    }
+}
+"#;
+
+/// What the relay prints once it listens.
+const RELAY_READY: &str = "relay ready";
 
 /// A Postgres 18 container that one test started, with an empty database `barras`. Each test
 /// starts its own, so no test sees another's data, and a container held in a `static` would
@@ -43,24 +87,31 @@ pub struct PostgresContainer {
 
 impl PostgresContainer {
     /// Starts a container from the image of the `postgres` service of `compose.yaml`, with `fsync`
-    /// off, since its data never outlives it, and waits until it accepts connections. Its port is
-    /// published on `127.0.0.1` only, at a port Docker picks. The test fails when Docker is not
-    /// running: a test that skipped itself would hide a failure.
+    /// off, since its data never outlives it, and the `cluster_name` of the local database, by
+    /// which `seed` and `reset` know its server for the local one. Waits until it accepts
+    /// connections. Its port is published on `127.0.0.1` only, at a port Docker picks. The test
+    /// fails when Docker is not running: a test that skipped itself would hide a failure.
     pub async fn start() -> Self {
-        let compose = fs::read_to_string(repository_file("compose.yaml"))
-            .unwrap_or_else(|error| panic!("cannot read compose.yaml: {error}"));
-        let (name, tag) = image_reference(&compose);
-        let container = ThrowawayPostgres { name, tag }
+        Self::start_with(true).await
+    }
+
+    /// [`start`](Self::start), without the `cluster_name` of the local database: a server that
+    /// stands for one on another machine, such as staging, which `seed` and `reset` must refuse
+    /// through whatever port of this machine reaches it.
+    pub async fn start_as_another_server() -> Self {
+        Self::start_with(false).await
+    }
+
+    async fn start_with(local: bool) -> Self {
+        let (name, tag) = compose_image();
+        let container = ThrowawayPostgres { name, tag, local }
             .with_label(LABEL.0, LABEL.1)
+            .with_network(NETWORK)
             .with_host_config_modifier(publish_on_loopback_only)
             .start()
             .await
-            .unwrap_or_else(|error| panic!("{}", start_failure(&error)));
-        let port = container
-            .get_host_port_ipv4(PORT)
-            .await
-            .unwrap_or_else(|error| panic!("the container publishes no port for {PORT}: {error}"));
-        let url = format!("postgres://{USER}:{PASSWORD}@127.0.0.1:{port}/{DATABASE}");
+            .unwrap_or_else(|error| panic!("{}", start_failure("a Postgres container", &error)));
+        let url = loopback_url(&container).await;
         Self { container, url }
     }
 
@@ -76,11 +127,80 @@ impl PostgresContainer {
     }
 }
 
+/// A relay from a port of `127.0.0.1` to the Postgres of a [`PostgresContainer`], in a container
+/// of its own: what `ssh -L`, `kubectl port-forward` or a cloud SQL proxy makes of a port of this
+/// machine, the first hop to a server on another one. Its address passes the local-database
+/// guard, whatever server is behind it.
+///
+/// Dropping it removes its container, as for a [`PostgresContainer`], whose label it carries.
+#[derive(Debug)]
+pub struct LoopbackRelay {
+    container: ContainerAsync<Relay>,
+    url: String,
+}
+
+impl LoopbackRelay {
+    /// Starts a relay to the Postgres of `target`, which it reaches on Docker's bridge network,
+    /// and waits until it listens. It runs on the image of `compose.yaml`, so it needs no image of
+    /// its own.
+    pub async fn start(target: &PostgresContainer) -> Self {
+        let address = target
+            .container
+            .get_bridge_ip_address()
+            .await
+            .unwrap_or_else(|error| panic!("the target container has no bridge address: {error}"));
+        let (name, tag) = compose_image();
+        let container = Relay {
+            name,
+            tag,
+            target: SocketAddr::new(address, PORT.as_u16()).to_string(),
+        }
+        .with_label(LABEL.0, LABEL.1)
+        .with_network(NETWORK)
+        .with_host_config_modifier(publish_on_loopback_only)
+        .start()
+        .await
+        .unwrap_or_else(|error| panic!("{}", start_failure("a relay container", &error)));
+        let url = loopback_url(&container).await;
+        Self { container, url }
+    }
+
+    /// The URL of the target's database through the relay, with its credentials:
+    /// `postgres://barras:barras@127.0.0.1:<port>/barras`.
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// The container's id, for a test that asks Docker about it.
+    pub fn id(&self) -> &str {
+        self.container.id()
+    }
+}
+
+/// The image of the `postgres` service of `compose.yaml`, as testcontainers takes it.
+fn compose_image() -> (String, String) {
+    let compose = fs::read_to_string(repository_file("compose.yaml"))
+        .unwrap_or_else(|error| panic!("cannot read compose.yaml: {error}"));
+    image_reference(&compose)
+}
+
+/// The URL of the database `barras` at the port of `127.0.0.1` where `container` publishes
+/// [`PORT`].
+async fn loopback_url<I: Image>(container: &ContainerAsync<I>) -> String {
+    let port = container
+        .get_host_port_ipv4(PORT)
+        .await
+        .unwrap_or_else(|error| panic!("the container publishes no port for {PORT}: {error}"));
+    format!("postgres://{USER}:{PASSWORD}@127.0.0.1:{port}/{DATABASE}")
+}
+
 /// The image of `compose.yaml`, run as a throwaway database.
 #[derive(Debug)]
 struct ThrowawayPostgres {
     name: String,
     tag: String,
+    /// Whether its server starts as the local one, with the `cluster_name` of the local database.
+    local: bool,
 }
 
 impl Image for ThrowawayPostgres {
@@ -113,7 +233,46 @@ impl Image for ThrowawayPostgres {
     }
 
     fn cmd(&self) -> impl IntoIterator<Item = impl Into<Cow<'_, str>>> {
-        ["postgres", "-c", "fsync=off"]
+        let mut command = vec!["postgres", "-c", "fsync=off"];
+        if self.local {
+            command.extend(["-c", LOCAL_CLUSTER_SETTING]);
+        }
+        command
+    }
+
+    fn expose_ports(&self) -> &[ContainerPort] {
+        &[PORT]
+    }
+}
+
+/// The image of `compose.yaml`, run as a relay to `target` instead of as a database.
+#[derive(Debug)]
+struct Relay {
+    name: String,
+    tag: String,
+    /// The address and port of the Postgres it relays to.
+    target: String,
+}
+
+impl Image for Relay {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn tag(&self) -> &str {
+        &self.tag
+    }
+
+    fn ready_conditions(&self) -> Vec<WaitFor> {
+        vec![WaitFor::message_on_stderr(RELAY_READY)]
+    }
+
+    fn entrypoint(&self) -> Option<&str> {
+        Some("perl")
+    }
+
+    fn cmd(&self) -> impl IntoIterator<Item = impl Into<Cow<'_, str>>> {
+        ["-e", RELAY, self.target.as_str()]
     }
 
     fn expose_ports(&self) -> &[ContainerPort] {
@@ -208,12 +367,10 @@ fn inside<'l, 'a>(lines: &'l [Line<'a>], key: &str, indent: usize) -> Option<&'l
     Some(&lines[start..start + length])
 }
 
-/// What a test that cannot start its container fails with. testcontainers reports a Docker
-/// that is not running in more than one way, so the sentence stands after any failure.
-fn start_failure(error: &TestcontainersError) -> String {
-    format!(
-        "cannot start a Postgres container: {error}. The int_ and e2e_ tests need Docker running."
-    )
+/// What a test that cannot start `container` fails with. testcontainers reports a Docker that is
+/// not running in more than one way, so the sentence stands after any failure.
+fn start_failure(container: &str, error: &TestcontainersError) -> String {
+    format!("cannot start {container}: {error}. The int_ and e2e_ tests need Docker running.")
 }
 
 #[cfg(test)]
@@ -366,7 +523,7 @@ mod tests {
             DockerError::SocketNotFoundError("/var/run/docker.sock".to_owned()),
         ));
 
-        let failure = start_failure(&error);
+        let failure = start_failure("a Postgres container", &error);
 
         assert!(
             failure.starts_with("cannot start a Postgres container: "),
