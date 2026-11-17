@@ -7,6 +7,16 @@
 all-features = true
 
 # Explicit so the policy does not change with the tool's defaults.
+#
+# Decided by the owner (BAR-4 spec §3.4, plan refinement 14): the advisories are checked in
+# every pull request, by `just deny` in CI and in `just verify`, never on a schedule alone, so
+# that nothing merges past a known advisory. A new advisory blocks every pull request until it is
+# fixed, usually with `cargo update -p <crate>`, or ignored below with a reason and a date, in a
+# pull request of its own: the fix or the ignore is then reviewed for itself, not inside
+# unrelated work. The one exception is an advisory that a pull request's own new dependency
+# brings: an ignore that matches no crate fails the check, so it cannot land before that
+# dependency does, and it is ignored in that pull request instead, scoped by a ban in [bans]
+# whose only wrapper is that dependency.
 [advisories]
 yanked = "deny"
 unmaintained = "all"

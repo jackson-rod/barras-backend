@@ -63,6 +63,38 @@ jobs:
       # its crates.io source at this version, with the lock file it was released with.
       - name: Install cargo-hakari
         run: cargo install --locked cargo-hakari@0.9.39
+      # For `just db-check`. The pinned install-action has no manifest for sqlx-cli
+      # either, so it is built the same way, with the command of `just setup`: the
+      # version it pins, Postgres support alone, and the `sqlx-toml` feature, without
+      # which sqlx-cli refuses to run beside the repository's sqlx.toml.
+      - name: Install sqlx-cli
+        run: cargo install --locked sqlx-cli@0.9.0 --no-default-features --features postgres,sqlx-toml
+      # Docker Hub limits the pulls of an anonymous address, and a runner shares its
+      # address. So the runner's Docker pulls every Docker Hub image through
+      # mirror.gcr.io, Google's cache of Docker Hub, which sets no such limit: dockerd
+      # reads `registry-mirrors` from /etc/docker/daemon.json when it starts, and falls
+      # back to Docker Hub itself whenever the mirror fails or lacks the image. The
+      # settings the runner's image already keeps in that file stay. Done before any
+      # pull, so that every pull of the job goes through the mirror.
+      - name: Pull Docker Hub images through mirror.gcr.io
+        env:
+          MIRROR: https://mirror.gcr.io
+        run: |
+          daemon=/etc/docker/daemon.json
+          settings='{}'
+          if [ -s "$daemon" ]; then settings="$(sudo cat "$daemon")"; fi
+          jq --arg mirror "$MIRROR" '."registry-mirrors" = [$mirror]' <<< "$settings" > "$RUNNER_TEMP/daemon.json"
+          sudo install --mode=0644 "$RUNNER_TEMP/daemon.json" "$daemon"
+          sudo systemctl restart docker
+          docker info --format 'registry mirrors: {{json .RegistryConfig.Mirrors}}'
+      # The image of compose.yaml's postgres service, read from that file alone, as the
+      # throwaway database of `just db-check` reads it. In a step of its own, with its
+      # own bound, so that a slow pull is charged to no check.
+      - name: Pull the Postgres image
+        timeout-minutes: 5
+        run: |
+          image="$(docker compose --file compose.yaml config --images postgres)"
+          docker pull "$image"
       # Every check runs even when a step above it failed, so one finding never
       # hides another.
       #
@@ -120,6 +152,15 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 10
         run: just openapi-check
+      # A throwaway Postgres from the image pulled above takes every migration from
+      # empty; then `cargo sqlx prepare --check` and a comparison of the file names
+      # fail when .sqlx/ is not what the queries and the migrations produce. It compiles
+      # the workspace again, so the bound stops a hung build or container from holding
+      # the job until the job's own limit.
+      - name: Offline query metadata
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        run: just db-check
       # Catches a step that, by mistake, rewrites a tracked file or writes any file
       # outside target/, ignored ones included, such as .env or lcov.info. It does not
       # stop a hostile build script, which can undo its writes before this step runs.
@@ -152,6 +193,33 @@ jobs:
         with:
           tool: just@1.59.0,cargo-nextest@0.9.152,cargo-llvm-cov@0.9.1
           fallback: none
+      # Docker Hub limits the pulls of an anonymous address, and a runner shares its
+      # address. So the runner's Docker pulls every Docker Hub image through
+      # mirror.gcr.io, Google's cache of Docker Hub, which sets no such limit: dockerd
+      # reads `registry-mirrors` from /etc/docker/daemon.json when it starts, and falls
+      # back to Docker Hub itself whenever the mirror fails or lacks the image. The
+      # settings the runner's image already keeps in that file stay. Done before any
+      # pull, so that every pull of the job goes through the mirror.
+      - name: Pull Docker Hub images through mirror.gcr.io
+        env:
+          MIRROR: https://mirror.gcr.io
+        run: |
+          daemon=/etc/docker/daemon.json
+          settings='{}'
+          if [ -s "$daemon" ]; then settings="$(sudo cat "$daemon")"; fi
+          jq --arg mirror "$MIRROR" '."registry-mirrors" = [$mirror]' <<< "$settings" > "$RUNNER_TEMP/daemon.json"
+          sudo install --mode=0644 "$RUNNER_TEMP/daemon.json" "$daemon"
+          sudo systemctl restart docker
+          docker info --format 'registry mirrors: {{json .RegistryConfig.Mirrors}}'
+      # The int_ and e2e_ tests start their containers from the image of compose.yaml's
+      # postgres service, read from that file alone, as the testkit reads it. Pulled in
+      # a step of its own, with its own bound, so that a slow pull is charged to no
+      # test's time limit.
+      - name: Pull the Postgres image
+        timeout-minutes: 5
+        run: |
+          image="$(docker compose --file compose.yaml config --images postgres)"
+          docker pull "$image"
       # Every test once under coverage, then the thresholds. nextest kills a test
       # that hangs (.config/nextest.toml).
       - name: Tests under coverage, and the thresholds
