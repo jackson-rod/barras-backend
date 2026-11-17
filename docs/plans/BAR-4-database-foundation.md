@@ -49,6 +49,10 @@ From the documentation of Task 7 (2026-11-17):
 
 17. **Spec §11.2, the database a test gets.** The testkit gives each test an empty `barras` database in its own container, and the test applies the migrations itself through the adapter. The testkit does not depend on the postgres adapter: through a dev-dependency cycle, the adapter's own unit tests would see two copies of its types.
 
+From the whole-branch code review and security audit (2026-11-17):
+
+18. **Refinements 13 to 15, carried through the branch.** The server is asked on every connection that `seed` and `reset` open, before it is used, the migration step of `reset` included: a relay that takes turns between servers sent that step to another one. `default-members` leaves the testkit and `xtask` out of a plain `cargo build`, as `just build` does, and `db-prepare` and `db-check` name `--workspace` so that their check still reads every member. cargo-deny also bans sqlx's own crates and `h2`. `.env` is read line by line and never run as a script; a line outside the value rule, or a file holding a NUL byte, is refused by its number alone. The server check is per connection, not per transaction: ADR-0030 records that limit.
+
 Choices the spec left to the plan, made from the spikes: testcontainers 0.28.0 with a Postgres image of our own (A.7); the image `postgres:18.7-trixie@sha256:2ea8630df176ad090ec92136dee850397c5af8781e4bcf2e4162593691c61bbc`, written with tag and digest in `compose.yaml`, the testkit and CI (A.9); CI pulls it through `mirror.gcr.io`, with Docker Hub as the fallback, to be confirmed by the first CI run (A.9). Task 6 chose the runner's `registry-mirrors` setting over the pull-and-tag of A.9: the reference stays the one `compose.yaml` names, by tag and digest, so the testkit and `db-check` find the image with no tag step, and Docker verifies the digest whichever registry serves it; sqlx-cli installed with `--locked` (A.8).
 
 ## Task 0: Spikes (gate)
