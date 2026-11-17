@@ -11,7 +11,11 @@ all-features = true
 yanked = "deny"
 unmaintained = "all"
 unsound = "all"
-# Each advisory ignored says why, and since when.
+# An ignore that no longer matches any crate fails the check, so that it goes as soon as its
+# reason does: the one below once testcontainers drops astral-tokio-tar.
+unused-ignored-advisory = "deny"
+# Each advisory ignored says why, and since when, and its crate is banned in [bans] with the
+# crates that reason names as its only wrappers: the ignore then covers no other crate taking it.
 ignore = [
     # astral-tokio-tar 0.6, which testcontainers 0.28.0, the latest release, depends on: its
     # maintainers ended it on 2026-11-03, and no release of testcontainers takes another tar
@@ -79,6 +83,10 @@ deny = [
     { crate = "hyper-rustls", wrappers = ["bollard"], reason = "the Docker client of the test containers: an HTTP connector over hyper" },
     { crate = "hyper-timeout", wrappers = ["tonic"], reason = "the Docker client of the test containers: an HTTP connector over hyper" },
     { crate = "hyperlocal", wrappers = ["bollard"], reason = "the Docker client of the test containers: an HTTP connector over hyper" },
+    # Unmaintained (RUSTSEC-2026-0440), and ignored in [advisories] only because testcontainers
+    # builds it into tests alone: no other crate may take it, so that the ignore covers nothing
+    # else.
+    { crate = "astral-tokio-tar", wrappers = ["testcontainers"], reason = "unmaintained (RUSTSEC-2026-0440): its advisory is ignored only under testcontainers, in test builds" },
     { crate = "reqwest", wrappers = ["barras-adapter-providers"], reason = "outbound HTTP lives in the providers adapter" },
     { crate = "redis", wrappers = ["barras-adapter-redis", "barras-testkit"], reason = "Redis access lives in the redis adapter" },
     # Alternatives to the crates the ADRs chose. No crate may use them, not even

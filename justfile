@@ -72,11 +72,11 @@ hakari-check:
 
 # Every member depends on crates/workspace-hack, so whatever it holds reaches each member's
 # release build, while hakari unifies the features of test builds too. For each platform of
-# .config/hakari.toml, this compares the crates and features of the workspace's release build,
-# as cargo tree resolves them without dev units, with the same build in a copy of the workspace
-# whose members do not depend on the hack, and fails on any difference, naming the crate and
-# what the hack adds to it. The copy is the files git tracks or would track, in a temporary
-# folder, so nothing is written in the repository.
+# .config/hakari.toml, this compares the crates and features of the release build of just build,
+# the packages of release_packages, as cargo tree resolves them without dev units, with the same
+# build in a copy of the workspace whose members do not depend on the hack, and fails on any
+# difference, naming the crate and what the hack adds to it. The copy is the files git tracks or
+# would track, in a temporary folder, so nothing is written in the repository.
 _hack-release-graph:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -105,7 +105,7 @@ _hack-release-graph:
     (cd "$copy" && cargo hakari remove-deps --yes --quiet)
     # One line per crate and set of features; the members, the hack among them, are left out.
     graph() {
-        (cd "$1" && cargo tree --locked --workspace --exclude workspace-hack -e normal,build \
+        (cd "$1" && cargo tree --locked {{release_packages}} --exclude workspace-hack -e normal,build \
             --target "$2" --prefix none -f '{p} [{f}]') \
             | sed 's/ (\*)$//' | awk -v member="($1/" 'index($0, member) == 0' | sort -u
     }
@@ -254,8 +254,15 @@ _no-stray-profiles:
         exit 1
     fi
 
+# What a release build builds: the workspace without barras-testkit and xtask, which only the
+# tests and the repository's checks use. cargo unifies the features of every package it builds,
+# so with the testkit the binaries took testcontainers' features, such as hyper-util's http2 and
+# server-auto, and barras-api's public port answered cleartext HTTP/2 (plan, refinement 13).
+# _hack-release-graph compares the release build of this same selection.
+release_packages := "--workspace --exclude barras-testkit --exclude xtask"
+
 build:
-    cargo build --workspace --release --locked
+    cargo build {{release_packages}} --release --locked
 
 # In CI's order. check-arch, check-structure, hakari-check, fmt-check and deny compile no
 # member, so they read the workspace before any build script of the change runs: cargo xtask
