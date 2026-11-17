@@ -6,10 +6,11 @@ mod matched_route;
 mod request_id;
 mod request_log;
 mod safety_net;
+mod timeout;
 
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
-use axum::middleware::{from_fn_with_state, map_response};
+use axum::middleware::{from_fn, from_fn_with_state, map_response};
 use tower::ServiceBuilder;
 use tower::util::MapRequestLayer;
 use tower_http::catch_panic::CatchPanicLayer;
@@ -19,6 +20,8 @@ use tower_http::request_id::{PropagateRequestIdLayer, SetRequestIdLayer};
 
 #[cfg(any(test, feature = "testing"))]
 pub use matched_route::MatchedRoute;
+#[cfg(test)]
+pub(crate) use timeout::REQUEST_TIME_LIMIT;
 
 use crate::metrics::Metrics;
 
@@ -57,6 +60,10 @@ pub(crate) fn wrap(router: Router, metrics: Metrics) -> Router {
                     http_metrics::record_http_metrics,
                 ))
                 .layer(map_response(safety_net::envelope_safety_net))
+                // Inside the request log, the id, the metrics and the safety net, so that a
+                // timeout is logged, counted and carries the request id; outside compression, the
+                // panic handler and the body limit, so that it bounds all a handler does.
+                .layer(from_fn(timeout::limit_request_time))
                 // An `Accept-Encoding` that refuses every encoding, such as `identity;q=0`,
                 // still runs the handler: this layer then changes only the status of its answer
                 // to 406, and the safety net above replaces the body.

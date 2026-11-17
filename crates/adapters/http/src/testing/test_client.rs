@@ -21,8 +21,8 @@ use crate::middleware::MatchedRoute;
 use crate::openapi::{X_COMMON_ERROR_CODES, X_ERROR_CODES, operations};
 
 /// The statuses of the codes of `x-common-error-codes`, which any route can answer, so that no
-/// operation documents them: 400, 404, 405, 406, 413, 415 and 500. Sorted.
-const COMMON_STATUSES: [u16; 7] = [400, 404, 405, 406, 413, 415, 500];
+/// operation documents them: 400, 404, 405, 406, 413, 415, 500 and 503. Sorted.
+const COMMON_STATUSES: [u16; 8] = [400, 404, 405, 406, 413, 415, 500, 503];
 
 /// Sends requests to an app in-process, through the whole stack of middleware, and fails the
 /// test when a route the OpenAPI document does not have served one: so any test that reaches
@@ -386,6 +386,8 @@ impl TestResponse {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::openapi::COMMON_ERROR_CODES;
 
@@ -403,6 +405,7 @@ mod tests {
             ApiError::payload_too_large(),
             ApiError::not_acceptable(),
             ApiError::internal("a handler panicked".to_owned()),
+            ApiError::request_timeout(Duration::from_secs(5)),
         ];
         let mut codes: Vec<&str> = common.iter().map(ApiError::code).collect();
         codes.sort_unstable();

@@ -23,6 +23,7 @@ pub const COMMON_ERROR_CODES: &[&str] = &[
     ApiError::METHOD_NOT_ALLOWED,
     ApiError::NOT_ACCEPTABLE,
     ApiError::PAYLOAD_TOO_LARGE,
+    ApiError::REQUEST_TIMEOUT,
     ApiError::ROUTE_NOT_FOUND,
     ApiError::UNSUPPORTED_MEDIA_TYPE,
 ];
@@ -268,6 +269,8 @@ pub(crate) fn operations_mut(item: &mut PathItem) -> impl Iterator<Item = &mut O
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use serde::Serialize;
     use serde_json::{Value, json};
     use utoipa::ToSchema;
@@ -414,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn the_common_codes_are_the_seven_of_the_spec_sorted() {
+    fn the_common_codes_are_the_eight_of_the_spec_sorted() {
         assert_eq!(
             COMMON_ERROR_CODES,
             [
@@ -423,6 +426,7 @@ mod tests {
                 "METHOD_NOT_ALLOWED",
                 "NOT_ACCEPTABLE",
                 "PAYLOAD_TOO_LARGE",
+                "REQUEST_TIMEOUT",
                 "ROUTE_NOT_FOUND",
                 "UNSUPPORTED_MEDIA_TYPE",
             ]
@@ -440,6 +444,7 @@ mod tests {
             ApiError::payload_too_large().code(),
             ApiError::not_acceptable().code(),
             ApiError::internal("handler panicked".to_owned()).code(),
+            ApiError::request_timeout(Duration::from_secs(5)).code(),
         ];
         answered.sort_unstable();
 

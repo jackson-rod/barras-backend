@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::error::Error;
+use std::time::Duration;
 
 use axum::http::header::WWW_AUTHENTICATE;
 use axum::http::{HeaderValue, StatusCode};
@@ -53,6 +54,8 @@ impl ApiError {
     pub const SERVICE_UNAVAILABLE: &'static str = "SERVICE_UNAVAILABLE";
     /// The code of [`ApiError::internal`].
     pub const INTERNAL_ERROR: &'static str = "INTERNAL_ERROR";
+    /// The code of the answer to a request that has had none within the time limit.
+    pub const REQUEST_TIMEOUT: &'static str = "REQUEST_TIMEOUT";
 
     /// 422 `VALIDATION_FAILED`, with every field that failed in `error.fields`.
     pub fn validation(fields: FieldErrors) -> Self {
@@ -132,6 +135,18 @@ impl ApiError {
         Self::server(
             StatusCode::INTERNAL_SERVER_ERROR,
             Self::INTERNAL_ERROR,
+            detail,
+        )
+    }
+
+    /// 503 `REQUEST_TIMEOUT`, with a generic message: no answer had started `limit` after the
+    /// request arrived. The detail names the limit alone: the request span the failure is
+    /// logged in already names the route and the request id.
+    pub(crate) fn request_timeout(limit: Duration) -> Self {
+        let detail = format!("no answer within {} seconds", limit.as_secs());
+        Self::server(
+            StatusCode::SERVICE_UNAVAILABLE,
+            Self::REQUEST_TIMEOUT,
             detail,
         )
     }
@@ -259,6 +274,7 @@ mod tests {
     use std::io;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use axum::http::header::{CONTENT_TYPE, WWW_AUTHENTICATE};
     use barras_kernel::{Currency, KernelError};
@@ -680,6 +696,11 @@ mod tests {
                 500,
                 "INTERNAL_ERROR",
             ),
+            (
+                ApiError::request_timeout(Duration::from_secs(5)),
+                503,
+                "REQUEST_TIMEOUT",
+            ),
         ] {
             assert_eq!(error.status().as_u16(), status, "{code}");
             assert_eq!(error.code(), code);
@@ -775,6 +796,7 @@ mod tests {
                 ApiError::NOT_ACCEPTABLE,
                 ApiError::SERVICE_UNAVAILABLE,
                 ApiError::INTERNAL_ERROR,
+                ApiError::REQUEST_TIMEOUT,
             ],
             [
                 "VALIDATION_FAILED",
@@ -786,8 +808,23 @@ mod tests {
                 "NOT_ACCEPTABLE",
                 "SERVICE_UNAVAILABLE",
                 "INTERNAL_ERROR",
+                "REQUEST_TIMEOUT",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_request_timeout_answers_the_generic_503_and_logs_the_limit() {
+        let (response, lines) =
+            respond_logged(|| ApiError::request_timeout(Duration::from_secs(5)));
+        let (status, _, body) = read(response).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["message"], "Service unavailable");
+        assert_eq!(body["error"], json!({ "code": "REQUEST_TIMEOUT" }));
+        let logged = "ERROR request failed code=\"REQUEST_TIMEOUT\" status=503 \
+                      detail=no answer within 5 seconds";
+        assert_eq!(lines, [logged]);
     }
 
     #[tokio::test]
