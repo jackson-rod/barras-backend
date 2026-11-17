@@ -7,6 +7,7 @@ The initial schema, in the Postgres schema `barras`. It is a starting point, bui
 - Ids are UUID v7.
 - Timestamps are `timestamptz` in UTC.
 - Fiat amounts are `numeric(20,2)` and quantities are `numeric(38,18)`, always with a currency.
+- Every table lives in the schema `barras`, which the first migration creates, and SQL names it on every table it touches (`barras.users`). sqlx keeps its history table, `_sqlx_migrations`, in `public` ([ADR-0030](../adr/0030-database-foundation.md)).
 
 ## identity
 
@@ -206,6 +207,8 @@ The messages of each conversation. Columns are defined in this module's spec.
 
 A record of each ingestion job run. Columns are defined by the ingest foundation ticket (F-06, BAR-6).
 
-## Seeds
+## Reference data and seeds
 
-The role `trader` and the permission catalog; the plans; the currency list; Bancolombia, Davivienda and Nu; Binance, Buda and the Colombian stock exchange; a demo user for local development.
+Seeds are local development data, such as the demo user: SQL files in `seeds/` that `just db-seed` and `just db-reset` apply to the local database alone, and that never reach production ([ADR-0030](../adr/0030-database-foundation.md)). The repository holds none until BAR-15 adds the demo user.
+
+Reference data that every environment needs never goes in a seed: it comes in a migration or from its module's code. That is the role `trader` and the permission catalog; the plans; the currency list; Bancolombia, Davivienda and Nu; Binance, Buda and the Colombian stock exchange.

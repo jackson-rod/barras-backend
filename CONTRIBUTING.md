@@ -41,9 +41,33 @@ The full rules are in [CLAUDE.md](CLAUDE.md#git-and-pull-requests); the git hook
 - After adding a crate, or changing a dependency or its features, run `just hakari` and commit what it changes: `crates/workspace-hack/Cargo.toml`, the `workspace-hack` lines of the members and `Cargo.lock`. `just hakari-check`, in `just verify` and in CI, fails while either would change, and when the generated crate changes what a release build compiles: a crate to which only tests ask for more then joins `third-party` under `[traversal-excludes]` in `.config/hakari.toml`.
 - After adding or changing a route, run `just openapi` and commit `openapi.json`. `just openapi-check` fails until then, in `just verify` and in CI.
 
+## The database
+
+The rules are in [CLAUDE.md](CLAUDE.md#data-access) and [ADR-0030](docs/adr/0030-database-foundation.md); the [README](README.md#the-local-database) sets up the local database.
+
+- A new migration: `just db-migrate <name>`, with a snake_case name such as `create_users`, creates `migrations/<timestamp>_<name>.sql`. Write its SQL, naming the schema of every table (`barras.users`). `just db-deploy` applies it to the database of `.env`, and `just db-status` shows what is applied and what is pending.
+- Migrations are forward-only: fix a mistake with a new migration. Never edit one that has been merged: `barras-api migrate` refuses a database that ran it before the change. One you are still writing on your branch you may edit; `just db-reset` then rebuilds your local database, which ran the old text.
+- After changing a query or adding a migration, run `just db-prepare` and commit what it changes in `.sqlx/`. `just db-check` fails until then, in `just verify` and in CI. Both start a throwaway Postgres of their own, so the local database may be down, but Docker must be running.
+- Seeds hold local development data, in `seeds/`, named like migrations. Reference data that every environment needs goes in a migration or in its module's code, never in a seed. A seed never ends the transaction the files run in, with `COMMIT` or `ROLLBACK`: the run fails on it.
+
+## When a new advisory blocks
+
+`just deny` checks the advisories in every pull request, so an advisory published today fails every pull request, yours included, until someone deals with it (ADR-0030, and the comment of `[advisories]` in `deny.toml`):
+
+1. Fix it in a pull request of its own, usually with `cargo update -p <crate>`, which rewrites `Cargo.lock`.
+2. When no fix exists, ignore it in `[advisories]` of `deny.toml`, with a reason and the date, in a pull request of its own. Ban its crate in `[bans]` with the crates that bring it as its only wrappers, so that the ignore covers no other crate.
+3. The one exception is an advisory that your pull request's own new dependency brings. An ignore that matches no crate fails the check, so it cannot land first: ignore the advisory in that pull request, scoped by a ban whose only wrapper is that dependency.
+
+sqlx-cli is a tool, not a member of the workspace, so `just deny` never reads its dependencies: it is built from the lock file it was published with. When you change its pinned version, in `just setup` and in CI, run `cargo deny check` on the lock of the new version before the change lands. ADR-0030 lists what the lock of 0.9.0 holds, and why it is accepted.
+
+## Your `.env`
+
+- `just dev` and the `db-*` commands that connect export the variables of `.env`, your copy of `.env.example`. When `.env.example` gains a variable, add it to your `.env`: a binary refuses to start without it, naming it.
+- The sqlx query macros read every `.env` from the crate's folder up to `/` when they compile, offline too. One that their parser cannot read fails every build, with `error reading dotenv file` and its path, not the line, and that includes a `.env` above the checkout, such as one in your home folder. Keep each line a comment or `NAME=value`, with a value of letters, digits and `. _ : / @ % + , = [ ] -` only, as `.env.example` has: a blank or an unclosed quote in a value breaks it.
+
 ## Pull requests
 
-1. Push your branch. The `pre-push` hook checks the branch name and runs `just verify`.
+1. Push your branch. The `pre-push` hook checks the branch name and runs `just verify`, which needs the network, and Docker running: `just db-check` and the `int_` and `e2e_` tests start Postgres containers.
 2. Open the pull request against `develop`. When the branch has more than one commit, GitHub pre-fills the title from the branch name, which `cargo xtask check-pr` refuses: replace it with `type(BAR-n): description`, as in the table above. Fill in the template: the ticket id and its Trello card, what and why, the four definition of done checkboxes, notes for the reviewer.
 3. Move the card to `EN PRUEBA`.
 4. CI runs `checks`, `test` and `build`. All three must pass. `checks` also checks the branch name, every commit message of the branch (not only the last one), and the pull request title and description. Editing the title or the description runs CI again. The README says what [each job runs](README.md#branches-pull-requests-and-ci).

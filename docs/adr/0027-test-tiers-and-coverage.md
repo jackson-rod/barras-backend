@@ -82,3 +82,4 @@ Date: 2026-11-16
 - The two nextest filters are valid only while at least one `e2e_` or `int_` test target exists: nextest refuses a `binary()` filter that matches no test target.
 - CI's `test` job runs `just test-cov`, and `just verify` runs it before every push.
 - ADR-0017 keeps its thresholds; this record says how they are measured.
+- Pointer: from BAR-4 the `int_` tier is real. `barras-adapter-postgres` and `barras-testkit` have `int_` targets, and the process tests of `barras-api` start containers too, each test a throwaway Postgres container of its own (ADR-0030). `just test-int` and `just test-cov`, and so `just verify` and the `pre-push` hook, need Docker running: Docker not running fails a test, which never skips itself. `barras-adapter-postgres` is measured as every adapter is.

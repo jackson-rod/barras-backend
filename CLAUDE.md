@@ -50,30 +50,39 @@ Every command runs from the repository root through `just`.
 | Command | What it does |
 | --- | --- |
 | `just` | Lists the recipes (the `default` recipe) |
-| `just setup` | Installs the toolchain that `rust-toolchain.toml` names, with its components (`rustup toolchain install`); installs cargo-nextest 0.9.152, cargo-deny 0.20.2, cargo-hakari 0.9.39, cargo-llvm-cov 0.9.1 and watchexec 2.8.0 (`cargo install --locked`); installs the git hooks |
-| `just dev` | Fails with `copy .env.example to .env` when `.env` is missing. Otherwise exports the variables of `.env` and runs `barras-api` under watchexec, which restarts it with SIGTERM whenever a `.rs` file or a `Cargo.toml` changes |
+| `just setup` | Installs the toolchain that `rust-toolchain.toml` names, with its components (`rustup toolchain install`); installs cargo-nextest 0.9.152, cargo-deny 0.20.2, cargo-hakari 0.9.39, cargo-llvm-cov 0.9.1 and watchexec 2.8.0, then sqlx-cli 0.9.0 with Postgres support alone and its `sqlx-toml` feature, without which it refuses to run beside `sqlx.toml` (`cargo install --locked`); installs the git hooks |
+| `just dev` | Fails with `copy .env.example to .env` when `.env` is missing. Otherwise exports the variables of `.env` and runs `barras-api` under watchexec, which restarts it with SIGTERM whenever a `.rs` file or a `Cargo.toml` changes. It serves while the database is down, readiness answering 503 |
 | `just dev-ingest` | The same for `barras-ingest` |
+| `just db-up` | Starts the local Postgres, the `postgres` service of `compose.yaml` on `127.0.0.1:5433`, and waits until it accepts connections (`docker compose up --detach --wait`) |
+| `just db-down` | Stops it; its data stays in the volume |
+| `just db-migrate <name>` | Creates `migrations/<UTC timestamp>_<name>.sql` with sqlx-cli, with no script that undoes it; refuses a name that is not snake_case before any file exists |
+| `just db-deploy` | `barras-api migrate` against the database of `.env`: applies the pending migrations |
+| `just db-status` | sqlx-cli's `migrate info` against the `API_DATABASE_URL` of `.env`: the migrations applied, those pending, and those changed after they ran. It creates `public._sqlx_migrations` in a database that lacks it. The URL reaches sqlx-cli's environment alone, never an argument or the output |
+| `just db-seed` | `barras-api seed seeds` against the database of `.env`; refused unless `APP_ENV` is `local` and the database is the local one |
+| `just db-reset` | `barras-api reset seeds` against the database of `.env`: drop, create, every migration, the seeds; refused unless `APP_ENV` is `local` and the database is the local one |
 | `just fmt` | Formats the workspace with rustfmt |
 | `just fmt-check` | Fails on unformatted code |
 | `just lint` | clippy on every crate and target; any warning fails, cargo's own too (`build.warnings="deny"`), such as a member without `[lints]` or a dependency no code uses |
 | `just deny` | cargo-deny: advisories, licences, bans and sources. Needs the network |
 | `just check-arch` | `cargo deny check bans`, then `cargo xtask check-arch` |
-| `just check-structure` | `cargo xtask check-structure`: ADRs, module crates, migration names |
+| `just check-structure` | `cargo xtask check-structure`: ADRs, module crates, and the names and versions of migrations and seeds |
 | `just hakari` | Regenerates `crates/workspace-hack` (`cargo hakari generate`) and every member's line to it (`cargo hakari manage-deps`) |
-| `just hakari-check` | Reads `Cargo.lock` with `--locked`, so a stale one fails it rather than being rewritten. Fails when `crates/workspace-hack` or a member's line to it is out of step with the dependency tree, or when, on a platform of `.config/hakari.toml`, the workspace's release build compiles a crate or a feature it would not compile without the generated crate, naming each. Writes nothing in the repository |
+| `just hakari-check` | Reads `Cargo.lock` with `--locked`, so a stale one fails it rather than being rewritten. Fails when `crates/workspace-hack` or a member's line to it is out of step with the dependency tree, or when, on a platform of `.config/hakari.toml`, the release build of `just build` compiles a crate or a feature it would not compile without the generated crate, naming each. Writes nothing in the repository |
 | `just openapi` | Rewrites `openapi.json` from `barras-api openapi`, through a temporary file, so a failed build leaves it whole |
 | `just openapi-check` | `barras-api openapi --check openapi.json`: fails when the file is not the document the code generates |
+| `just db-prepare` | Rewrites `.sqlx/` with `cargo sqlx prepare`, against a throwaway Postgres from the image of `compose.yaml` with every migration applied; the container is removed afterwards |
+| `just db-check` | The same throwaway Postgres: fails when a migration does not apply to an empty database, when `cargo sqlx prepare --check` finds `.sqlx/` stale, or when `.sqlx/` holds a file that no query produces |
 | `just test` | With cargo-nextest, every test target not named `e2e_` or `int_`, then `just test-doc`; no Docker |
 | `just test-doc` | The doctests, with `cargo test --doc`: nextest does not run them, and cargo-llvm-cov cannot measure them on stable |
-| `just test-int` | With cargo-nextest, the test targets named `e2e_` or `int_`; from BAR-4 it needs Docker |
-| `just test-cov` | Every test once under cargo-llvm-cov, into a fresh `target/coverage/lcov.info`; fails on a `.profraw` file outside `target/`; then `cargo xtask check-coverage` holds the thresholds |
-| `just build` | Release build of the workspace |
-| `just verify` | `check-arch`, `check-structure`, `hakari-check`, `fmt-check`, `deny`, `lint`, `openapi-check`, `test-cov`, `test-doc`, `build`, in that order, which is CI's: the first five compile no member, so they read the workspace before any build script of the change runs. It is what CI runs, apart from the branch, commit and pull request checks and the tree check |
+| `just test-int` | With cargo-nextest, the test targets named `e2e_` or `int_`; needs Docker running, for the tests that start a Postgres container |
+| `just test-cov` | Every test once under cargo-llvm-cov, into a fresh `target/coverage/lcov.info`; fails on a `.profraw` file outside `target/`; then `cargo xtask check-coverage` holds the thresholds. It runs the `e2e_` and `int_` tests too, so it needs Docker running |
+| `just build` | Release build of the workspace without `barras-testkit` and `xtask`, which only the tests and the checks use: cargo unifies the features of every package it builds, so the testkit's would reach the binaries (ADR-0030) |
+| `just verify` | `check-arch`, `check-structure`, `hakari-check`, `fmt-check`, `deny`, `lint`, `openapi-check`, `db-check`, `test-cov`, `test-doc`, `build`, in that order, which is CI's: the first five compile no member, so they read the workspace before any build script of the change runs. It needs Docker running, for `db-check` and `test-cov`. It is what CI runs, apart from the branch, commit and pull request checks and the tree check |
 
 - `cargo xtask` subcommands: `check-branch [name]`, `check-commit-msg <file>`, `check-commits <range>`, `check-pr <file>`, `check-arch`, `check-structure` and `check-coverage <lcov-file> [workspace-root]`, whose root is this repository unless a test gives another. Each exits 1 with one line per problem on standard error, and 2 on a command line it does not know; `check-coverage` also prints each crate's figure.
-- The database commands of spec §6.14 (`db-*`) join this table with the ticket that creates them.
+- The `db-*` commands that connect (`db-deploy`, `db-status`, `db-seed`, `db-reset`) read their database from `.env`, as `just dev` does, so they act on whatever database it names; `barras-api seed` and `reset` refuse one that is not the local one (ADR-0030). `db-prepare` and `db-check` never use the database of `.env`: each starts a throwaway Postgres of its own, labelled `barras-throwaway=1`.
 
-Git hooks (lefthook, installed by `just setup`; ADR-0018): `pre-commit` runs `just fmt-check`, `just lint`, `just check-arch` and `just check-structure`; `commit-msg` runs `cargo xtask check-commit-msg`; `pre-push` runs `cargo xtask check-branch` and `just verify`, so it needs the network, as `just deny` does, and every tool `just setup` installs. Never bypass them: `--no-verify` is not allowed, and neither is `LEFTHOOK=0`, which turns lefthook off.
+Git hooks (lefthook, installed by `just setup`; ADR-0018): `pre-commit` runs `just fmt-check`, `just lint`, `just check-arch` and `just check-structure`; `commit-msg` runs `cargo xtask check-commit-msg`; `pre-push` runs `cargo xtask check-branch` and `just verify`, so it needs the network, as `just deny` does, Docker running, and every tool `just setup` installs. Never bypass them: `--no-verify` is not allowed, and neither is `LEFTHOOK=0`, which turns lefthook off.
 
 ## Repository layout
 
@@ -86,8 +95,10 @@ deny.toml               cargo-deny: licences, advisories, sources, and the bans 
 justfile                every command
 lefthook.yml            git hooks
 openapi.json            the OpenAPI document, written by `just openapi`: the contract with the app
+compose.yaml            the local Postgres, on 127.0.0.1:5433; the one place that names its image
+sqlx.toml               sqlx-cli's name for the history table, public._sqlx_migrations
 .env.example            every variable the binaries read, with a value for a developer machine
-.cargo/config.toml      the `cargo xtask` alias
+.cargo/config.toml      the `cargo xtask` alias; SQLX_OFFLINE=true for every cargo command
 .config/
   hakari.toml           how cargo-hakari generates crates/workspace-hack
   nextest.toml          the time limit of a test
@@ -102,22 +113,25 @@ crates/
                         shutdown signal, failures told on standard error
   modules/<module>/     one crate per bounded context: domain, ports and use cases
   adapters/
-    postgres/           sqlx repositories and mappers
+    postgres/           sqlx: the pools and their checks, the embedded migrations, seed, reset and the
+                        local-database guard; the repositories and mappers from the first table
     http/               axum: routers, DTOs, extractors, envelope, error mapping, OpenAPI, health,
                         internal port, metrics, server; the test client behind the `testing` feature
     realtime/           websocket gateway
     redis/              pub/sub, cache, rate limiter
     providers/          outbound clients: exchanges, feeds, DANE, Apple, Google, store, model
-  testkit/              test-only helpers: the process helper, the env file reader; containers, fixtures, fakes
+  testkit/              test-only helpers: a Postgres container per test, the process helper, the env file
+                        reader; fixtures, fakes
   workspace-hack/       generated by cargo-hakari: unifies the features of third-party crates; holds no code
   xtask/                repository checks: architecture, structure, coverage, commit and branch names
-migrations/             plain SQL migrations (sqlx)
+migrations/             plain SQL migrations (sqlx), forward-only, embedded in barras-adapter-postgres
 .sqlx/                  offline query metadata, committed
+seeds/                  local development data in SQL files, from BAR-15
 docs/                   the plan: specs, plans, ADRs, standards, schema, analysis, backlog
 ```
 
 - Modules: `identity`, `settings`, `billing`, `capital`, `budgets`, `goals`, `markets`, `news`, `indicators`, `assistant` (spec §6.2).
-- `crates/modules/`, `migrations/` and `.sqlx/` do not exist yet; the first ticket that needs one creates it.
+- `crates/modules/` and `seeds/` do not exist yet: the first module creates the one, and BAR-15, with the demo user, the other.
 
 ## Module anatomy
 
@@ -156,11 +170,13 @@ crates/modules/<module>/        snake_case; plural for collections
 - Every folder directly under `apps/`, `crates/modules/` and `crates/adapters/` that holds a `Cargo.toml`, and `crates/kernel`, `crates/bootstrap`, `crates/testkit`, `crates/workspace-hack` and `crates/xtask`, is listed in `members` (`not-a-member`); a crate in any other folder fails (`unknown-location`) (`check-arch`; ADR-0024).
 - `cargo deny check bans` lets only these crates depend directly on a technology crate; every other crate, apps included, fails, and an app reaches them through its adapter (`deny.toml`; ADR-0024):
   - `sqlx`: `barras-adapter-postgres` and `barras-testkit`.
-  - `axum`: `barras-adapter-http` and `barras-adapter-realtime`, and the third-party `utoipa-axum`.
-  - `axum-core`, `hyper` and `hyper-util`: the HTTP and realtime adapters, and the third-party crates that wrap them (`axum`; `hyper-util` for `hyper`).
+  - `axum`: `barras-adapter-http` and `barras-adapter-realtime`, and the third-party `utoipa-axum` and `tonic`, a crate of the Docker client (below).
+  - `axum-core`, `hyper` and `hyper-util`: the HTTP and realtime adapters, and the third-party crates that wrap them (`axum`; `hyper-util` for `hyper`; the crates of the Docker client).
   - `utoipa-axum`: `barras-adapter-http`.
   - `reqwest`: `barras-adapter-providers`.
   - `redis`: `barras-adapter-redis` and `barras-testkit`.
+  - `testcontainers`: `barras-testkit`. Each crate of the Docker client under it (`bollard`, `bollard-stubs`, `bollard-buildkit-proto`, `tonic`, `tonic-prost`, `hyper-named-pipe`, `hyper-rustls`, `hyper-timeout`, `hyperlocal`) is banned with its parents on that path as its wrappers, so that only the testkit reaches them and no crate reaches `hyper`, `hyper-util` or `axum` through them (ADR-0030).
+  - `astral-tokio-tar`: `testcontainers` alone, which scopes the advisory `deny.toml` ignores (ADR-0030).
 - No crate, an adapter included, depends on `actix-web`, `rocket`, `warp`, `poem`, `salvo`, `tide`, `diesel`, `sea-orm`, `tokio-postgres`, `ureq`, `surf`, `isahc` or `curl`: each would be a second way to do what one adapter owns. A `*` version requirement fails, a path dependency between our crates aside. cargo-deny reads every feature of every member, so a banned crate cannot hide behind an optional dependency (`deny.toml`; ADR-0024).
 - No crate turns on axum's `json`, `query` or `form` feature, nor its `default`, which turns on all three: they bring axum's own `Json`, `Query` and `Form` extractors, whose rejections are not envelopes and quote the caller's input (`[[bans.features]]` in `deny.toml`; ADR-0024, ADR-0029).
 
@@ -170,8 +186,8 @@ crates/modules/<module>/        snake_case; plural for collections
 | `crates/modules/<m>` | `barras-kernel`, the same pure crates and `async-trait`. Never another module, an adapter, axum, sqlx, reqwest, redis, tokio's runtime or serde_json | `check-arch`: normal and build dependencies only from that list and `workspace-hack`; dev dependencies from them plus `tokio`, `mockall`, `insta` (`module-allowlist`, `module-dev-allowlist`); no build script (`no-build-script`) |
 | `crates/adapters/*` | `barras-kernel`, the module crates and its own technology. Never another adapter | `check-arch`: no other adapter (`adapter-isolation`). cargo-deny bans: a technology crate only in its own adapter. Any other library is left to review |
 | `crates/bootstrap` | the start-up the binaries share: configuration, logs, panic hook, runtime, shutdown signal, failures told on standard error. No workspace crate but `workspace-hack` | `check-arch`: no other member (`bootstrap-isolation`); only `apps/*` depend on it, in any kind (`bootstrap-apps-only`). cargo-deny bans: no technology crate. Any other library is left to review (ADR-0026) |
-| `apps/*` | everything. The only place where a concrete adapter meets a port | cargo-deny bans: no direct `sqlx`, `axum`, `axum-core`, `hyper`, `hyper-util`, `utoipa-axum`, `reqwest` or `redis`. `check-arch`: `barras-testkit` only as a dev dependency (`testkit-dev-only`); no crate depends on an app (`apps-are-roots`) |
-| `crates/testkit` | test-only helpers: containers, fixtures, fakes, the process helper | cargo-deny bans: `sqlx` and `redis` allowed directly, the other technology crates not. `check-arch` sets no list; every crate that uses it takes it only as a dev dependency (`testkit-dev-only`) |
+| `apps/*` | everything. The only place where a concrete adapter meets a port | cargo-deny bans: no direct `sqlx`, `axum`, `axum-core`, `hyper`, `hyper-util`, `utoipa-axum`, `reqwest`, `redis` or `testcontainers`. `check-arch`: `barras-testkit` only as a dev dependency (`testkit-dev-only`); no crate depends on an app (`apps-are-roots`) |
+| `crates/testkit` | test-only helpers: containers, fixtures, fakes, the process helper | cargo-deny bans: `sqlx`, `redis` and `testcontainers` allowed directly, the other technology crates not. `check-arch` sets no list; every crate that uses it takes it only as a dev dependency (`testkit-dev-only`) |
 | `crates/workspace-hack` | generated by cargo-hakari: third-party crates and their features, no code | `check-arch`: every dependency from crates.io (`hack-isolation`); one library at `src/lib.rs` holding doc comments at most, at most a `build.rs` holding `fn main() {}`, nothing else (`hack-is-a-stub`). `just hakari-check`: in step with the dependency tree, and changing no release build |
 | `crates/xtask` | no workspace crate | `check-arch`: no member, `workspace-hack` included (`tool-isolation`) |
 
@@ -200,7 +216,7 @@ workspace = true
 - Declare each dependency once, with its version, in `[workspace.dependencies]` of the root `Cargo.toml`, and take it in the crate with `<name>.workspace = true`. Enable only the features you use (spec §6.2, spec §6.12).
 - A workspace crate is declared there too, with its `path`, as in `barras-kernel = { path = "crates/kernel" }`, and taken with `barras-kernel.workspace = true` like any other dependency.
 - After adding a member, or changing a dependency or its features, run `just hakari` and commit what it changes: `crates/workspace-hack/Cargo.toml`, the members' `workspace-hack.workspace = true` lines and `Cargo.lock`. `just hakari-check` fails while the generated crate or a member's line to it would change; `just verify` and CI run it (ADR-0024).
-- Every member that depends on the generated crate takes whatever it holds into its release build. `just hakari-check` fails, naming the crate and the feature, when the generated crate changes what the workspace's release build compiles. When only tests ask for that feature, the crate joins `third-party` under `[traversal-excludes]` in `.config/hakari.toml`, never `[final-excludes]`; then run `just hakari`. Only hakari writes `crates/workspace-hack/Cargo.toml`, its `[lints.cargo]` table aside (ADR-0024).
+- Every member that depends on the generated crate takes whatever it holds into its release build. `just hakari-check` fails, naming the crate and the feature, when the generated crate changes what the release build of `just build` compiles. When only tests ask for that feature, the crate joins `third-party` under `[traversal-excludes]` in `.config/hakari.toml`, never `[final-excludes]`; then run `just hakari`. Only hakari writes `crates/workspace-hack/Cargo.toml`, its `[lints.cargo]` table aside (ADR-0024).
 - `barras-testkit` and `xtask` are left out of hakari's traversal (`workspace-members` under `[traversal-excludes]`): they take no line to the generated crate, and their dependencies never shape it (ADR-0024).
 - A new member that depends on the generated crate names it once, in `lib.rs`, or in `main.rs` when it has no library. Without that line, cargo can report it as a dependency no code uses, which fails `just lint` (ADR-0024):
 
@@ -233,7 +249,8 @@ use workspace_hack as _;
 - Money and any integer above 2^53 travel as strings (ADR-0005, ADR-0008).
 - Every answer the application gives on the public port carries `x-request-id`: the caller's when it is 1 to 64 characters of `A-Z a-z 0-9 . _ -`, a new UUID v7 otherwise. hyper answers a request head it cannot read itself (400, 414 or 431), with an empty body: no envelope, no request id, nothing logged or counted (ADR-0029).
 - A request body is a JSON object, sent as `application/json`, of at most 1 MiB. An answer of 1 KiB or more is compressed with gzip or brotli when `Accept-Encoding` allows (ADR-0029).
-- The HTTP adapter's own codes, besides those of the module errors (ADR-0029):
+- A request has 5 seconds from its arrival to the head of its answer, the reading of its body included; then its handler is dropped. A body that streams out after the head is not limited. The layer sits inside the request log, the request id, the metrics and the safety net, and outside compression, the panic handler and the body limit (ADR-0031).
+- The HTTP adapter's own codes, besides those of the module errors (ADR-0029, ADR-0031). All but `VALIDATION_FAILED` and `SERVICE_UNAVAILABLE` are the nine codes any route can return, listed once in `openapi.json` as `x-common-error-codes`:
 
 | `error.code` | Status | When |
 | --- | --- | --- |
@@ -244,14 +261,16 @@ use workspace_hack as _;
 | `NOT_ACCEPTABLE` | 406 | `Accept-Encoding` refuses every encoding, the plain body included |
 | `ROUTE_NOT_FOUND` | 404 | No route matches the path |
 | `METHOD_NOT_ALLOWED` | 405 | The path exists, the method does not |
+| `REQUEST_BODY_TIMEOUT` | 408 | At the 5 seconds, the handler was waiting for more of a body the client had not finished sending. The answer carries `connection: close`, and logs no `request failed` |
+| `REQUEST_TIMEOUT` | 503 | No answer had started within the 5 seconds, and the handler was not waiting for the client's body: it had none, had read it all, or never read it or stopped reading it |
 | `SERVICE_UNAVAILABLE` | 503 | `GET /api/v1/health` with a critical probe failing |
 | `INTERNAL_ERROR` | 500 | A handler panicked |
 
 - `openapi.json` is generated from the code and committed with the change: run `just openapi` after any route change, or `just openapi-check` fails. It is the contract with the app, from BAR-5 including the realtime event names and payloads (ADR-0002, ADR-0028).
-- Add a route only with `ApiRouter::route(routes!(handler), access, codes)`: its `#[utoipa::path]` handlers, an `Access` value with the permission and the plan feature it needs (`Access::public()` for none), and its own error codes, without the seven codes every route can return (`x-common-error-codes`). The HTTP adapter's crate doc shows one (ADR-0028).
+- Add a route only with `ApiRouter::route(routes!(handler), access, codes)`: its `#[utoipa::path]` handlers, an `Access` value with the permission and the plan feature it needs (`Access::public()` for none), and its own error codes, without the nine codes every route can return (`x-common-error-codes`). The HTTP adapter's crate doc shows one (ADR-0028, ADR-0031).
 - Only `ApiRouter::route` adds a route to the public API: `ApiRouter`'s fields are private, and `undocumented_route`, which serves a route the document lacks, exists only behind the adapter's `testing` feature. The gap left: `route` takes the tuple `routes!` makes, and a tuple built by hand can serve a method its document lacks, which only `TestClient`'s route guard sees, on a request a test sends (ADR-0028).
 - The handler's `#[utoipa::path]` has one tag, a summary (the first line of its doc comment), a description on every response, `SuccessEnvelope<T>` on its 2xx and `ErrorEnvelope` on every error status it can return. `metadata_problems`, run by an e2e test, fails an operation that lacks one or has more than one tag, and an operationId used twice (ADR-0017, ADR-0028).
-- `TestClient` fails a test when a documented route answers an error envelope whose `error.code` neither its `x-error-codes` nor `x-common-error-codes` lists, or whose status its operation does not document (as itself, as its range such as `4XX`, or with `default`), the statuses of the common codes aside: 400, 404, 405, 406, 413, 415 and 500 (ADR-0028).
+- `TestClient` fails a test when a documented route answers an error envelope whose `error.code` neither its `x-error-codes` nor `x-common-error-codes` lists, or whose status its operation does not document (as itself, as its range such as `4XX`, or with `default`), unless the answer is a common code at the status the adapter gives it: `INTERNAL_ERROR` 500, `MALFORMED_REQUEST` 400, `METHOD_NOT_ALLOWED` 405, `NOT_ACCEPTABLE` 406, `PAYLOAD_TOO_LARGE` 413, `REQUEST_BODY_TIMEOUT` 408, `REQUEST_TIMEOUT` 503, `ROUTE_NOT_FOUND` 404 or `UNSUPPORTED_MEDIA_TYPE` 415. So a route's own code at one of those statuses, such as a module error of kind `Unavailable` at 503, needs its status documented (ADR-0028, ADR-0031).
 - A schema name is registered once: when two modules have a type of the same name, one takes `#[schema(as = …)]`. The app refuses to build with a route the document cannot describe (ADR-0028).
 
 ### Errors
@@ -285,17 +304,26 @@ use workspace_hack as _;
 - Refresh tokens rotate on every use and are stored hashed. Reuse of an old one revokes the session. No cookies, no CSRF (ADR-0009).
 - The access token carries the role and the plan's entitlements; no request reads the database to authorise. When a plan changes, the server sends a realtime event and the app refreshes its token (ADR-0010).
 - A new user starts on Lite. Entitlements can carry an expiry, so a Pro trial ends on its own (ADR-0010).
-- Permissions are a catalog in code, seeded into `permissions` and granted to roles through `role_permissions`. Each route declares the permission and the plan feature it needs, through its `Access` value (ADR-0010, ADR-0028).
+- Permissions are a catalog in code, written into `permissions` by code or a migration, never by a seed file (ADR-0030), and granted to roles through `role_permissions`. Each route declares the permission and the plan feature it needs, through its `Access` value (ADR-0010, ADR-0028).
 - The server is the only authority on what a user may use. Pro is bought through the stores; store events arrive by webhook and are stored idempotently in `subscription_events` (ADR-0010, ADR-0023).
 
 ### Data access
 
 - sqlx 0.9 with hand-written SQL, checked at compile time in offline mode. No ORM. Commit the offline query metadata in `.sqlx/` (ADR-0007).
-- Two pools: primary for writes and for reads that follow a write; a read pool for read models (a replica when one exists) (ADR-0007).
+- A query is a compile-time checked macro: `query!`, `query_as!` or `query_scalar!`. Only SQL the compiler cannot see takes a string at run time, marked with sqlx's `AssertSqlSafe`: a seed file, and the statements that drop and create a database (ADR-0030).
+- Every cargo command compiles offline, with `SQLX_OFFLINE=true` from `.cargo/config.toml`, or from the postgres adapter's build script when it is unset: no build connects to a database (ADR-0030).
+- After changing a query or adding a migration, run `just db-prepare` and commit what it changes in `.sqlx/`. `just db-check` fails until then, in `just verify` and in CI (ADR-0030).
+- Two pools: primary for writes and for reads that follow a write; a read pool for read models (a replica when one exists) (ADR-0007). They are built without connecting. Each opens at most `API_DATABASE_POOL_SIZE` connections and keeps none while idle, gives up getting one after 2 seconds, and gives each statement 5 seconds (`statement_timeout`). When the two URLs are the same, one pool serves both roles (ADR-0030).
 - Read models aggregate in SQL. Lists use cursor pagination, never `OFFSET`, with at most 50 items per page (ADR-0007).
 - Each repository has an explicit mapper in both directions (ADR-0007).
-- The schema changes only through migrations in `migrations/` (ADR-0007). Every non-hidden entry in `migrations/` must be named `YYYYMMDDHHMMSS_snake_case.sql` (`check-structure`).
+- SQL names the schema of every table it touches (`barras.users`): no query depends on a connection's `search_path` (ADR-0030).
+- The schema changes only through migrations in `migrations/` (ADR-0007). Every non-hidden entry in `migrations/` must be named `YYYYMMDDHHMMSS_snake_case.sql`, and no two may share a version (`check-structure`). `just db-migrate <name>` creates one.
+- Migrations are forward-only: no script undoes one. Fix a mistake with a new migration, and never edit one that has been merged: `barras-api migrate`, the deploy step, applies nothing when its history holds a migration changed since it ran, missing from the binary, or recorded as failed. A change that would break the running code goes in two releases: expand, adding the new shape and keeping the old, then contract, removing the old (ADR-0030).
+- A migration that cannot run inside a transaction, such as `CREATE INDEX CONCURRENTLY`, starts with sqlx's `-- no-transaction` line and a comment that says why (ADR-0030).
+- sqlx's history table is `public._sqlx_migrations`, named in the postgres adapter's `migrate.rs` and, for sqlx-cli, in `sqlx.toml`; a test fails when the two differ (ADR-0030).
 - SQL that looks odd (a partial index, a CHECK) carries a comment that says why (ADR-0007).
+- Seeds are local development data, such as the demo user: SQL files in `seeds/`, named like migrations, no two sharing a version (`check-structure`). `barras-api seed` and `reset` apply them in name order, in one transaction, only when `APP_ENV` is `local` and the database is the local one. A seed never ends that transaction with `COMMIT` or `ROLLBACK`: the run fails naming it, and what it did may stay (ADR-0030).
+- Reference data that every environment needs, such as the role `trader`, the permission catalog, the plans and the currencies, never goes in a seed: it comes in a migration or from its module's code, since seeds never reach production (ADR-0030).
 - Money is `rust_decimal::Decimal` in Rust and `numeric` in Postgres, always with its currency. Fiat uses `numeric(20,2)`; quantities use `numeric(38,18)` (ADR-0008).
 - Timestamps are `timestamptz` in UTC. The user's time zone applies only when presenting or grouping, such as a budget's month (ADR-0008).
 - Ids are UUID version 7 (ADR-0008).
@@ -324,15 +352,19 @@ use workspace_hack as _;
 - `tracing` with JSON output in every deployed environment. Log at boundaries and on failure (ADR-0015).
 - `APP_ENV=local` writes readable lines; any other value writes one JSON object per line with exactly the keys `timestamp` (RFC 3339, UTC), `level`, `target`, `fields` (the event's fields, `message` included) and, inside a span, `spans`. Whatever an event or a span records stays inside `fields` or `spans` (ADR-0026).
 - Every event has a message, as in `tracing::info!(%addr, "listening")`: the process tests read `fields.message` of each line.
+- sqlx's event for each statement has none, so the pools turn it off. A statement slower than 250 ms is logged at `warn`, target `sqlx::query`, with its SQL and its duration, never a value bound to it (ADR-0030).
 - Never log credentials, tokens or request bodies (ADR-0015). The request log records the method, the route template (or `unmatched`), the request id, the status and the duration, never a header, the query string or the body (ADR-0029).
 - A 5xx logs one `error` event, `request failed`, with its code, status and detail; a handler panic also logs the panic hook's event (ADR-0026, ADR-0029).
 - A panic message never formats a value the caller sent: every panic is logged with its payload, by the panic hook and, for a handler's, in the detail of `request failed` (ADR-0026, ADR-0029).
-- `GET /api/v1/health` (ready: `ok`, `degraded`, or 503) and `GET /api/v1/health/live` are public and never name a dependency. Every probe runs at once, with 2 seconds to answer (ADR-0015, ADR-0029).
+- `GET /api/v1/health` (ready: `ok`, `degraded`, or 503) and `GET /api/v1/health/live` are public and never name a dependency. Every probe runs at once, with 2 seconds to answer (ADR-0015, ADR-0029). Readiness requests share one run of the probes, on both ports, and the reports of a run that ended less than a second ago are given again (ADR-0031). `barras-api` has a critical probe per pool, `postgres` and `postgres-read`, or `postgres` alone when one pool serves both roles (ADR-0030).
+- A probe's error is one sentence of a fixed set, such as `no connection within 2 seconds` or `the server refused it with SQLSTATE 28P01`: never a URL, a user name, a password, or a driver's or a server's text (ADR-0031).
 - Per-dependency detail and Prometheus metrics are only on an internal port: `GET /health` and `GET /metrics`, with no `/api/v1` prefix, no envelope and none of the public middleware, and not in `openapi.json` (ADR-0015, ADR-0029).
 - The metrics live in a registry the composition root creates and hands over; nothing is global. A label takes bounded values: the route template, never the path (ADR-0029).
 - Each binary loads one typed configuration from the environment at start and refuses to boot when a variable is missing or not valid. It prints one line per problem to standard error, all at once, naming the variable and what is expected and never the value, and exits non-zero before it opens a socket (ADR-0016, ADR-0026).
 - Every variable is required; there is no default in code. An empty value counts as missing (BAR-3 spec §8.1).
-- The variables: `APP_ENV` (`local`, `staging` or `production`) and `LOG_LEVEL` (`trace`, `debug`, `info`, `warn` or `error`), read by both binaries; `API_BIND_ADDR` and `API_INTERNAL_BIND_ADDR`, read by `barras-api`; `INGEST_INTERNAL_BIND_ADDR`, read by `barras-ingest`.
+- The variables: `APP_ENV` (`local`, `staging` or `production`) and `LOG_LEVEL` (`trace`, `debug`, `info`, `warn` or `error`), read by both binaries; `API_BIND_ADDR`, `API_INTERNAL_BIND_ADDR`, `API_DATABASE_URL`, `API_DATABASE_READ_URL` (the primary's URL when there is no replica) and `API_DATABASE_POOL_SIZE`, read by `barras-api`; `INGEST_INTERNAL_BIND_ADDR`, read by `barras-ingest`. `barras-api migrate` reads only `API_DATABASE_URL`, and `seed` and `reset` only `APP_ENV` and `API_DATABASE_URL` (ADR-0030).
+- Every variable that holds a credential is a `Secret<T>` of `barras-bootstrap`: `Debug` and `Display` print `[redacted]`, it implements no `Serialize`, and only `expose()` reaches the value. So a configuration that derives `Debug` shows no password (ADR-0016).
+- A database URL is a `postgres://` or `postgresql://` URL that names its host, port, user, password and database, one host and no IPv6 address in brackets, with no query string. Any other is refused at start, by its variable's name. So no part of it comes from the `PG*` variables or `~/.pgpass`. sqlx still reads those variables itself for the settings no URL of ours carries, such as `PGSSLMODE`, so no environment of ours sets one (ADR-0030).
 - Every variable is listed in `.env.example`, with a value that works on a developer machine (ADR-0016). The e2e tests check it both ways: each binary's variables are in the file, and each variable in the file is read by `barras-api` or starts with `INGEST_`, and is read by `barras-ingest` or starts with `API_`. So a variable that one binary alone reads takes its prefix. A value holds only letters, digits and `. _ : / @ % + , = [ ] -`, which a shell and a dotenv loader read the same way (`env_file` in `barras-testkit`).
 - Only `Environment::from_process` of `barras-bootstrap` reads the environment of a binary (ADR-0016, ADR-0026). clippy denies `std::env::var`, `std::env::var_os`, `std::env::vars` and `std::env::vars_os` (`clippy.toml`); that function carries one `#[allow]`. The other is the test-support exception: the testkit's process helper reads `LLVM_PROFILE_FILE` and passes it to each binary it starts, so that the binary's coverage is measured (`crates/testkit/src/process.rs`; ADR-0027). Review covers the rest, such as a library that reads a variable itself: `build_runtime` of `barras-bootstrap` gives tokio its worker count, so it never reads `TOKIO_WORKER_THREADS` (ADR-0029).
 - After SIGTERM or Ctrl-C a binary stops accepting connections, gives the requests in flight at most 10 seconds, and exits 0 (ADR-0029).
@@ -352,8 +384,12 @@ A change is done only when the same pull request contains (ADR-0017):
 
 - A test target's file name decides its tier, so a new test has nothing to register (ADR-0027):
   - `tests/e2e_*.rs` drives a whole binary: its app in-process with the HTTP adapter's `TestClient`, or its real process with the testkit's `BinaryCommand`.
-  - `tests/int_*.rs` drives one adapter against a real outside system (from BAR-4).
-  - `just test` runs every other test; `just test-int` runs the `e2e_` and `int_` targets.
+  - `tests/int_*.rs` drives one adapter against a real outside system: from BAR-4, a throwaway Postgres container.
+  - `just test` runs every other test, with no Docker; `just test-int` runs the `e2e_` and `int_` targets. `just test-int` and `just test-cov`, and so `just verify` and the `pre-push` hook, need Docker running (ADR-0027, ADR-0030).
+- A test that needs a database starts its own container with the testkit's `PostgresContainer::start()`: the image of `compose.yaml`, `fsync` off, its port on `127.0.0.1` alone, and an empty database `barras` that no other test touches. The test applies the migrations it needs (ADR-0030).
+- The container is removed when the value is dropped, a panic included, and when the test is stopped with SIGTERM or SIGINT. Only SIGKILL leaves one behind, which the label `barras-test=1` finds (ADR-0030).
+- Docker not running fails the test; no test skips itself (ADR-0030).
+- No test reaches the local database: every URL a test uses comes from a container it started, the testkit reads no environment variable but the coverage profile its process helper hands on, and the process tests hand each binary its whole environment (ADR-0030).
 - An adapter's tests that need its `testing` feature live in `src/tests/`, declared `#[cfg(test)] mod tests;`: under `tests/` they would need a dependency of the adapter on itself (ADR-0027).
 - A test still running after two minutes is killed and fails under its own name (`.config/nextest.toml`).
 

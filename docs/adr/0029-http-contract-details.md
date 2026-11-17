@@ -86,3 +86,4 @@ Date: 2026-11-16
 - The guard on the keys of `error.fields`, like the route guard, lives in `TestClient`, so it holds only for what the tests send; review covers the rest (ADR-0028).
 - A tracing layer that reads the level of spans, such as an OpenTelemetry one, will see every request span as an error.
 - A request still running 10 seconds after the signal is cut off with its connection.
+- Pointer: ADR-0031 limits a request to 5 seconds, with two codes of the adapter, `REQUEST_TIMEOUT` (503) and `REQUEST_BODY_TIMEOUT` (408), which join the table above and the common codes; its layer sits between the safety net and compression. Readiness requests share one run of the probes, on both ports, whose reports are given again for a second, and each probe's error is a sentence of a fixed set.

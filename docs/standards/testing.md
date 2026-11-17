@@ -1,8 +1,8 @@
 # Testing
 
-Source: [ADR-0017](../adr/0017-definition-of-done.md) and [ADR-0027](../adr/0027-test-tiers-and-coverage.md). Change the ADR and this file in the same pull request; if they disagree, the ADR wins.
+Source: [ADR-0017](../adr/0017-definition-of-done.md), [ADR-0027](../adr/0027-test-tiers-and-coverage.md) and [ADR-0030](../adr/0030-database-foundation.md). Change the ADR and this file in the same pull request; if they disagree, the ADR wins.
 
-This restates the foundation design, sections 9 and 6.14, and the BAR-3 spec, section 9.
+This restates the foundation design, sections 9 and 6.14, the BAR-3 spec, section 9, and the BAR-4 spec, section 11.
 
 ## Tests per layer
 
@@ -22,13 +22,23 @@ A test target's file name decides its tier, so a new test has nothing to registe
 | Tier | Where | Runs in | Needs |
 | --- | --- | --- | --- |
 | Unit and in-process | `#[cfg(test)]` modules, and every test target under `tests/` not named below | `just test` | Nothing outside the process |
-| e2e | `tests/e2e_*.rs`: a whole binary, its app in-process through the HTTP adapter's `TestClient`, or its real process through the testkit's `BinaryCommand` | `just test-int` | From BAR-4, Docker |
-| int | `tests/int_*.rs`: one adapter against a real outside system, from BAR-4 | `just test-int` | Docker, in throwaway Postgres 18 and Redis 8 containers |
+| e2e | `tests/e2e_*.rs`: a whole binary, its app in-process through the HTTP adapter's `TestClient`, or its real process through the testkit's `BinaryCommand` | `just test-int` | Docker, for the process tests that give the binary a database |
+| int | `tests/int_*.rs`: one adapter against a real outside system | `just test-int` | Docker: a throwaway Postgres 18 container per test; Redis 8 from BAR-5 |
 
-- `just test` runs the doctests after the tests; nextest does not run them.
+- `just test` runs the doctests after the tests; nextest does not run them. It needs no Docker.
 - `just test-cov` runs every test of both tiers once, under coverage, then the thresholds. `just verify` and CI run it, and the doctests apart.
+- `just test-int` and `just test-cov`, and so `just verify` and the `pre-push` hook, need Docker running.
 - An adapter's tests that need its `testing` feature live in `src/tests/`, declared `#[cfg(test)] mod tests;`. Under `tests/` they would need a dependency of the adapter on itself, which `check-arch` refuses.
 - A test still running after 30 seconds is reported as slow; after two minutes it is killed and fails under its own name (`.config/nextest.toml`).
+
+## Containers
+
+- A test that needs a database starts its own container with `PostgresContainer::start()` of `barras-testkit`: Postgres 18 from the image of the `postgres` service of `compose.yaml`, with `fsync` off, since its data never outlives it, the `cluster_name` of the local database, its port published on `127.0.0.1` alone, and an empty database `barras` that no other test touches. The test applies the migrations it needs, and reaches the database through `url()`.
+- One container per test, never one shared: nextest runs every test in a process of its own, and a container held in a `static` would never be removed.
+- Dropping the container removes it, also while a failed test unwinds; it must be dropped inside the tokio runtime that started it. testcontainers' `watchdog` removes it when the test is stopped with SIGTERM, as nextest does at its time limit, or with SIGINT. Only SIGKILL leaves one behind: the label `barras-test=1` finds it, and `barras-throwaway=1` the throwaway database of `just db-prepare` and `just db-check`.
+- Docker not running fails the test with a sentence that says so. No test skips itself: that would hide a failure.
+- No test reaches the local database. Every URL a test uses comes from a container it started; the testkit reads no environment variable, apart from the coverage profile its process helper hands on; and the process tests hand each binary its whole environment.
+- `LoopbackRelay` of the testkit reaches a container through a port of `127.0.0.1`, as `ssh -L` would, and `PostgresContainer::start_as_another_server()` starts one without the local `cluster_name`. Together they stand for a server on another machine behind a port of this one, which `seed` and `reset` must refuse.
 
 ## Coverage
 

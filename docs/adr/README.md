@@ -37,3 +37,5 @@ When something is not covered: if the decision for an area does not exist, stop 
 | [0027](0027-test-tiers-and-coverage.md) | Test tiers and coverage | Accepted |
 | [0028](0028-openapi-pipeline.md) | The OpenAPI pipeline | Accepted |
 | [0029](0029-http-contract-details.md) | Details of the HTTP contract | Accepted |
+| [0030](0030-database-foundation.md) | Database foundation | Accepted |
+| [0031](0031-request-timeout-and-shared-readiness.md) | Request timeout and shared readiness | Accepted |
