@@ -1,13 +1,16 @@
 //! The contract `barras-api` publishes (spec §7, §8.1): every operation of its OpenAPI document
 //! carries the metadata of spec §7.2; the committed `openapi.json` is the document the code
-//! generates, byte for byte; `.env.example` holds a configuration the binary accepts.
+//! generates, byte for byte; `.env.example` holds a configuration the binary accepts, to serve
+//! and to run each database command.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration test crate: every item is test code
 
 use std::fs;
 
 use barras_adapter_http::metadata_problems;
 use barras_adapter_postgres::Pools;
-use barras_api::{ApiConfig, Dependencies, build_app, openapi_json};
+use barras_api::{
+    ApiConfig, Dependencies, LocalDatabaseConfig, MigrateConfig, build_app, openapi_json,
+};
 use barras_bootstrap::{AppEnv, Environment, LogLevel};
 use barras_testkit::{env_file, repository_file};
 
@@ -50,6 +53,16 @@ async fn the_configuration_loads_from_the_values_of_env_example() {
         config.database_pool_size,
     );
     assert!(pools.read_is_primary());
+}
+
+#[test]
+fn each_database_command_loads_its_configuration_from_the_values_of_env_example() {
+    let variables = || Environment::from_pairs(env_file(repository_file(".env.example")));
+
+    MigrateConfig::from_env(variables()).unwrap();
+    let local = LocalDatabaseConfig::from_env(variables()).unwrap();
+
+    assert_eq!(local.env, AppEnv::Local);
 }
 
 #[test]

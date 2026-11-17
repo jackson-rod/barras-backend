@@ -1,4 +1,6 @@
-//! The configuration of `barras-api`, read from the environment once, at start (spec §8.1).
+//! The configuration of `barras-api`, read from the environment once, at start (spec §8.1):
+//! the whole of it to serve, and to run a database command only the variables that command
+//! uses (BAR-4 spec §4.2).
 
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
@@ -65,6 +67,51 @@ impl ApiConfig {
                 database_url: database_url?,
                 database_read_url: database_read_url?,
                 database_pool_size: database_pool_size?,
+            })
+        })();
+        env.finish(config)
+    }
+}
+
+/// What `barras-api migrate` reads: the primary database alone, so that a deploy step needs no
+/// other setting.
+#[derive(Debug)]
+pub struct MigrateConfig {
+    pub database_url: Secret<DatabaseUrlValue>,
+}
+
+impl MigrateConfig {
+    /// Every variable the configuration reads.
+    pub const VARIABLES: &[&str] = &[API_DATABASE_URL];
+
+    /// The configuration `env` holds, or the problem with its one variable.
+    pub fn from_env(mut env: Environment) -> Result<Self, ConfigError> {
+        let database_url = env.required(API_DATABASE_URL);
+        let config = database_url.map(|database_url| Self { database_url });
+        env.finish(config)
+    }
+}
+
+/// What `barras-api seed` and `barras-api reset` read: where the binary runs, since both change
+/// only a local database, and the database.
+#[derive(Debug)]
+pub struct LocalDatabaseConfig {
+    pub env: AppEnv,
+    pub database_url: Secret<DatabaseUrlValue>,
+}
+
+impl LocalDatabaseConfig {
+    /// Every variable the configuration reads, in the order it reads them.
+    pub const VARIABLES: &[&str] = &[APP_ENV, API_DATABASE_URL];
+
+    /// The configuration `env` holds, or every variable that is missing or not valid, at once.
+    pub fn from_env(mut env: Environment) -> Result<Self, ConfigError> {
+        let app_env = env.required(APP_ENV);
+        let database_url = env.required(API_DATABASE_URL);
+        let config = (|| {
+            Some(Self {
+                env: app_env?,
+                database_url: database_url?,
             })
         })();
         env.finish(config)
@@ -255,6 +302,89 @@ mod tests {
                 DatabaseUrlValue::from_env_value(&accepted).is_some(),
                 "{accepted}"
             );
+        }
+    }
+
+    #[test]
+    fn migrate_reads_the_database_url_alone() {
+        // Every other variable of the configuration is set, and none is valid.
+        let url = database_url("127.0.0.1:5433");
+        let mut pairs: Vec<(&str, &str)> = ApiConfig::VARIABLES
+            .iter()
+            .map(|&name| (name, "not-valid"))
+            .collect();
+        pairs.push(("API_DATABASE_URL", &url));
+
+        let config = MigrateConfig::from_env(Environment::from_pairs(pairs));
+
+        assert!(config.is_ok(), "{:?}", config.err());
+        assert_eq!(MigrateConfig::VARIABLES, ["API_DATABASE_URL"]);
+    }
+
+    #[test]
+    fn migrate_names_its_variable_when_it_is_missing_or_not_valid() {
+        let missing = Environment::from_pairs(std::iter::empty::<(&str, &str)>());
+        let not_valid = Environment::from_pairs([("API_DATABASE_URL", database_url("127.0.0.1"))]);
+
+        let missing = MigrateConfig::from_env(missing).unwrap_err();
+        let not_valid = MigrateConfig::from_env(not_valid).unwrap_err();
+
+        assert_eq!(
+            summary(&missing),
+            [("API_DATABASE_URL", ProblemKind::Missing)]
+        );
+        assert_eq!(
+            summary(&not_valid),
+            [("API_DATABASE_URL", ProblemKind::Invalid)]
+        );
+        assert!(!format!("{not_valid} {not_valid:?}").contains("hunter2"));
+    }
+
+    #[test]
+    fn seed_and_reset_read_where_the_binary_runs_and_the_database_url_alone() {
+        let url = database_url("127.0.0.1:5433");
+        let mut pairs: Vec<(&str, &str)> = ApiConfig::VARIABLES
+            .iter()
+            .map(|&name| (name, "not-valid"))
+            .collect();
+        pairs.extend([("APP_ENV", "staging"), ("API_DATABASE_URL", &url)]);
+
+        let config = LocalDatabaseConfig::from_env(Environment::from_pairs(pairs)).unwrap();
+
+        assert_eq!(config.env, AppEnv::Staging);
+        assert_eq!(
+            LocalDatabaseConfig::VARIABLES,
+            ["APP_ENV", "API_DATABASE_URL"]
+        );
+        assert_eq!(
+            format!("{config:?}"),
+            "LocalDatabaseConfig { env: Staging, database_url: [redacted] }"
+        );
+    }
+
+    #[test]
+    fn seed_and_reset_name_both_their_variables_at_once() {
+        let env = Environment::from_pairs(std::iter::empty::<(&str, &str)>());
+
+        let error = LocalDatabaseConfig::from_env(env).unwrap_err();
+
+        assert_eq!(
+            summary(&error),
+            [
+                ("APP_ENV", ProblemKind::Missing),
+                ("API_DATABASE_URL", ProblemKind::Missing),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_variable_a_command_reads_is_one_the_server_reads() {
+        // So `.env.example`, which holds every variable the server reads, holds them too.
+        for name in MigrateConfig::VARIABLES
+            .iter()
+            .chain(LocalDatabaseConfig::VARIABLES)
+        {
+            assert!(ApiConfig::VARIABLES.contains(name), "{name}");
         }
     }
 

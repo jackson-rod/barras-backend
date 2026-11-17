@@ -1,12 +1,13 @@
-//! `barras-api`: the public API under `/api/v1` and its internal port, in one process. This is
-//! the composition root; `main.rs` only hands it the command line, so the tests reach the same
-//! code as the binary.
+//! `barras-api`: the public API under `/api/v1` and its internal port, in one process, and the
+//! commands that migrate, seed and rebuild its database. This is the composition root; `main.rs`
+//! only hands it the command line, so the tests reach the same code as the binary.
 
 // Taken for its features, not code; named so that cargo never reports it as an unused dependency.
 use workspace_hack as _;
 
 pub mod cli;
 mod config;
+mod database_commands;
 
 use std::error::Error;
 use std::fmt;
@@ -20,7 +21,7 @@ use barras_adapter_http::{
 use barras_adapter_postgres::Pools;
 use barras_bootstrap::{LoggingError, ShutdownSignal, init_logging, install_panic_hook};
 
-pub use config::{ApiConfig, DatabaseUrlValue};
+pub use config::{ApiConfig, DatabaseUrlValue, LocalDatabaseConfig, MigrateConfig};
 
 /// The binary as it names itself in its metrics, on its internal port and to Postgres.
 const SERVICE: ServiceInfo = ServiceInfo {

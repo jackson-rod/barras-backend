@@ -1,20 +1,26 @@
 //! The command line of `barras-api`. With no argument it serves; `openapi` prints the OpenAPI
 //! document and `openapi --check <file>` compares a file with it, both without reading the
-//! environment or opening a socket. Neither starts the logs, so each says on standard error
-//! what failed, as serving does until its logs are up.
+//! environment or opening a socket; `migrate`, `seed <folder>` and `reset <folder>` are the
+//! database commands. None but serving starts the logs, so each says on standard error what
+//! failed, as serving does until its logs are up.
 
 use std::fs;
 use std::io::{self, Write};
+use std::path::Path;
 use std::process::ExitCode;
 
 use barras_bootstrap::{Environment, build_runtime, report_failure, report_usage, with_sources};
 
+use crate::database_commands;
 use crate::{ApiConfig, RunError, openapi_json, run};
 
 const USAGE: &str = "\
 usage: barras-api                          serve the API, configured by the environment
        barras-api openapi                  print the OpenAPI document
-       barras-api openapi --check <file>   fail unless <file> holds the document the code generates";
+       barras-api openapi --check <file>   fail unless <file> holds the document the code generates
+       barras-api migrate                  apply the pending migrations to API_DATABASE_URL
+       barras-api seed <folder>            load the seed files of <folder> into the local database
+       barras-api reset <folder>           rebuild the local database: drop, create, migrate, seed";
 
 /// What the arguments ask for.
 #[derive(Debug, PartialEq, Eq)]
@@ -22,6 +28,9 @@ enum Command<'a> {
     Serve,
     PrintOpenApi,
     CheckOpenApi(&'a str),
+    Migrate,
+    Seed(&'a str),
+    Reset(&'a str),
     Usage,
 }
 
@@ -31,6 +40,9 @@ impl<'a> Command<'a> {
             [] => Self::Serve,
             ["openapi"] => Self::PrintOpenApi,
             ["openapi", "--check", file] => Self::CheckOpenApi(file),
+            ["migrate"] => Self::Migrate,
+            ["seed", folder] => Self::Seed(folder),
+            ["reset", folder] => Self::Reset(folder),
             _ => Self::Usage,
         }
     }
@@ -42,6 +54,9 @@ pub fn main_with_args(args: &[String]) -> ExitCode {
         Command::Serve => serve(),
         Command::PrintOpenApi => print_openapi(),
         Command::CheckOpenApi(file) => check_openapi(file),
+        Command::Migrate => database_commands::migrate(),
+        Command::Seed(folder) => database_commands::seed(Path::new(folder)),
+        Command::Reset(folder) => database_commands::reset(Path::new(folder)),
         Command::Usage => report_usage(&USAGE),
     }
 }
@@ -129,6 +144,17 @@ mod tests {
     }
 
     #[test]
+    fn migrate_seed_and_reset_are_the_database_commands() {
+        let migrate = args(&["migrate"]);
+        let seed = args(&["seed", "seeds"]);
+        let reset = args(&["reset", "fixtures/seeds"]);
+
+        assert_eq!(Command::parse(&migrate), Command::Migrate);
+        assert_eq!(Command::parse(&seed), Command::Seed("seeds"));
+        assert_eq!(Command::parse(&reset), Command::Reset("fixtures/seeds"));
+    }
+
+    #[test]
     fn any_other_command_line_is_answered_with_the_usage() {
         for words in [
             &["serve"][..],
@@ -138,8 +164,38 @@ mod tests {
             &["openapi", "--check", "openapi.json", "extra"],
             &["--check", "openapi.json", "openapi"],
             &["OPENAPI"],
+            &["migrate", "now"],
+            &["seed"],
+            &["seed", "seeds", "more-seeds"],
+            &["reset"],
+            &["reset", "seeds", "--force"],
+            &["seeds", "seed"],
+            &["Migrate"],
         ] {
             assert_eq!(Command::parse(&args(words)), Command::Usage, "{words:?}");
         }
+    }
+
+    #[test]
+    fn the_usage_names_every_command_line_it_knows() {
+        let forms: Vec<&str> = USAGE
+            .lines()
+            .map(|line| {
+                let line = line.trim_start_matches("usage:").trim_start();
+                line.split("   ").next().unwrap().trim()
+            })
+            .collect();
+
+        assert_eq!(
+            forms,
+            [
+                "barras-api",
+                "barras-api openapi",
+                "barras-api openapi --check <file>",
+                "barras-api migrate",
+                "barras-api seed <folder>",
+                "barras-api reset <folder>",
+            ]
+        );
     }
 }

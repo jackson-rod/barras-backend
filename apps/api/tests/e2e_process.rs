@@ -349,8 +349,9 @@ fn an_address_already_taken_stops_the_binary_and_the_log_says_why() {
 
 #[test]
 fn a_closed_standard_error_does_not_turn_a_failure_into_a_panic() {
-    // The configuration's problems, then the usage, each with nowhere to go.
-    for (args, status) in [(&[][..], 1), (&["--help"][..], 2)] {
+    // The configuration's problems, a database command's, then the usage, each with nowhere to
+    // go.
+    for (args, status) in [(&[][..], 1), (&["migrate"][..], 1), (&["--help"][..], 2)] {
         let output = args
             .iter()
             .fold(BinaryCommand::new(BINARY), |command, arg| command.arg(arg))
@@ -477,7 +478,13 @@ fn openapi_check_passes_on_the_committed_file() {
 
 #[test]
 fn a_command_line_it_does_not_know_prints_the_usage_and_exits_with_status_2() {
-    for args in [&["serve"][..], &["openapi", "--check"]] {
+    for args in [
+        &["serve"][..],
+        &["openapi", "--check"],
+        &["migrate", "now"],
+        &["seed"],
+        &["reset", "seeds", "more-seeds"],
+    ] {
         let output = args
             .iter()
             .fold(BinaryCommand::new(BINARY), |command, arg| command.arg(arg))
