@@ -75,7 +75,11 @@ jobs:
       # reads `registry-mirrors` from /etc/docker/daemon.json when it starts, and falls
       # back to Docker Hub itself whenever the mirror fails or lacks the image. The
       # settings the runner's image already keeps in that file stay. Done before any
-      # pull, so that every pull of the job goes through the mirror.
+      # pull, so that every pull of the job goes through the mirror. A daemon that
+      # ignored the file would pull from Docker Hub with nothing to show it until a
+      # pull hit the limit, so the step fails unless dockerd lists the mirror after
+      # the restart; it writes each one with a trailing slash. The checks and test
+      # jobs run this same step: keep the two copies identical.
       - name: Pull Docker Hub images through mirror.gcr.io
         env:
           MIRROR: https://mirror.gcr.io
@@ -86,7 +90,12 @@ jobs:
           jq --arg mirror "$MIRROR" '."registry-mirrors" = [$mirror]' <<< "$settings" > "$RUNNER_TEMP/daemon.json"
           sudo install --mode=0644 "$RUNNER_TEMP/daemon.json" "$daemon"
           sudo systemctl restart docker
-          docker info --format 'registry mirrors: {{json .RegistryConfig.Mirrors}}'
+          mirrors="$(docker info --format '{{json .RegistryConfig.Mirrors}}')"
+          echo "registry mirrors: $mirrors"
+          if ! jq --exit-status --arg mirror "$MIRROR" 'any(.[]?; rtrimstr("/") == $mirror)' <<< "$mirrors" > /dev/null; then
+            echo "dockerd does not list $MIRROR among its registry mirrors after the restart" >&2
+            exit 1
+          fi
       # The image of compose.yaml's postgres service, read from that file alone, as the
       # throwaway database of `just db-check` reads it. In a step of its own, with its
       # own bound, so that a slow pull is charged to no check.
@@ -199,7 +208,11 @@ jobs:
       # reads `registry-mirrors` from /etc/docker/daemon.json when it starts, and falls
       # back to Docker Hub itself whenever the mirror fails or lacks the image. The
       # settings the runner's image already keeps in that file stay. Done before any
-      # pull, so that every pull of the job goes through the mirror.
+      # pull, so that every pull of the job goes through the mirror. A daemon that
+      # ignored the file would pull from Docker Hub with nothing to show it until a
+      # pull hit the limit, so the step fails unless dockerd lists the mirror after
+      # the restart; it writes each one with a trailing slash. The checks and test
+      # jobs run this same step: keep the two copies identical.
       - name: Pull Docker Hub images through mirror.gcr.io
         env:
           MIRROR: https://mirror.gcr.io
@@ -210,7 +223,12 @@ jobs:
           jq --arg mirror "$MIRROR" '."registry-mirrors" = [$mirror]' <<< "$settings" > "$RUNNER_TEMP/daemon.json"
           sudo install --mode=0644 "$RUNNER_TEMP/daemon.json" "$daemon"
           sudo systemctl restart docker
-          docker info --format 'registry mirrors: {{json .RegistryConfig.Mirrors}}'
+          mirrors="$(docker info --format '{{json .RegistryConfig.Mirrors}}')"
+          echo "registry mirrors: $mirrors"
+          if ! jq --exit-status --arg mirror "$MIRROR" 'any(.[]?; rtrimstr("/") == $mirror)' <<< "$mirrors" > /dev/null; then
+            echo "dockerd does not list $MIRROR among its registry mirrors after the restart" >&2
+            exit 1
+          fi
       # The int_ and e2e_ tests start their containers from the image of compose.yaml's
       # postgres service, read from that file alone, as the testkit reads it. Pulled in
       # a step of its own, with its own bound, so that a slow pull is charged to no

@@ -4,7 +4,10 @@ default:
     @just --list
 
 # sqlx-cli takes its history table's name from sqlx.toml, and only with its sqlx-toml feature:
-# without it, every sqlx-cli command refuses to run beside that file.
+# without it, every sqlx-cli command refuses to run beside that file. Every sqlx-cli command here
+# runs with --no-dotenv: sqlx-cli would otherwise read a .env on its own, from this folder or one
+# above, and print any line of it that it cannot parse, a password included. The commands that
+# connect take DATABASE_URL from their environment instead.
 
 setup:
     rustup toolchain install
@@ -33,7 +36,9 @@ _with-env +command:
         exit 1
     fi
     set -a
-    source .env
+    # With a slash: bash's source looks a bare name up in the folders of PATH before this one, so
+    # a .env in any of them would be read in place of the project's.
+    source ./.env
     set +a
     exec "$@"
 
@@ -52,7 +57,8 @@ db-down:
 # Migrations are forward-only (spec §3.3), so the file is a simple one, with no script that
 # undoes it, and its version is the moment in UTC. sqlx-cli takes any description and turns its
 # blanks into underscores, so a name check-structure would refuse is refused first, before a file
-# exists: snake_case as check-structure reads a module's name.
+# exists: snake_case as check-structure reads a module's name. `migrate add` refuses --no-dotenv,
+# which sqlx-cli takes before the subcommand instead.
 
 # Creates migrations/<UTC timestamp>_<name>.sql; the name is snake_case, such as create_users
 db-migrate $name:
@@ -63,7 +69,7 @@ db-migrate $name:
         echo 'the name of a migration is snake_case, such as create_users: lower-case letters and digits, in words joined by single underscores' >&2
         exit 1
     fi
-    exec sqlx migrate add --source migrations --simple --timestamp "$name"
+    exec sqlx --no-dotenv migrate add --source migrations --simple --timestamp "$name"
 
 # Applies the pending migrations to the database of .env with barras-api migrate, the deploy step
 db-deploy: (_with-env "cargo" "run" "--locked" "--quiet" "-p" "barras-api" "--" "migrate")
@@ -73,8 +79,7 @@ db-status: (_with-env "just" "_migrate-info")
 
 # sqlx-cli reads its database from DATABASE_URL, which .env does not set: it is mapped from
 # API_DATABASE_URL into sqlx-cli's environment alone, never into an argument or the output, so
-# that no process list or log shows it. --no-dotenv keeps sqlx-cli from reading .env again on its
-# own, which prints any line it cannot parse. The history table's name comes from sqlx.toml.
+# that no process list or log shows it. The history table's name comes from sqlx.toml.
 _migrate-info:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -211,7 +216,7 @@ openapi-check:
 # nor API_DATABASE_URL, so that what it holds follows from the migrations and the queries alone.
 
 # Rewrites .sqlx/ from the queries, against a throwaway database with every migration applied
-db-prepare: (_throwaway-db "cargo" "sqlx" "prepare" "--workspace" "--" "--locked")
+db-prepare: (_throwaway-db "cargo" "sqlx" "prepare" "--workspace" "--no-dotenv" "--" "--locked")
 
 # Fails when a migration does not apply to an empty database, or when .sqlx/ is not what the queries and the migrations produce
 db-check: (_throwaway-db "just" "_sqlx-check")
@@ -223,7 +228,7 @@ db-check: (_throwaway-db "just" "_sqlx-check")
 _sqlx-check:
     #!/usr/bin/env bash
     set -euo pipefail
-    cargo sqlx prepare --workspace --check -- --locked
+    cargo sqlx prepare --workspace --check --no-dotenv -- --locked
     target="$(cargo metadata --locked --format-version 1 --no-deps | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
     extra="$(comm -23 <(cd .sqlx && ls query-*.json | sort) <(cd "$target/sqlx-prepare-check" && ls query-*.json | sort))"
     if [[ -n "$extra" ]]; then
@@ -243,8 +248,9 @@ _throwaway-db +command:
     set -euo pipefail
     # Read by the service, as the testkit reads it, so that another service changes nothing; and
     # from compose.yaml alone, as the testkit does: --file leaves out a compose.override.yaml and
-    # a COMPOSE_FILE variable.
-    image="$(docker compose --file compose.yaml config --images postgres)"
+    # a COMPOSE_FILE variable, and --env-file /dev/null leaves out .env, which compose would read
+    # too, printing a line it cannot parse, a password included.
+    image="$(docker compose --file compose.yaml --env-file /dev/null config --images postgres)"
     # Pinned as the testkit requires: a digest, and a tag after the name's last slash.
     named="${image%@sha256:*}"
     if [[ $named == "$image" || ${named##*/} != *:* ]]; then
@@ -279,7 +285,7 @@ _throwaway-db +command:
     done
     port="$(docker port "$container" 5432/tcp)"
     export DATABASE_URL="postgres://barras:barras@127.0.0.1:${port##*:}/barras"
-    sqlx migrate run --source migrations
+    sqlx migrate run --source migrations --no-dotenv
     # bash runs a trap only after the command in the foreground ends, so the command runs in the
     # background while the script waits for it: a signal then reaches the trap at once. set -m
     # gives the command a process group of its own, which the trap stops whole, with the
