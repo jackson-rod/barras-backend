@@ -18,10 +18,14 @@ dev: (_watch "barras-api")
 # Runs barras-ingest with the variables of .env; restarts it when a Rust source or a Cargo.toml changes
 dev-ingest: (_watch "barras-ingest")
 
-# A binary refuses to start without its variables, so a missing .env is named before anything
-# builds. watchexec stops the binary with SIGTERM before each restart, so every reload goes
-# through the clean shutdown.
-_watch $binary:
+# watchexec stops the binary with SIGTERM before each restart, so every reload goes through the
+# clean shutdown.
+_watch binary: (_with-env "watchexec" "--restart" "--filter" "*.rs" "--filter" "Cargo.toml" "--ignore" "target/**" "--" "cargo" "run" "-p" binary)
+
+# Runs the given command in place of this script, with the variables of .env exported. A binary
+# refuses to start without its variables, so a missing .env is named before anything builds.
+[positional-arguments]
+_with-env +command:
     #!/usr/bin/env bash
     set -euo pipefail
     if [[ ! -f .env ]]; then
@@ -31,7 +35,61 @@ _watch $binary:
     set -a
     source .env
     set +a
-    exec watchexec --restart --filter '*.rs' --filter 'Cargo.toml' --ignore 'target/**' -- cargo run -p "$binary"
+    exec "$@"
+
+# The local database is the postgres service of compose.yaml, on 127.0.0.1:5433 (ADR-0007). The
+# commands below that connect read their database from .env, as just dev does, so they act on
+# whatever database it names: barras-api seed and reset refuse one that is not on this machine.
+
+# Starts the local Postgres of compose.yaml and waits until it accepts connections
+db-up:
+    docker compose up --detach --wait postgres
+
+# Stops the local Postgres; its data stays in the volume
+db-down:
+    docker compose stop postgres
+
+# Migrations are forward-only (spec §3.3), so the file is a simple one, with no script that
+# undoes it, and its version is the moment in UTC. sqlx-cli takes any description and turns its
+# blanks into underscores, so a name check-structure would refuse is refused first, before a file
+# exists: snake_case as check-structure reads a module's name.
+
+# Creates migrations/<UTC timestamp>_<name>.sql; the name is snake_case, such as create_users
+db-migrate $name:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    snake_case='^[a-z][a-z0-9]*(_[a-z0-9]+)*$'
+    if [[ ! $name =~ $snake_case ]]; then
+        echo 'the name of a migration is snake_case, such as create_users: lower-case letters and digits, in words joined by single underscores' >&2
+        exit 1
+    fi
+    exec sqlx migrate add --source migrations --simple --timestamp "$name"
+
+# Applies the pending migrations to the database of .env with barras-api migrate, the deploy step
+db-deploy: (_with-env "cargo" "run" "--locked" "--quiet" "-p" "barras-api" "--" "migrate")
+
+# Shows which migrations the database of .env has applied, which are pending, and which changed after they ran
+db-status: (_with-env "just" "_migrate-info")
+
+# sqlx-cli reads its database from DATABASE_URL, which .env does not set: it is mapped from
+# API_DATABASE_URL into sqlx-cli's environment alone, never into an argument or the output, so
+# that no process list or log shows it. --no-dotenv keeps sqlx-cli from reading .env again on its
+# own, which prints any line it cannot parse. The history table's name comes from sqlx.toml.
+_migrate-info:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -z ${API_DATABASE_URL:-} ]]; then
+        echo '.env sets no API_DATABASE_URL' >&2
+        exit 1
+    fi
+    export DATABASE_URL="$API_DATABASE_URL"
+    exec sqlx migrate info --source migrations --no-dotenv
+
+# Loads the seed files of seeds/ into the database of .env, which must be on this machine
+db-seed: (_with-env "cargo" "run" "--locked" "--quiet" "-p" "barras-api" "--" "seed" "seeds")
+
+# Rebuilds the database of .env, which must be on this machine: drop, create, migrate, seed
+db-reset: (_with-env "cargo" "run" "--locked" "--quiet" "-p" "barras-api" "--" "reset" "seeds")
 
 lint:
     cargo clippy --workspace --all-targets --locked --config 'build.warnings="deny"' -- -D warnings
@@ -286,4 +344,4 @@ build:
 # builds only xtask, and cargo metadata and cargo tree run no build script.
 
 # What CI runs, apart from the branch, commit and pull request checks and the tree check
-verify: check-arch check-structure hakari-check fmt-check deny lint openapi-check test-cov test-doc build
+verify: check-arch check-structure hakari-check fmt-check deny lint openapi-check db-check test-cov test-doc build
