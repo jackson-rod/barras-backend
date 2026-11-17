@@ -178,6 +178,51 @@ async fn a_server_behind_a_loopback_relay_that_is_not_the_local_one_keeps_its_da
 }
 
 #[tokio::test]
+async fn a_server_that_answers_a_later_connection_of_the_same_port_is_refused_and_left_as_it_was() {
+    // A port of this machine that takes turns between two servers, as a proxy in front of
+    // several does: the first connection of the reset, which drops and creates the database,
+    // reaches the local server; the next, which migrates, reaches another one.
+    let local = PostgresContainer::start().await;
+    let elsewhere = PostgresContainer::start_as_another_server().await;
+    sqlx::raw_sql("CREATE TABLE public.left_over (id int);")
+        .execute(&mut connect(local.url()).await)
+        .await
+        .unwrap();
+    sqlx::raw_sql("CREATE TABLE public.precious (id int); INSERT INTO public.precious VALUES (1);")
+        .execute(&mut connect(elsewhere.url()).await)
+        .await
+        .unwrap();
+    let relay = LoopbackRelay::start_alternating(&local, &elsewhere).await;
+    let folder = SeedFolder::new("alternating");
+
+    let outcome = reset(
+        &DatabaseUrl::parse(relay.url()).unwrap(),
+        &folder.path().join("missing"),
+    )
+    .await;
+
+    // Nothing reached the other server: neither the history nor the schema of a migration.
+    assert_eq!(
+        tables(elsewhere.url()).await,
+        ["public.precious"],
+        "{outcome:?}"
+    );
+    let schemas: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM pg_namespace WHERE nspname = 'barras'")
+            .fetch_one(&mut connect(elsewhere.url()).await)
+            .await
+            .unwrap();
+    assert_eq!(schemas, 0);
+    assert_eq!(
+        outcome,
+        Err(ResetError::NotLocalAfterCreate(NotLocal::OtherServer))
+    );
+    // The local server's database was created again, as the error says, and nothing was
+    // migrated into it.
+    assert_eq!(tables(local.url()).await, Vec::<String>::new());
+}
+
+#[tokio::test]
 async fn reset_reaches_the_local_server_through_localhost_at_every_step() {
     // The container listens on 127.0.0.1 alone, and `localhost` may resolve to `::1` first: the
     // maintenance database, the migrations and the seeds are each reached at an address the

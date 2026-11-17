@@ -3,9 +3,10 @@
 //! readiness checks ([`Pools`]), which the composition root wraps in its health probes; the
 //! migrations of `migrations/`, embedded at compile time, with the run that applies them
 //! ([`migrate`]); and, for the local database alone, the seed runner ([`seed`]) and the reset that
-//! rebuilds it ([`reset`]), both behind the local-database guard ([`ensure_local`]), which allows
-//! an address of this machine only and, once connected, the server that started as the local one.
-//! The repositories that implement the modules' persistence ports join it with the first table.
+//! rebuilds it ([`reset`]), both behind the local-database guard, which allows an address of this
+//! machine only and, on every connection, the server that started as the local one, and says why
+//! it refused one ([`NotLocal`]). The repositories that implement the modules' persistence ports
+//! join it with the first table.
 //!
 //! Its SQL is checked at compile time against the metadata committed in `.sqlx/`, which `just
 //! db-prepare` rewrites and `just db-check` holds to the queries and the migrations.
@@ -24,7 +25,7 @@ mod seed;
 mod unavailable;
 
 pub use database_url::{DatabaseUrl, UrlProblem};
-pub use guard::{LocalDatabase, NotLocal, ensure_local};
+pub use guard::NotLocal;
 pub use migrate::{AppliedMigration, MigrateError, MigrationFailure, migrate, migrate_with};
 pub use pools::Pools;
 pub use reset::{Reset, ResetError, reset};

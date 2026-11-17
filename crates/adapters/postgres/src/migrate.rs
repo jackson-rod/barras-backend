@@ -5,7 +5,6 @@ use std::fmt;
 use sqlx::migrate::{Migrate, Migration, Migrator};
 use sqlx::{Connection, PgConnection};
 
-use crate::guard::LocalDatabase;
 use crate::unavailable::sqlstate_of;
 use crate::{DatabaseUnavailable, DatabaseUrl};
 
@@ -50,15 +49,11 @@ pub async fn migrate_with(
     run(connection, migrations).await
 }
 
-/// [`migrate`] on a database the guard judged local, at the address it judged, as `reset`
-/// migrates the database it has just created.
-pub(crate) async fn migrate_local(
-    local: &LocalDatabase,
+/// [`migrate`] on `connection`, as `reset` migrates the database it has just created, on a
+/// connection whose server has shown that it is the local one.
+pub(crate) async fn migrate_on(
+    connection: PgConnection,
 ) -> Result<Vec<AppliedMigration>, MigrateError> {
-    let connection = local
-        .connect()
-        .await
-        .map_err(|error| MigrateError::Unavailable(DatabaseUnavailable::from(&error)))?;
     run(connection, &MIGRATIONS).await
 }
 

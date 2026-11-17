@@ -5,12 +5,12 @@ use std::path::Path;
 
 use sqlx::{AssertSqlSafe, Connection, PgConnection};
 
-use crate::guard::{LocalDatabase, ServerCheckFailed, ensure_local_server};
-use crate::migrate::migrate_local;
+use crate::guard::{LocalDatabase, ServerCheckFailed, ensure_local};
+use crate::migrate::migrate_on;
 use crate::seed::{apply, read_seed_files};
 use crate::{
     AppliedMigration, AppliedSeed, DatabaseUnavailable, DatabaseUrl, MigrateError, NotLocal,
-    SeedError, ensure_local,
+    SeedError,
 };
 
 /// The most bytes of a name that Postgres keeps (`NAMEDATALEN` less one). It cuts a longer name
@@ -20,13 +20,15 @@ const LONGEST_NAME: usize = 63;
 
 /// Rebuilds the database `url` names, on this machine only, and returns what each step did.
 ///
-/// The guard comes first ([`ensure_local`]), then a name longer than Postgres keeps is refused.
-/// Then the seed files of `seeds` are read, so that one that cannot be read leaves the database
-/// as it was. Then, from the server's maintenance database, once the server has shown that it is
-/// the local one, the database is dropped if it exists, every other session on it ended, and
-/// created, empty. Then every migration this binary carries is applied
+/// The local-database guard comes first, which refuses a database that may be on another
+/// machine ([`NotLocal`]), then a name longer than Postgres keeps is refused. Then the seed files
+/// of `seeds` are read, so that one that cannot be read leaves the database as it was. Then, from
+/// the server's maintenance database, the database is dropped if it exists, every other session
+/// on it ended, and created, empty. Then every migration this binary carries is applied
 /// ([`migrate`](crate::migrate)), and the seed files after them, in one transaction, as
-/// [`seed`](crate::seed) applies them. Every step connects to the address the guard judged.
+/// [`seed`](crate::seed) applies them. Every step connects to the address the guard judged, on a
+/// connection of its own, and uses it only once the server there has shown that it is the local
+/// one.
 pub async fn reset(url: &DatabaseUrl, seeds: &Path) -> Result<Reset, ResetError> {
     let local = ensure_local(url).map_err(ResetError::NotLocal)?;
     let database = local.database().to_owned();
@@ -35,7 +37,7 @@ pub async fn reset(url: &DatabaseUrl, seeds: &Path) -> Result<Reset, ResetError>
     }
     let files = read_seed_files(seeds).map_err(ResetError::SeedsUnreadable)?;
     let dropped = recreate(&local, &database).await?;
-    let migrations = migrate_local(&local).await.map_err(ResetError::Migrate)?;
+    let migrations = migrate_created(&local).await?;
     let seeds = apply(&local, &files).await.map_err(ResetError::Seed)?;
     Ok(Reset {
         database,
@@ -48,9 +50,6 @@ pub async fn reset(url: &DatabaseUrl, seeds: &Path) -> Result<Reset, ResetError>
 /// Drops `database` when it exists, ending every other session on it, and creates it, empty, on
 /// a connection of its own to the server's maintenance database, which is closed afterwards
 /// whatever happened. Returns whether `database` existed.
-///
-/// The server is asked who it is before the drop, which no later step can undo: the steps after
-/// it reach the same address, and the seeds ask again, as they do on their own.
 async fn recreate(local: &LocalDatabase, database: &str) -> Result<bool, ResetError> {
     // As createdb does: `postgres`, unless that is the database rebuilt.
     let maintenance = if database == "postgres" {
@@ -62,11 +61,8 @@ async fn recreate(local: &LocalDatabase, database: &str) -> Result<bool, ResetEr
         .with_database(maintenance)
         .connect()
         .await
-        .map_err(|error| ResetError::Unavailable(DatabaseUnavailable::from(&error)))?;
-    let outcome = match ensure_local_server(&mut connection).await {
-        Ok(()) => drop_and_create(&mut connection, database).await,
-        Err(failure) => Err(ResetError::from(failure)),
-    };
+        .map_err(ResetError::from)?;
+    let outcome = drop_and_create(&mut connection, database).await;
     if let Err(error) = connection.close().await {
         // A connection that cannot close cleanly is dropped instead, which closes its socket:
         // the session ends either way, so the outcome stands.
@@ -76,6 +72,19 @@ async fn recreate(local: &LocalDatabase, database: &str) -> Result<bool, ResetEr
         );
     }
     outcome
+}
+
+/// Every migration this binary carries, applied to the database [`recreate`] made, on a
+/// connection of its own. The server that answers it is asked again who it is: the same address
+/// can lead to another server than the one that dropped and created the database.
+async fn migrate_created(local: &LocalDatabase) -> Result<Vec<AppliedMigration>, ResetError> {
+    match local.connect().await {
+        Ok(connection) => migrate_on(connection).await.map_err(ResetError::Migrate),
+        Err(ServerCheckFailed::NotLocal(reason)) => Err(ResetError::NotLocalAfterCreate(reason)),
+        Err(ServerCheckFailed::Unavailable(cause)) => {
+            Err(ResetError::Migrate(MigrateError::Unavailable(cause)))
+        }
+    }
 }
 
 async fn drop_and_create(
@@ -179,6 +188,10 @@ pub enum ResetError {
         dropped: bool,
         cause: DatabaseUnavailable,
     },
+    /// The database was created, and the server that answered the connection of the migrations
+    /// did not start as the local one, as when a port of this machine takes turns between two
+    /// servers: no migration was applied, and that server was left as it was.
+    NotLocalAfterCreate(NotLocal),
     /// The database was created, and the migrations failed as the error says: those applied
     /// before the failure stay.
     Migrate(MigrateError),
@@ -222,6 +235,11 @@ impl fmt::Display for ResetError {
             } => write!(
                 f,
                 "cannot create the database {database}, which did not exist: {cause}"
+            ),
+            Self::NotLocalAfterCreate(reason) => write!(
+                f,
+                "the database was created, and the server that answered for the migrations was \
+                 refused, so none was applied: {reason}"
             ),
             Self::Migrate(error) => write!(
                 f,
@@ -374,6 +392,14 @@ mod tests {
                 },
                 "cannot create the database barras, which did not exist: the server refused it \
                  with SQLSTATE 42501",
+            ),
+            (
+                ResetError::NotLocalAfterCreate(NotLocal::OtherServer),
+                "the database was created, and the server that answered for the migrations was \
+                 refused, so none was applied: the database may be on another machine: the \
+                 server that answered does not have cluster_name set to barras-local, as the \
+                 Postgres of compose.yaml has; a Postgres of your own takes it from the line \
+                 cluster_name = 'barras-local' in its postgresql.conf, and a restart",
             ),
             (
                 ResetError::Migrate(MigrateError::Unavailable(refused("53300"))),

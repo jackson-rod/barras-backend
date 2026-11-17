@@ -28,10 +28,10 @@ pub(crate) const LOCAL_CLUSTER_NAME: &str = "barras-local";
 ///
 /// It judges the target sqlx connects to, read as sqlx reads the URL: the socket before the
 /// host, since sqlx connects to the socket whatever the host holds (plan, appendix A.5). It
-/// opens no connection. A port of this machine can still lead to another one, so a run also asks
-/// the server, once connected and before it changes anything, whether it is the local one.
-/// `APP_ENV` is the composition root's to check.
-pub fn ensure_local(url: &DatabaseUrl) -> Result<LocalDatabase, NotLocal> {
+/// opens no connection. A port of this machine can still lead to another one, so each
+/// connection of a run also asks the server, before it is used, whether it is the local one
+/// ([`LocalDatabase::connect`]). `APP_ENV` is the composition root's to check.
+pub(crate) fn ensure_local(url: &DatabaseUrl) -> Result<LocalDatabase, NotLocal> {
     judge(url.connect_options(), resolve)
 }
 
@@ -98,7 +98,7 @@ fn judge(
 /// A database the guard judged to be on this machine, aimed at what it judged: a run connects
 /// there, and never asks the resolver again (plan, refinement 15). It holds the password, so it
 /// has no `Debug`.
-pub struct LocalDatabase {
+pub(crate) struct LocalDatabase {
     /// The URL's options as they are, for a socket or a loopback address; for `localhost`, aimed
     /// at the first address it resolved to.
     first: PgConnectOptions,
@@ -134,10 +134,38 @@ impl LocalDatabase {
         }
     }
 
-    /// A connection of its own to the database, at the first of the judged addresses that can be
-    /// reached: a connection to `localhost` tries the addresses the name resolves to in turn, as
-    /// this does. Nothing has asked the server who it is yet ([`ensure_local_server`]).
-    pub(crate) async fn connect(&self) -> Result<PgConnection, sqlx::Error> {
+    /// A connection of its own to the database, once the server that answered has shown that it
+    /// started as the local one ([`ensure_local_server`]): the only way to one, so a run uses no
+    /// connection that was not asked. Each is asked, never only a run's first: a port of this
+    /// machine can lead to another server on each connection, as a proxy that takes turns
+    /// between servers does, so what one server answered says nothing of the next.
+    ///
+    /// A connection whose server was not let through is closed before this returns.
+    pub(crate) async fn connect(&self) -> Result<PgConnection, ServerCheckFailed> {
+        let mut connection = self
+            .reach()
+            .await
+            .map_err(|error| ServerCheckFailed::Unavailable(DatabaseUnavailable::from(&error)))?;
+        match ensure_local_server(&mut connection).await {
+            Ok(()) => Ok(connection),
+            Err(failure) => {
+                if let Err(error) = connection.close().await {
+                    // A connection that cannot close cleanly is dropped instead, which closes its
+                    // socket: the session ends either way, so the refusal stands.
+                    tracing::warn!(
+                        error = %DatabaseUnavailable::from(&error),
+                        "the connection that asked the server who it is did not close cleanly"
+                    );
+                }
+                Err(failure)
+            }
+        }
+    }
+
+    /// A connection to the first of the judged addresses that can be reached: a connection to
+    /// `localhost` tries the addresses the name resolves to in turn, as this does. Nothing has
+    /// asked the server who it is yet.
+    async fn reach(&self) -> Result<PgConnection, sqlx::Error> {
         let mut connected = PgConnection::connect_with(&self.first).await;
         for options in &self.others {
             if !matches!(connected, Err(sqlx::Error::Io(_))) {
@@ -150,13 +178,11 @@ impl LocalDatabase {
 }
 
 /// Refuses the server `connection` reached unless it started as the local one, with the
-/// `cluster_name` of [`LOCAL_CLUSTER_NAME`] (plan, refinement 15). It is the first question on the
-/// connection, before anything changes: the guard allows a port of this machine, and such a port
-/// can be the first hop to another machine, as `ssh -L`, `kubectl port-forward` or a cloud SQL
-/// proxy makes it.
-pub(crate) async fn ensure_local_server(
-    connection: &mut PgConnection,
-) -> Result<(), ServerCheckFailed> {
+/// `cluster_name` of [`LOCAL_CLUSTER_NAME`] (plan, refinement 15). It is the first question on
+/// every connection of a run, before anything changes: the guard allows a port of this machine,
+/// and such a port can be the first hop to another machine, as `ssh -L`, `kubectl port-forward`
+/// or a cloud SQL proxy makes it.
+async fn ensure_local_server(connection: &mut PgConnection) -> Result<(), ServerCheckFailed> {
     let name = sqlx::query_scalar!(r#"SELECT current_setting('cluster_name') AS "name!""#)
         .fetch_one(connection)
         .await
@@ -168,12 +194,12 @@ pub(crate) async fn ensure_local_server(
     }
 }
 
-/// Why a run did not go on with the server it reached.
+/// Why a run got no connection to the local server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ServerCheckFailed {
-    /// The server did not start as the local one.
+    /// The server that answered did not start as the local one.
     NotLocal(NotLocal),
-    /// The server could not be asked.
+    /// No server could be reached, or the one that answered could not be asked.
     Unavailable(DatabaseUnavailable),
 }
 

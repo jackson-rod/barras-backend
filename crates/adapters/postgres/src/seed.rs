@@ -8,9 +8,9 @@ use std::path::Path;
 use sqlx::postgres::{PgDatabaseError, PgErrorPosition};
 use sqlx::{AssertSqlSafe, Connection, PgConnection};
 
-use crate::guard::{LocalDatabase, ServerCheckFailed, ensure_local_server};
+use crate::guard::{LocalDatabase, ServerCheckFailed, ensure_local};
 use crate::unavailable::sqlstate_of;
-use crate::{DatabaseUnavailable, DatabaseUrl, NotLocal, ensure_local};
+use crate::{DatabaseUnavailable, DatabaseUrl, NotLocal};
 
 /// Applies the seed files of `folder` to the database `url` names, on this machine only, and
 /// returns them in the order they ran.
@@ -20,10 +20,11 @@ use crate::{DatabaseUnavailable, DatabaseUrl, NotLocal, ensure_local};
 /// ignored, and a folder that does not exist holds none. Every file is read before the first
 /// one runs, and with nothing to apply nothing connects.
 ///
-/// The guard comes first ([`ensure_local`]): seeds are local development data, so a database
-/// that may be on another machine is refused before the folder is read. The run connects to the
-/// address the guard judged, on a connection of its own without the pools' statement timeout,
-/// and refuses a server that did not start as the local one before the first file runs.
+/// The local-database guard comes first: seeds are local development data, so a database that
+/// may be on another machine is refused ([`NotLocal`]) before the folder is read. The run
+/// connects to the address the guard judged, on a connection of its own without the pools'
+/// statement timeout, and refuses a server that did not start as the local one before the first
+/// file runs.
 pub async fn seed(url: &DatabaseUrl, folder: &Path) -> Result<Vec<AppliedSeed>, SeedError> {
     let local = ensure_local(url).map_err(SeedError::NotLocal)?;
     let files = read_seed_files(folder)?;
@@ -89,14 +90,8 @@ pub(crate) async fn apply(
     if files.is_empty() {
         return Ok(Vec::new());
     }
-    let mut connection = local
-        .connect()
-        .await
-        .map_err(|error| SeedError::Unavailable(DatabaseUnavailable::from(&error)))?;
-    let outcome = match ensure_local_server(&mut connection).await {
-        Ok(()) => apply_in_one_transaction(&mut connection, files).await,
-        Err(failure) => Err(SeedError::from(failure)),
-    };
+    let mut connection = local.connect().await.map_err(SeedError::from)?;
+    let outcome = apply_in_one_transaction(&mut connection, files).await;
     if let Err(error) = connection.close().await {
         // A connection that cannot close cleanly is dropped instead, which closes its socket:
         // the session ends either way, so the outcome stands.

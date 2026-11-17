@@ -43,8 +43,9 @@ const READY: &str = "database system is ready to accept connections";
 const LOCAL_CLUSTER_SETTING: &str = "cluster_name=barras-local";
 
 /// The relay, in Perl, which the Postgres image carries: it listens on port 5432 and copies the
-/// bytes of each connection both ways to the address of its first argument, in a process per
-/// connection, as `ssh -L` does.
+/// bytes of each connection both ways, in a process per connection, to the address of one of its
+/// arguments, each in turn: with one, as `ssh -L` does; with several, as a proxy that takes
+/// turns between servers does.
 const RELAY: &str = r#"
 use IO::Select;
 use IO::Socket::INET;
@@ -52,10 +53,12 @@ $SIG{CHLD} = "IGNORE";
 my $listener = IO::Socket::INET->new(LocalPort => 5432, Listen => 16, ReuseAddr => 1)
     or die "cannot listen: $!";
 print STDERR "relay ready\n";
+my $turn = 0;
 while (1) {
     my $client = $listener->accept or next;
+    my $target = $ARGV[$turn++ % @ARGV];
     if (fork) { close $client; next; }
-    my $server = IO::Socket::INET->new(PeerAddr => $ARGV[0]) or exit 1;
+    my $server = IO::Socket::INET->new(PeerAddr => $target) or exit 1;
     my $both = IO::Select->new($client, $server);
     while (1) {
         for my $from ($both->can_read) {
@@ -169,16 +172,34 @@ impl LoopbackRelay {
     /// and waits until it listens. It runs on the image of `compose.yaml`, so it needs no image of
     /// its own.
     pub async fn start(target: &PostgresContainer) -> Self {
-        let address = target
-            .container
-            .get_bridge_ip_address()
-            .await
-            .unwrap_or_else(|error| panic!("the target container has no bridge address: {error}"));
+        Self::start_to(&[target]).await
+    }
+
+    /// [`start`](Self::start), with a relay that sends each new connection to `first` and
+    /// `second` in turn, `first` first: one port of this machine that leads to another server on
+    /// each connection, as a proxy that takes turns between two does. What the first connection
+    /// learnt of its server says nothing of the server of the next.
+    pub async fn start_alternating(first: &PostgresContainer, second: &PostgresContainer) -> Self {
+        Self::start_to(&[first, second]).await
+    }
+
+    async fn start_to(targets: &[&PostgresContainer]) -> Self {
+        let mut addresses = Vec::new();
+        for target in targets {
+            let address = target
+                .container
+                .get_bridge_ip_address()
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("the target container has no bridge address: {error}")
+                });
+            addresses.push(SocketAddr::new(address, PORT.as_u16()).to_string());
+        }
         let (name, tag) = compose_image();
         let container = Relay {
             name,
             tag,
-            target: SocketAddr::new(address, PORT.as_u16()).to_string(),
+            targets: addresses,
         }
         .with_label(LABEL.0, LABEL.1)
         .with_network(NETWORK)
@@ -270,13 +291,13 @@ impl Image for ThrowawayPostgres {
     }
 }
 
-/// The image of `compose.yaml`, run as a relay to `target` instead of as a database.
+/// The image of `compose.yaml`, run as a relay to `targets` instead of as a database.
 #[derive(Debug)]
 struct Relay {
     name: String,
     tag: String,
-    /// The address and port of the Postgres it relays to.
-    target: String,
+    /// The address and port of each Postgres it relays to, in the order it takes them.
+    targets: Vec<String>,
 }
 
 impl Image for Relay {
@@ -297,7 +318,9 @@ impl Image for Relay {
     }
 
     fn cmd(&self) -> impl IntoIterator<Item = impl Into<Cow<'_, str>>> {
-        ["-e", RELAY, self.target.as_str()]
+        let mut command = vec!["-e", RELAY];
+        command.extend(self.targets.iter().map(String::as_str));
+        command
     }
 
     fn expose_ports(&self) -> &[ContainerPort] {
