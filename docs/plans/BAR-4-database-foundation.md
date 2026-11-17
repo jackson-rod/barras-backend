@@ -9,6 +9,7 @@ The spec says what and why; this plan says in which order, with which tests, and
 - Test first: each step writes the failing test, sees it fail for the right reason, then writes the code.
 - Each task is built by a subagent and reviewed by `agent-skills:code-reviewer` before the next task builds on it. A task that touches CI, the hooks, the justfile's gates, `deny.toml` or the local-database guard is also reviewed by `agent-skills:security-auditor`. The findings are fixed, or answered with a reason, before the task counts as done. One whole-branch review closes the plan (Task 8).
 - Tasks 1 and 2 need no database and run in parallel with the spikes of Task 0. Task 3 starts once Task 0 has answered.
+- A subagent in a worktree of its own cannot commit: the hooks need the toolchain on PATH, and the worktree's guard refuses a git command that sets it. It leaves its work staged, and for a task of several commits it marks each one with `git write-tree` and saves the diff between two marks as a patch. The session applies the patches in order on the branch and commits each one through the hooks.
 - Docker Desktop runs for Task 0 and from Task 3 on.
 - Commits read `type(BAR-4): lower-case description`, go through the hooks, and carry no attribution (ADR-0018). Nothing is pushed until the owner says so.
 
@@ -24,6 +25,11 @@ From the spikes (appendix A, 2026-11-16):
 4. **Spec §5 and §9.3, what a URL names.** sqlx's getters fill a missing part from the `PG*` variables or `~/.pgpass` and show no password (A.5), so the rule reads the URL itself with the `url` crate: scheme `postgres` or `postgresql`; host, port, user, password and database all present; none of the query keys `host`, `hostaddr`, `port`, `user`, `password`, `dbname`; and no IPv6 address in brackets, which sqlx 0.9 cannot connect to (`localhost` reaches `::1`). The guard reads `get_socket()` before `get_host()`.
 5. **Spec §9.1, a seed's failure.** It is built from the file's name, the SQLSTATE, the server's message and the line and column of its position, never from sqlx's `Display`, whose "at line N" is a line of Postgres's C source (A.4). A seed that ends the transaction itself (`COMMIT`) would escape the one-transaction rule, so the runner checks after each file that its transaction is still open, and fails naming the file otherwise.
 6. **Spec §6.4, the rule for repositories.** A database error's detail can quote a value bound to a statement (A.4, A.6: `Key (id)=(1) already exists.`, `invalid input syntax for type integer: "…"`). A repository's error never carries sqlx's text into an answer or a log line; BAR-15 applies it with the mapping of §6.4.
+
+Decided by the owner on 2026-11-16, after the spikes and the review of Task 2:
+
+7. **Spec §6.4, a request whose body is slow.** A request whose body has not finished arriving when the 5 seconds pass is answered 408, with the envelope, the code `REQUEST_BODY_TIMEOUT` and `connection: close`. It is the client's slowness, not the server's: no `request failed` event, counted as a 4xx. A request whose body arrived, or that has none, still gets 503 `REQUEST_TIMEOUT`. The timeout layer wraps the request body to know whether it reached its end; a handler that never reads a body it was sent counts as still waiting for it. `REQUEST_BODY_TIMEOUT` is the ninth common code.
+8. **The refinements 1 to 6 above** were put to the owner, who said to go on with them.
 
 Choices the spec left to the plan, made from the spikes: testcontainers 0.28.0 with a Postgres image of our own (A.7); the image `postgres:18.7-trixie@sha256:2ea8630df176ad090ec92136dee850397c5af8781e4bcf2e4162593691c61bbc`, written with tag and digest in `compose.yaml`, the testkit and CI (A.9); CI pulls it from `mirror.gcr.io` and tags it, with Docker Hub as the fallback, to be confirmed by the first CI run (A.9); sqlx-cli installed with `--locked` (A.8).
 
@@ -98,7 +104,8 @@ Built on appendix A.
 
 ## Task 7: Docs
 
-- ADR-0030 and ADR-0031 (spec §15), `Accepted`, with their rows in the index; the pointers in ADR-0007, ADR-0016, ADR-0024, ADR-0027 and ADR-0029.
+- ADR-0030 and ADR-0031 (spec §15), `Accepted`, with their rows in the index; the pointers in ADR-0007, ADR-0016, ADR-0024, ADR-0027 and ADR-0029, and in ADR-0028, whose seven common codes and status rule changed (refinement 7; the review of Task 2: a common code is exempt only at its own status).
+- `CLAUDE.md`'s rules of the API: the nine common codes in the table (`REQUEST_TIMEOUT`, `REQUEST_BODY_TIMEOUT`), and `TestClient`'s status rule as it now is.
 - `CLAUDE.md`: the `db-*` commands, the variables, the data access rules (schema-qualified SQL, forward-only migrations, `.sqlx/` and `just db-prepare`, seeds), the test tiers with Docker, the layout (`migrations/`, `.sqlx/`, `seeds/` and `compose.yaml` now exist).
 - `README.md`: Docker required, sqlx-cli, the local routine (`db-up`, `db-reset`, `dev`); an existing checkout re-runs `just setup`.
 - `CONTRIBUTING.md`: the database workflow; what to do when a new advisory blocks; a `.env` that sqlx can parse.
