@@ -269,8 +269,6 @@ pub(crate) fn operations_mut(item: &mut PathItem) -> impl Iterator<Item = &mut O
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use serde::Serialize;
     use serde_json::{Value, json};
     use utoipa::ToSchema;
@@ -444,7 +442,7 @@ mod tests {
             ApiError::payload_too_large().code(),
             ApiError::not_acceptable().code(),
             ApiError::internal("handler panicked".to_owned()).code(),
-            ApiError::request_timeout(Duration::from_secs(5)).code(),
+            ApiError::request_timeout("no answer within 5 seconds".to_owned()).code(),
         ];
         answered.sort_unstable();
 

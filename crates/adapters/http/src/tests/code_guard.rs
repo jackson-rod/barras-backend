@@ -1,7 +1,8 @@
 //! The guard on the error answers of a documented route: its `error.code` is one that its
 //! operation lists in `x-error-codes` or the document lists in `x-common-error-codes`, and its
-//! status is one that its operation documents or that any route can answer; otherwise the test
-//! that received it fails, naming the route, the code and the status.
+//! status is one that its operation documents, unless the answer is a common code at its own
+//! status, which any route can give; otherwise the test that received it fails, naming the
+//! route, the code and the status.
 
 use std::error::Error;
 use std::fmt;
@@ -20,6 +21,9 @@ use crate::{
 
 /// The code of [`Taken`].
 const FIXTURE_TAKEN: &str = "FIXTURE_TAKEN";
+
+/// The code of [`Down`].
+const FIXTURE_DOWN: &str = "FIXTURE_DOWN";
 
 /// A failure of a module the adapter knows nothing about: someone else holds the fixture.
 #[derive(Debug)]
@@ -40,6 +44,29 @@ impl AppError for Taken {
 
     fn kind(&self) -> ErrorKind {
         ErrorKind::Conflict
+    }
+}
+
+/// A failure of a module the adapter knows nothing about, at the status of a common code: what
+/// the fixture needs cannot be reached, as a database that is down.
+#[derive(Debug)]
+struct Down;
+
+impl fmt::Display for Down {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("what the fixture needs is down")
+    }
+}
+
+impl Error for Down {}
+
+impl AppError for Down {
+    fn code(&self) -> &'static str {
+        FIXTURE_DOWN
+    }
+
+    fn kind(&self) -> ErrorKind {
+        ErrorKind::Unavailable
     }
 }
 
@@ -121,6 +148,29 @@ async fn teapot() -> Response {
     (StatusCode::IM_A_TEAPOT, "short and stout").into_response()
 }
 
+/// Reach what the fixture needs while it is down, documenting only the success.
+#[utoipa::path(
+    get,
+    path = "/down",
+    tag = "fixtures",
+    responses((status = 200, description = "Never sent", body = SuccessEnvelope<NoData>)),
+)]
+async fn reach_quietly() -> ApiResult<NoData> {
+    Err(Down.into())
+}
+
+/// Answer 503 in plain text, as a library layer might, documenting only the success: the
+/// safety net makes it an `INTERNAL_ERROR` envelope at 503, the status of another common code.
+#[utoipa::path(
+    get,
+    path = "/overloaded",
+    tag = "fixtures",
+    responses((status = 200, description = "Never sent", body = SuccessEnvelope<NoData>)),
+)]
+async fn overloaded() -> Response {
+    (StatusCode::SERVICE_UNAVAILABLE, "try again later").into_response()
+}
+
 /// A client of an app with `route` alone, registered with `codes` as its own error codes.
 fn client_of(route: UtoipaMethodRouter, codes: &'static [&'static str]) -> TestClient {
     let routes = ApiRouter::new().route(route, Access::public(), codes);
@@ -167,7 +217,7 @@ async fn a_status_the_operation_does_not_document_fails_the_test() {
 }
 
 #[tokio::test]
-async fn a_common_code_at_a_status_any_route_can_answer_needs_nothing_documented() {
+async fn a_common_code_at_its_own_status_needs_nothing_documented() {
     let client = client_of(routes!(refuse_unread), &[]);
 
     let response = client.send(post("/api/v1/unread")).await;
@@ -184,6 +234,28 @@ async fn a_common_code_at_any_other_status_needs_that_status_documented() {
     let client = client_of(routes!(teapot), &[]);
 
     client.get("/api/v1/teapot").await;
+}
+
+#[tokio::test]
+#[should_panic(
+    expected = "GET /api/v1/overloaded answered 503 INTERNAL_ERROR, a status that its operation \
+                does not document"
+)]
+async fn a_common_code_at_the_status_of_another_common_code_needs_that_status_documented() {
+    let client = client_of(routes!(overloaded), &[]);
+
+    client.get("/api/v1/overloaded").await;
+}
+
+#[tokio::test]
+#[should_panic(
+    expected = "GET /api/v1/down answered 503 FIXTURE_DOWN, a status that its operation does not \
+                document"
+)]
+async fn a_code_of_the_route_at_the_status_of_a_common_code_needs_that_status_documented() {
+    let client = client_of(routes!(reach_quietly), &[FIXTURE_DOWN]);
+
+    client.get("/api/v1/down").await;
 }
 
 #[tokio::test]

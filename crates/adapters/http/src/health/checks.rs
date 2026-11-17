@@ -60,7 +60,9 @@ impl HealthChecks {
         match run.await {
             Ok(reports) => reports,
             // Only a runtime that shuts down stops the task early, since `check_all` answers
-            // even for a check that panics; the probes then run here, unrecorded.
+            // even for a check that panics. That runtime cancels the tasks `check_all` spawns
+            // here too, so no check runs: every probe reads `stopped without an answer`, and
+            // nothing is recorded.
             Err(_stopped) => check_all(&self.probes).await.into(),
         }
     }

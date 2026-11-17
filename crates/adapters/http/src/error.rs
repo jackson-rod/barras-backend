@@ -3,7 +3,6 @@
 
 use std::collections::BTreeMap;
 use std::error::Error;
-use std::time::Duration;
 
 use axum::http::header::WWW_AUTHENTICATE;
 use axum::http::{HeaderValue, StatusCode};
@@ -139,11 +138,9 @@ impl ApiError {
         )
     }
 
-    /// 503 `REQUEST_TIMEOUT`, with a generic message: no answer had started `limit` after the
-    /// request arrived. The detail names the limit alone: the request span the failure is
-    /// logged in already names the route and the request id.
-    pub(crate) fn request_timeout(limit: Duration) -> Self {
-        let detail = format!("no answer within {} seconds", limit.as_secs());
+    /// 503 `REQUEST_TIMEOUT`, with a generic message: no answer had started within the time
+    /// limit of a request. `detail` goes only to the log.
+    pub(crate) fn request_timeout(detail: String) -> Self {
         Self::server(
             StatusCode::SERVICE_UNAVAILABLE,
             Self::REQUEST_TIMEOUT,
@@ -274,7 +271,6 @@ mod tests {
     use std::io;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
 
     use axum::http::header::{CONTENT_TYPE, WWW_AUTHENTICATE};
     use barras_kernel::{Currency, KernelError};
@@ -697,7 +693,7 @@ mod tests {
                 "INTERNAL_ERROR",
             ),
             (
-                ApiError::request_timeout(Duration::from_secs(5)),
+                ApiError::request_timeout("no answer within 5 seconds".to_owned()),
                 503,
                 "REQUEST_TIMEOUT",
             ),
@@ -814,9 +810,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_request_timeout_answers_the_generic_503_and_logs_the_limit() {
+    async fn a_request_timeout_answers_the_generic_503_and_logs_its_detail() {
         let (response, lines) =
-            respond_logged(|| ApiError::request_timeout(Duration::from_secs(5)));
+            respond_logged(|| ApiError::request_timeout("no answer within 5 seconds".to_owned()));
         let (status, _, body) = read(response).await;
 
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);

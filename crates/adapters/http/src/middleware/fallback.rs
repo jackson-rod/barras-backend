@@ -30,10 +30,16 @@ fn fallback_answer(error: ApiError) -> Response {
 
 /// 500 `INTERNAL_ERROR`. The panic's text goes to the log with the answer, never into it.
 pub(crate) fn handle_panic(payload: Box<dyn Any + Send + 'static>) -> Response {
-    let text = payload
+    let text = panic_text(&*payload);
+    ApiError::internal(format!("a handler panicked: {text}")).into_response()
+}
+
+/// The text a panic carried: `panic!` gives a `String` when it formats and a `&str` when it
+/// does not; `panic_any` can give anything else.
+pub(super) fn panic_text(payload: &(dyn Any + Send)) -> &str {
+    payload
         .downcast_ref::<String>()
         .map(String::as_str)
         .or_else(|| payload.downcast_ref::<&str>().copied())
-        .unwrap_or("a payload that is not text");
-    ApiError::internal(format!("a handler panicked: {text}")).into_response()
+        .unwrap_or("a payload that is not text")
 }

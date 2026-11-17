@@ -20,9 +20,21 @@ use crate::internal::InternalApp;
 use crate::middleware::MatchedRoute;
 use crate::openapi::{X_COMMON_ERROR_CODES, X_ERROR_CODES, operations};
 
-/// The statuses of the codes of `x-common-error-codes`, which any route can answer, so that no
-/// operation documents them: 400, 404, 405, 406, 413, 415, 500 and 503. Sorted.
-const COMMON_STATUSES: [u16; 8] = [400, 404, 405, 406, 413, 415, 500, 503];
+/// Each code of `x-common-error-codes` with the status the adapter answers it at: any route can
+/// give these answers, so no operation documents them. Pairs rather than a list of statuses, so
+/// that a route's own code at one of these statuses, such as an `Unavailable` module error at
+/// 503, and a common code at the status of another, such as the `INTERNAL_ERROR` the safety net
+/// makes of a layer's bare 503, both need the status documented. Sorted.
+const COMMON_ANSWERS: [(&str, u16); 8] = [
+    (ApiError::INTERNAL_ERROR, 500),
+    (ApiError::MALFORMED_REQUEST, 400),
+    (ApiError::METHOD_NOT_ALLOWED, 405),
+    (ApiError::NOT_ACCEPTABLE, 406),
+    (ApiError::PAYLOAD_TOO_LARGE, 413),
+    (ApiError::REQUEST_TIMEOUT, 503),
+    (ApiError::ROUTE_NOT_FOUND, 404),
+    (ApiError::UNSUPPORTED_MEDIA_TYPE, 415),
+];
 
 /// Sends requests to an app in-process, through the whole stack of middleware, and fails the
 /// test when a route the OpenAPI document does not have served one: so any test that reaches
@@ -31,8 +43,9 @@ const COMMON_STATUSES: [u16; 8] = [400, 404, 405, 406, 413, 415, 500, 503];
 /// It also fails the test when a route the document has answers an error envelope whose
 /// `error.code` neither the operation's `x-error-codes` nor the document's
 /// `x-common-error-codes` lists, or whose status the operation documents neither as itself,
-/// nor as its range such as `4XX`, nor with `default`, unless a common code has that status:
-/// the document would otherwise hide from the app an answer it must handle.
+/// nor as its range such as `4XX`, nor with `default`, unless the answer is a common code at
+/// its own status, such as `REQUEST_TIMEOUT` at 503: the document would otherwise hide from the
+/// app an answer it must handle.
 ///
 /// And it fails the test when a validation failure has a key in `error.fields` with a name
 /// that holds `_`, a Rust name where every JSON name is camelCase (spec §4.2), or, answered to
@@ -137,7 +150,8 @@ impl Documented {
     }
 
     /// When `response` is an error envelope, its code is one that `operation` or the document
-    /// lists, and its status one that `operation` documents or any route can answer.
+    /// lists, and its status one that `operation` documents, unless the answer is a common code
+    /// at its own status.
     fn hold_the_error(
         &self,
         served: &MatchedRoute,
@@ -156,7 +170,8 @@ impl Documented {
                  the route"
             );
         }
-        if !documents(&operation.statuses, status) && !COMMON_STATUSES.contains(&status) {
+        let common_answer = COMMON_ANSWERS.contains(&(code.as_str(), status));
+        if !documents(&operation.statuses, status) && !common_answer {
             panic!(
                 "{route} answered {status} {code}, a status that its operation does not \
                  document: give the handler's #[utoipa::path] a {status} response with the \
@@ -386,8 +401,6 @@ impl TestResponse {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
     use crate::openapi::COMMON_ERROR_CODES;
 
@@ -396,7 +409,7 @@ mod tests {
     }
 
     #[test]
-    fn the_common_statuses_are_those_of_the_common_codes() {
+    fn the_common_answers_are_the_common_codes_at_the_statuses_the_adapter_gives_them() {
         let common = [
             ApiError::route_not_found(),
             ApiError::method_not_allowed(),
@@ -405,15 +418,17 @@ mod tests {
             ApiError::payload_too_large(),
             ApiError::not_acceptable(),
             ApiError::internal("a handler panicked".to_owned()),
-            ApiError::request_timeout(Duration::from_secs(5)),
+            ApiError::request_timeout("no answer within 5 seconds".to_owned()),
         ];
-        let mut codes: Vec<&str> = common.iter().map(ApiError::code).collect();
-        codes.sort_unstable();
-        let mut statuses: Vec<u16> = common.iter().map(|error| error.status().as_u16()).collect();
-        statuses.sort_unstable();
+        let mut answers: Vec<(&str, u16)> = common
+            .iter()
+            .map(|error| (error.code(), error.status().as_u16()))
+            .collect();
+        answers.sort_unstable();
+        let codes: Vec<&str> = COMMON_ANSWERS.iter().map(|&(code, _)| code).collect();
 
+        assert_eq!(answers, COMMON_ANSWERS);
         assert_eq!(codes, COMMON_ERROR_CODES);
-        assert_eq!(statuses, COMMON_STATUSES);
     }
 
     #[test]

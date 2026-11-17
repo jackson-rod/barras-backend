@@ -1,7 +1,8 @@
 //! The time limit of a request (spec §6.4): an answer that has not started five seconds after
 //! the request arrived, the reading of its body included, is a 503 `REQUEST_TIMEOUT` that is
-//! logged, counted and carries the request id, and its handler is dropped; a body that streams
-//! out after the head is not limited. Every test pauses tokio's clock, so none of them waits.
+//! logged, counted and carries the request id, and its handler is dropped, a handler that panics
+//! as it is dropped included; a body that streams out after the head is not limited. Every test
+//! pauses tokio's clock, so none of them waits.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -30,6 +31,10 @@ const OVER_THE_LIMIT: &str = "/api/v1/wait/60000";
 
 /// What the streaming route sends at once, before its body ends.
 const STREAMED: &str = "the first and only part of the body";
+
+/// What the value the fragile route holds panics with as it is dropped: it must reach the log
+/// and never a body.
+const DROP_PANIC_TEXT: &str = "drop-panic-secret from the fixture";
 
 /// Counts the runs of the waiting handler: those that began, and those still going. A run stops
 /// going when it ends or when it is dropped.
@@ -78,6 +83,28 @@ async fn wait(State(runs): State<Runs>, Path(ms): Path<u64>) -> ApiResult<NoData
     Ok(ApiSuccess::ok("Answered late", NoData))
 }
 
+/// Panics as it is dropped, as a value whose clean-up fails might.
+struct PanicsWhenDropped;
+
+impl Drop for PanicsWhenDropped {
+    fn drop(&mut self) {
+        panic!("{DROP_PANIC_TEXT}");
+    }
+}
+
+/// Answer once a minute has passed, holding meanwhile a value that panics as it is dropped.
+#[utoipa::path(
+    get,
+    path = "/fragile",
+    tag = "fixtures",
+    responses((status = 200, description = "Answered late", body = SuccessEnvelope<NoData>)),
+)]
+async fn fragile() -> ApiResult<NoData> {
+    let _held = PanicsWhenDropped;
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    Ok(ApiSuccess::ok("Answered late", NoData))
+}
+
 /// Answer at once with a body that ends only once `ms` milliseconds have passed.
 #[utoipa::path(
     get,
@@ -105,11 +132,12 @@ fn ending_after(first: &'static str, after: Duration) -> Body {
     Body::new(Full::new(Bytes::from_static(first.as_bytes())).with_trailers(end))
 }
 
-/// The fixture app with the two routes of these tests, its waiting runs counted in `runs` and
+/// The fixture app with the three routes of these tests, its waiting runs counted in `runs` and
 /// its answers in `metrics`.
 fn app_with(runs: Runs, metrics: Metrics) -> HttpApp {
     let routes = ApiRouter::new()
         .route(routes!(wait), Access::public(), &[])
+        .route(routes!(fragile), Access::public(), &[])
         .route(routes!(stream), Access::public(), &[])
         .with_state(runs);
     HttpApp::builder(metrics)
@@ -191,6 +219,47 @@ async fn the_handler_of_a_request_that_times_out_is_dropped() {
     assert_eq!(response.status, 503);
     assert_eq!(runs.began(), 1);
     assert_eq!(runs.going(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_handler_panicking_when_dropped_still_gets_the_503_with_the_request_id_and_is_counted() {
+    let metrics = fixture_metrics();
+    let client = TestClient::new(&app_with(Runs::default(), metrics.clone()));
+    let request = TestRequest::new("GET", "/api/v1/fragile").header("x-request-id", "fragile");
+
+    let response = client.send(request).await;
+
+    assert_error(&response, 503, ApiError::REQUEST_TIMEOUT);
+    assert_eq!(response.json()["message"], "Service unavailable");
+    assert_eq!(response.header("x-request-id"), Some("fragile"));
+    assert!(!String::from_utf8_lossy(response.bytes()).contains(DROP_PANIC_TEXT));
+    let text = metrics.render().unwrap();
+    let counted = r#"http_requests_total{method="GET",path="/api/v1/fragile",status="503"} 1"#;
+    assert!(text.contains(counted), "{text}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_handler_panicking_when_dropped_is_logged_once_as_failed_with_the_panic() {
+    let request = TestRequest::new("GET", "/api/v1/fragile").header("x-request-id", "fragile-log");
+
+    let (response, lines) = send_logged_json(&client(), request).await;
+
+    assert_eq!(response.status, 503);
+    assert_eq!(
+        events(&lines),
+        [("ERROR", "request failed"), ("INFO", "request finished")]
+    );
+    let failed = &lines[0]["fields"];
+    assert_eq!(failed["code"], ApiError::REQUEST_TIMEOUT);
+    let detail = format!(
+        "no answer within 5 seconds, and the handler panicked as it was dropped: \
+         {DROP_PANIC_TEXT}"
+    );
+    assert_eq!(failed["detail"], detail);
+    assert_eq!(lines[1]["fields"]["status"], 503);
+    for line in &lines {
+        assert_eq!(line["spans"][0]["request_id"], "fragile-log", "{line}");
+    }
 }
 
 #[tokio::test(start_paused = true)]
