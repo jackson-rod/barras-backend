@@ -46,13 +46,17 @@ _with-env +command:
 # commands below that connect read their database from .env, as just dev does, so they act on
 # whatever database it names: barras-api seed and reset refuse one that is not on this machine.
 
+# compose.yaml interpolates no variable, so these read neither a compose.override.yaml, a
+# COMPOSE_FILE nor .env: compose would otherwise parse .env and print a line it cannot read,
+# password included.
+
 # Starts the local Postgres of compose.yaml and waits until it accepts connections
 db-up:
-    docker compose up --detach --wait postgres
+    docker compose --file compose.yaml --env-file /dev/null up --detach --wait postgres
 
 # Stops the local Postgres; its data stays in the volume
 db-down:
-    docker compose stop postgres
+    docker compose --file compose.yaml --env-file /dev/null stop postgres
 
 # Migrations are forward-only (spec §3.3), so the file is a simple one, with no script that
 # undoes it, and its version is the moment in UTC. sqlx-cli takes any description and turns its

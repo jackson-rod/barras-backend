@@ -317,7 +317,7 @@ use workspace_hack as _;
 - Read models aggregate in SQL. Lists use cursor pagination, never `OFFSET`, with at most 50 items per page (ADR-0007).
 - Each repository has an explicit mapper in both directions (ADR-0007).
 - SQL names the schema of every table it touches (`barras.users`): no query depends on a connection's `search_path` (ADR-0030).
-- The schema changes only through migrations in `migrations/` (ADR-0007). Every non-hidden entry in `migrations/` must be named `YYYYMMDDHHMMSS_snake_case.sql`, and no two may share a version (`check-structure`). `just db-migrate <name>` creates one.
+- The schema changes only through migrations in `migrations/` (ADR-0007). Every non-hidden entry in `migrations/` must be a regular file named `YYYYMMDDHHMMSS_snake_case.sql`, with ASCII digits, and no two may share a version; `migrations/` itself must be a folder, not a link (`check-structure`). `just db-migrate <name>` creates one.
 - Migrations are forward-only: no script undoes one. Fix a mistake with a new migration, and never edit one that has been merged: `barras-api migrate`, the deploy step, applies nothing when its history holds a migration changed since it ran, missing from the binary, or recorded as failed. A change that would break the running code goes in two releases: expand, adding the new shape and keeping the old, then contract, removing the old (ADR-0030).
 - A migration that cannot run inside a transaction, such as `CREATE INDEX CONCURRENTLY`, starts with sqlx's `-- no-transaction` line and a comment that says why (ADR-0030).
 - sqlx's history table is `public._sqlx_migrations`, named in the postgres adapter's `migrate.rs` and, for sqlx-cli, in `sqlx.toml`; a test fails when the two differ (ADR-0030).
