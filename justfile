@@ -195,10 +195,17 @@ _throwaway-db +command:
         --env POSTGRES_USER=barras --env POSTGRES_PASSWORD=barras --env POSTGRES_DB=barras \
         "$image" postgres -c fsync=off)"
     # Set before the container starts, so that nothing leaves it running; a signal ends the
-    # script through it too.
+    # script through it too, once the command it runs has been stopped.
     trap 'docker rm --force --volumes "$container" >/dev/null' EXIT
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
+    command=''
+    stop() {
+        if [[ -n $command ]]; then
+            kill -TERM -- "-$command" 2>/dev/null || true
+        fi
+        exit "$1"
+    }
+    trap 'stop 130' INT
+    trap 'stop 143' TERM
     docker start "$container" >/dev/null
     # Over TCP: while the image creates the database, a temporary server answers on its Unix
     # socket alone, then stops.
@@ -213,7 +220,15 @@ _throwaway-db +command:
     port="$(docker port "$container" 5432/tcp)"
     export DATABASE_URL="postgres://barras:barras@127.0.0.1:${port##*:}/barras"
     sqlx migrate run --source migrations
-    "$@"
+    # bash runs a trap only after the command in the foreground ends, so the command runs in the
+    # background while the script waits for it: a signal then reaches the trap at once. set -m
+    # gives the command a process group of its own, which the trap stops whole, with the
+    # compilers cargo started and not only the first process.
+    set -m
+    "$@" &
+    command=$!
+    set +m
+    wait "$command"
 
 # The tiers go by the test target's file name, so a new test has nothing to register.
 

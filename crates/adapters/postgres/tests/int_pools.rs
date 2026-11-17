@@ -222,6 +222,12 @@ async fn only_a_statement_slower_than_250_milliseconds_is_logged_and_at_warn() {
     let _default = tracing::subscriber::set_default(subscriber);
 
     pools.check_primary().await.unwrap();
+    // Under the threshold, so not logged: with the 300 ms one alone, a threshold of a few
+    // milliseconds would pass too.
+    sqlx::query("SELECT pg_sleep(0.15)")
+        .execute(pools.primary())
+        .await
+        .unwrap();
     sqlx::query("SELECT pg_sleep(0.3)")
         .execute(pools.primary())
         .await
@@ -242,9 +248,12 @@ async fn only_a_statement_slower_than_250_milliseconds_is_logged_and_at_warn() {
             "slow statement: execution time exceeded alert threshold"
         );
     }
-    let slept = statements
-        .iter()
-        .filter(|statement| statement["fields"]["summary"] == "SELECT pg_sleep(0.3)")
-        .count();
-    assert_eq!(slept, 1, "{text}");
+    let logged = |sql: &str| {
+        statements
+            .iter()
+            .filter(|statement| statement["fields"]["summary"] == sql)
+            .count()
+    };
+    assert_eq!(logged("SELECT pg_sleep(0.15)"), 0, "{text}");
+    assert_eq!(logged("SELECT pg_sleep(0.3)"), 1, "{text}");
 }
