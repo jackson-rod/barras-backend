@@ -50,6 +50,11 @@ third-party = [
     # `client-legacy`, the test client's: only the HTTP adapter's dev-dependencies and its
     # `testing` feature, which only dev-dependencies turn on, ask for it.
     { name = "hyper-util" },
+    # sqlx's query macros, and what they run on at compile time: sqlx-core with `any`, sha2,
+    # digest and others, built for the compiler's host. hakari unifies a crate built for both the
+    # host and the target, so through the generated crate these features would reach the release
+    # build.
+    { name = "sqlx-macros" },
     # `test-util`, which pauses the clock in the HTTP adapter's tests; tokio itself treats it in
     # a release build as an accident.
     { name = "tokio" },

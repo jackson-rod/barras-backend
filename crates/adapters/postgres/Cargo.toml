@@ -6,7 +6,16 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+log.workspace = true
+sqlx.workspace = true
+# A connection to migrate with that does not close cleanly is logged.
+tracing.workspace = true
+url.workspace = true
 workspace-hack.workspace = true
+
+[dev-dependencies]
+barras-testkit.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
 
 [lints]
 workspace = true
